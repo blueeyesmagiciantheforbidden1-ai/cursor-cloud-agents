@@ -1,0 +1,20 @@
+{
+  "name": "Cloud Agents Starter",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "api",
+      "command": "npm run dev:server",
+      "description": "Express API in watch mode on http://localhost:3001"
+    },
+    {
+      "name": "web",
+      "command": "npm run dev:client",
+      "description": "Vite dev server on http://localhost:5173 (proxies /api to the API)"
+    }
+  ],
+  "ports": [
+    { "name": "api", "port": 3001 },
+    { "name": "web", "port": 5173 }
+  ]
+}
