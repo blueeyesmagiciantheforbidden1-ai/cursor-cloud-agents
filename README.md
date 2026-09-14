@@ -13,6 +13,37 @@ Starter environment for Cursor Cloud Agents — a full-stack TypeScript monorepo
 - Node.js >= 20 (Node 22 recommended)
 - npm >= 10
 
+## Windows self-hosted worker: better-sqlite3 ABI repair
+
+Cursor’s official Windows `agent-cli` bundles (both **x64** and **arm64**) currently
+ship Node.js 24 (`NODE_MODULE_VERSION` **137**) with a `better-sqlite3` native
+binary built for Node.js 22 (`NODE_MODULE_VERSION` **127**). That mismatch
+crashes `exec-daemon` right after the worker authenticates.
+
+Repair **both** architectures in place without clearing sign-in (the script only
+replaces `better_sqlite3.node` and never deletes `%LOCALAPPDATA%\cursor-agent`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\repair-cursor-agent-sqlite.ps1
+agent worker start
+```
+
+Dry run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\repair-cursor-agent-sqlite.ps1 -DryRun
+```
+
+Verify against clean official Windows packages (CI / Linux hosts):
+
+```bash
+./scripts/verify-repair-cursor-agent-sqlite.sh
+```
+
+Note: `node_sqlite3.node` is a separate N-API module. On some Windows hosts Smart
+App Control may still block it; that is unrelated to this ABI repair. WSL remains
+the supported workaround when Code Integrity blocks unsigned native modules.
+
 ## Getting started
 
 ```bash
