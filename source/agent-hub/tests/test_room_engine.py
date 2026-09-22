@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_hub.capture import apply_capture_limit, completion_body
-from agent_hub.core import LEASE_SECONDS, MAX_OUTPUT, Hub, HubError
+from agent_hub.core import FLEET, LEASE_SECONDS, MAX_OUTPUT, Hub, HubError
 from agent_hub.store import SQLiteStore
 
 
@@ -136,14 +136,47 @@ class RoomEngineTests(unittest.TestCase):
         self.assertIsNone(self.hub.claim('claude')['task'])
 
     def test_duplicate_complete_is_idempotent(self):
-        created = self.room(agents=['codex'])
+        created = self.room()
         task = self.hub.claim('codex')['task']
         payload = {'lease_token': task['lease_token'], 'output': 'done', 'exit_code': 0}
         first = self.hub.complete('codex', task['room_id'], payload)
         second = self.hub.complete('codex', task['room_id'], payload)
-        self.assertEqual(first['status'], 'completed')
-        self.assertEqual(second['status'], 'completed')
-        self.assertEqual(len(self.hub.get('manager', created['id'])['messages']), 1)
+        self.assertEqual(first['status'], 'queued')
+        self.assertEqual(second['status'], 'queued')
+        saved = self.hub.get('manager', created['id'])
+        self.assertEqual(len(saved['messages']), 1)
+        self.assertEqual(saved['next_agent'], 'claude')
+
+    def test_omitted_or_one_name_roster_is_the_five_agent_fleet(self):
+        omitted = self.hub.create('manager', {'prompt': 'Take one turn together'})
+        named = self.hub.create('manager', {'prompt': 'Take one turn together', 'agents': ['codex']})
+        self.assertEqual(tuple(omitted['agents']), FLEET)
+        self.assertEqual(tuple(named['agents']), FLEET)
+        self.assertEqual(omitted['next_agent'], 'codex')
+
+    def test_one_room_runs_all_five_and_keeps_the_merged_result(self):
+        created = self.hub.create('manager', {'prompt': 'Take one turn together'})
+        seen = []
+        for agent in FLEET:
+            task = self.hub.claim(agent)['task']
+            self.assertIsNotNone(task)
+            self.assertEqual(task['room_id'], created['id'])
+            self.assertEqual([message['agent'] for message in task['messages']], seen)
+            text = agent + ' finished'
+            result = self.hub.complete(agent, task['room_id'], {
+                'lease_token': task['lease_token'], 'output': text, 'exit_code': 0,
+            })
+            seen.append(agent)
+            if agent != FLEET[-1]:
+                self.assertEqual(result['status'], 'queued')
+            else:
+                self.assertEqual(result['status'], 'completed')
+        saved = self.hub.get('manager', created['id'])
+        self.assertEqual(saved['status'], 'completed')
+        self.assertIsNone(saved['next_agent'])
+        self.assertEqual([message['agent'] for message in saved['messages']], list(FLEET))
+        self.assertEqual([message['text'] for message in saved['messages']], [agent + ' finished' for agent in FLEET])
+        self.assertEqual(saved['step'], len(FLEET))
 
     def test_lease_window_constant(self):
         self.assertEqual(LEASE_SECONDS, 45)
