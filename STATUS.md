@@ -54,3 +54,4 @@ The local pack on Alpha is unchanged.
 3. A live worker that must match an enrolled owner needs the real owner pin from the operator's local store. The public files above contain `example.invalid` placeholders.
 4. Leave the self-improver and trading stopped. Do not create keep-nine, SessionHostUp, or a worker named 9.
 5. Director commit `768b564` is not in Alpha's hub pack. If that object is still required, get it from the director's own notes. Do not read Amber-PC to find it.
+6. Alpha has no stored GitHub credential. Push this branch from a machine that already has GitHub write access. Light has pushed other branches with its own credential. Do not copy that credential onto Alpha.
