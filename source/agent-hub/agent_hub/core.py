@@ -7,8 +7,11 @@ import secrets
 import time
 import uuid
 
-DEFAULT_AGENTS = ('codex', 'claude', 'cursor', 'copilot')
-AGENTS = (*DEFAULT_AGENTS, 'grok')
+# A project room is these five taking one turn. The old default stopped
+# at four and left Grok out; a one-name list finished after a single agent.
+FLEET = ('codex', 'claude', 'cursor', 'copilot', 'grok')
+DEFAULT_AGENTS = FLEET
+AGENTS = FLEET
 MAX_OUTPUT = 16000
 MAX_PROMPT = 8000
 MAX_ATTEMPTS = 24
@@ -76,6 +79,9 @@ class Hub:
         if purpose == 'improvement':
             # The 25% planner alone cannot reserve real subscription allowance.
             raise HubError('Model improvement is paused until live usage accounting and atomic budget reservations are connected', 503)
+        # Omitted and one-name project rosters used to end the room after one agent.
+        if not isinstance(agents, list) or len(agents) <= 1:
+            agents = list(FLEET)
         if not isinstance(prompt, str) or not 1 <= utf8_size(prompt.strip(), 'prompt') <= MAX_PROMPT:
             raise HubError('prompt must contain 1 to 8000 UTF-8 bytes')
         if not isinstance(agents, list) or not agents or len(agents) > len(AGENTS) or any(agent not in AGENTS for agent in agents):
