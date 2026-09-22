@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RunCrew Cloud · Hub status</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to status</a>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="RunCrew Cloud home"><span class="brand-icon" aria-hidden="true">R</span><span>RunCrew <strong>Cloud</strong><small>AGENT OPERATIONS</small></span></a>
+    <nav aria-label="Dashboard sections"><a href="#agents">Agents</a><a href="#usage">Usage</a><a href="#alerts">Alerts <span id="nav-alerts">—</span></a></nav>
+    <span class="private-label"><span aria-hidden="true">●</span> Private workspace</span>
+  </header>
+  <main id="main">
+    <div class="page-heading"><div><p class="eyebrow">YOUR GOOGLE CLOUD HUB</p><h1>One view. Every agent.</h1><p class="intro">Cloud services, connected workers, and reported provider usage.</p></div><div class="refresh-controls"><label class="toggle"><input id="auto-refresh" type="checkbox" checked> Auto-refresh · 15s</label><button id="refresh" type="button"><span aria-hidden="true">↻</span> Refresh</button></div></div>
+    <section id="health-banner" class="health-banner waiting" aria-labelledby="health-title" aria-live="polite">
+      <span id="health-symbol" class="health-symbol" aria-hidden="true">···</span><div class="health-copy"><h2 id="health-title">Connecting to your hub</h2><p id="health-detail">Checking the latest status. No data has been received yet.</p></div><div class="health-meta"><span id="deployment">Deployment unknown</span><small id="updated">Waiting for first update</small></div>
+    </section>
+    <section class="metrics" aria-label="Hub overview">
+      <article class="metric"><span>Connected hub workers</span><div><strong id="reporting-count">—</strong><small id="reporting-total">of 5 teammates</small></div><p id="worker-summary">Awaiting cloud worker telemetry</p></article>
+      <article class="metric"><span>Work in progress</span><div><strong id="running-count">—</strong><small>rooms running</small></div><p id="queue-detail">Queue not available</p></article>
+      <article class="metric"><span>Needs attention</span><div><strong id="alert-count">—</strong><small id="alert-label">active alerts</small></div><p id="alert-summary">Waiting for status</p></article>
+      <article class="metric"><span>Usage visibility</span><div><strong id="usage-count">—</strong><small>reported metrics</small></div><p>Unknown balances stay unknown</p></article>
+    </section>
+    <section class="machine-panel panel" aria-labelledby="cloud-heading"><div class="machine-heading"><div><p class="eyebrow">GOOGLE CLOUD</p><h2 id="cloud-heading">Cloud Run connection</h2></div><span id="cloud-observed" class="section-note">Not yet connected</span></div><div id="cloud-grid" class="machine-grid"><p class="empty-state">Waiting for cloud connection status.</p></div><p class="help-note cloud-note">Resource metrics require a Cloud Monitoring connection. Unavailable CPU, memory, instance, and request readings remain unknown.</p></section>
+    <section id="agents" class="section" aria-labelledby="agents-heading"><div class="section-heading"><div><p class="eyebrow">THE TEAM</p><h2 id="agents-heading">Cloud hub workers</h2></div><span class="section-note">Based on authenticated worker reports</span></div><div id="agent-grid" class="agent-grid"><p class="empty-state">Awaiting cloud worker telemetry.</p></div><p class="help-note">Worker heartbeats and provider authentication are separate signals. Only reports received by the cloud hub appear here.</p></section>
+    <div class="two-column">
+      <section id="alerts" class="panel" aria-labelledby="alerts-heading"><div class="panel-heading"><div><p class="eyebrow">WATCH LIST</p><h2 id="alerts-heading">Alerts &amp; attention</h2></div><span id="alerts-badge" class="count-badge">—</span></div><div id="alerts-list" class="alerts-list" aria-live="polite"><p class="empty-state">Waiting for a status snapshot.</p></div></section>
+      <section id="queue" class="panel" aria-labelledby="queue-heading"><div class="panel-heading"><div><p class="eyebrow">WORKFLOW</p><h2 id="queue-heading">Recent rooms</h2></div><span id="room-window" class="section-note">Latest 50</span></div><div id="room-list" class="room-list"><p class="empty-state">Waiting for queue data.</p></div><p class="panel-footer">Counts cover the observed room window, not lifetime totals.</p></section>
+    </div>
+    <section id="usage" class="panel usage-panel" aria-labelledby="usage-heading"><div class="panel-heading"><div><p class="eyebrow">CREDITS &amp; CONSUMPTION</p><h2 id="usage-heading">Provider usage</h2></div><span class="section-note">Account and session usage are separate</span></div><div id="quota-summary" class="quota-grid"></div><div class="table-scroll"><table><caption class="sr-only">Reported usage and credit balances by provider. Unavailable values are unknown.</caption><thead><tr><th scope="col">Provider / scope</th><th scope="col">Metric</th><th scope="col">Used</th><th scope="col">Remaining</th><th scope="col">Limit</th><th scope="col">Source / updated</th><th scope="col">Status</th></tr></thead><tbody id="usage-body"><tr><td colspan="7" class="empty-state">Waiting for provider telemetry.</td></tr></tbody></table></div><p class="panel-footer">Only reported values appear here. Subscription allowances and monetary credits are different measurements. Unsupported balances stay unavailable.</p></section>
+    <footer class="footer"><span><span class="footer-dot" aria-hidden="true"></span> RunCrew Cloud <span class="divider">/</span> Read-only status</span><span id="snapshot-time">No snapshot received</span></footer>
+  </main>
+  <noscript><p class="noscript">Enable JavaScript to load live hub status.</p></noscript>
+</body>
+</html>

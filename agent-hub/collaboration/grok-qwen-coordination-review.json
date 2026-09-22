@@ -1,0 +1,7 @@
+{
+  "review": [
+    "The proposal is sound as a **plan-only** control: Qwen never holds worker auth, never pools credits, and must not start jobs or change IAM. Disconnected cloud workers are correct for step one. None of this is verified; no files, credentials, or running system were inspected.\n\n**Missing boundaries (do these before any worker wiring):**\n- Frozen local map of five canonical IDs \u2192 nothing else. Model output is an enum list only\u2014never URLs, argv, prompts, or credentials.\n- Request-bound caller set plus a **second** human/caller accept of the *validated* plan. Approving candidates is not approving execution.\n- Fail-closed schema: JSON array of unique IDs, subset/subsequence of that set; reject extra keys, prose, markdown, repeats, over-length.\n- Adapter identity isolated from executors (no worker secrets, no shared IAM/VPC).\n- Cost: cap **input** tokens too; deny if reservation or $0.10 daily cap cannot be taken; single-flight lock with timeout so a crash cannot double-call.\n- Data minimization: send task class + approved IDs to Alibaba, not repos or secrets.\n- Audit: store raw model text vs validated plan as untrusted.\n\n**Smallest useful deliverable (no new infra):** the existing Qwen adapter + a local validator that writes a `proposed` ordered-ID artifact and stops. No rooms, leases, or provider jobs. Later execution stays on vendor auth and fenced leases, gated on that accepted artifact."
+  ],
+  "model": "grok-4.6-build",
+  "reported_cost_usd": {}
+}

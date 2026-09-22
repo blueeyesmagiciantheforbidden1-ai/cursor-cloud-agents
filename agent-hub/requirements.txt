@@ -1,0 +1,4 @@
+google-cloud-firestore>=2.19,<3
+google-auth>=2.38,<3
+cryptography>=44,<47
+oauthlib==3.3.1

@@ -1,0 +1,35 @@
+# Highest-priority, root-owned provider policy. BYOK still requires independent rejection.
+[grok_com_config]
+disable_api_key_auth = true
+
+[ui]
+disable_bypass_permissions_mode = true
+
+[cli]
+auto_update = false
+
+[session]
+load_envrc = false
+
+[models]
+max_retries = 0
+
+[subagents]
+enabled = false
+
+[memory]
+enabled = false
+
+[compat.claude]
+skills = false
+rules = false
+agents = false
+mcps = false
+hooks = false
+
+[compat.cursor]
+skills = false
+rules = false
+agents = false
+mcps = false
+hooks = false

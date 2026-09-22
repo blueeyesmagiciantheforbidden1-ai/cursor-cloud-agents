@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "allowance_pools": [
+    {"id": "grok", "capacity": 100, "used": 0, "weight": 1},
+    {"id": "cursor", "capacity": 100, "used": 0, "weight": 1},
+    {"id": "claude", "capacity": 100, "used": 0, "weight": 1},
+    {"id": "copilot", "capacity": 100, "used": 0, "weight": 1},
+    {"id": "chatgpt", "capacity": 100, "used": 0, "weight": 1}
+  ],
+  "api_cash_pools": [{"id": "alibaba-gateway", "budget": 0, "spent": 0}],
+  "providers": [
+    {"id": "grok", "kind": "subscription", "model": "VERIFY_ACCOUNT_MODEL", "strongest_model": "VERIFY_ACCOUNT_MODEL", "effort": "VERIFY_MAX_EFFORT", "highest_effort": "VERIFY_MAX_EFFORT", "supported_efforts": ["VERIFY_MAX_EFFORT"], "capabilities": ["code"], "verified": false, "allowance_pool": "grok"},
+    {"id": "cursor", "kind": "subscription", "model": "VERIFY_ACCOUNT_MODEL", "strongest_model": "VERIFY_ACCOUNT_MODEL", "effort": "VERIFY_MAX_EFFORT", "highest_effort": "VERIFY_MAX_EFFORT", "supported_efforts": ["VERIFY_MAX_EFFORT"], "capabilities": ["code"], "verified": false, "allowance_pool": "cursor"},
+    {"id": "claude", "kind": "subscription", "model": "VERIFY_ACCOUNT_MODEL", "strongest_model": "VERIFY_ACCOUNT_MODEL", "effort": "VERIFY_MAX_EFFORT", "highest_effort": "VERIFY_MAX_EFFORT", "supported_efforts": ["VERIFY_MAX_EFFORT"], "capabilities": ["code"], "verified": false, "allowance_pool": "claude"},
+    {"id": "copilot", "kind": "subscription", "model": "VERIFY_ACCOUNT_MODEL", "strongest_model": "VERIFY_ACCOUNT_MODEL", "effort": "VERIFY_MAX_EFFORT", "highest_effort": "VERIFY_MAX_EFFORT", "supported_efforts": ["VERIFY_MAX_EFFORT"], "capabilities": ["code"], "verified": false, "allowance_pool": "copilot"},
+    {"id": "chatgpt", "kind": "subscription", "model": "VERIFY_ACCOUNT_MODEL", "strongest_model": "VERIFY_ACCOUNT_MODEL", "effort": "VERIFY_MAX_EFFORT", "highest_effort": "VERIFY_MAX_EFFORT", "supported_efforts": ["VERIFY_MAX_EFFORT"], "capabilities": ["code"], "verified": false, "allowance_pool": "chatgpt", "reserve_for_connection": true}
+  ]
+}
