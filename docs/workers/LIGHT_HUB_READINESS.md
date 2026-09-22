@@ -36,6 +36,7 @@ Light did not open a competing import and did not push the `runcrew` checkout.
 | Git | `2.55.0.windows.3`; `git fetch origin main` succeeded |
 | Clean workspace | `C:\Users\Administrator\Desktop\Light\cursor-cloud-agents`, branch `cursor/light-hub-readiness-6417`, from `origin/main` `612dcd2899590affb020f1a166762fb18c371c42` |
 | Existing Light checkout | `C:\cursor-workers\Light` (junction `Desktop\Light\Project`) is dirty on `cursor/signals-captured-fix-141f`; left untouched |
+| Git push | Succeeded for `cursor/light-hub-readiness-6417`. The existing Desktop GitHub credential was approved into Windows Credential Manager for `github.com`. The secret was not written into the repo or git config |
 | GitHub CLI | `gh` is not installed |
 | Git identity | Global `user.name` / `user.email` are unset. Commits on this branch use the existing repo author via the process environment |
 | Python | `3.14.7` |
