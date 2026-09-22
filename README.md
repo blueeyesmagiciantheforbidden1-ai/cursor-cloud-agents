@@ -5,8 +5,9 @@ Starter environment for Cursor Cloud Agents — a full-stack TypeScript monorepo
 ## Stack
 
 - **client/** — React 18 + Vite 6 + TypeScript single-page app (Task Board UI)
-- **server/** — Express 4 + TypeScript REST API with an in-memory task store
-- **npm workspaces** — one install at the root wires both packages together
+- **server/** — Express 4 + TypeScript REST API with a JSON-file task store
+- **packages/types** — shared Task/API TypeScript types used by client and server
+- **npm workspaces** — one install at the root wires the packages together
 
 ## Prerequisites
 
@@ -54,15 +55,29 @@ npm run dev   # start API (http://localhost:3001) + client (http://localhost:517
 The Vite dev server proxies `/api/*` to the Express server, so open
 http://localhost:5173 and start adding tasks.
 
+Production-style one URL (API + built UI):
+
+```bash
+npm run build
+npm start     # http://localhost:3001
+```
+
+Tasks persist to `data/tasks.json` (override with `TASKS_FILE`). The client
+build is served from `client/dist` when that folder exists (override with
+`CLIENT_DIST`).
+
 ## Useful commands
 
 | Command | Description |
 | --- | --- |
 | `npm run dev` | Run API and client together (watch mode) |
 | `npm run build` | Type-check + build server and client for production |
-| `npm run typecheck` | Type-check both workspaces |
+| `npm start` | Serve the API and built client from one URL |
+| `npm run typecheck` | Type-check all workspaces |
 | `npm run lint` | Lint the whole repo with ESLint |
 | `npm test` | Run the server API test suite |
+
+CI (GitHub Actions) runs typecheck, lint, tests, and build on every push and pull request.
 
 ## API
 

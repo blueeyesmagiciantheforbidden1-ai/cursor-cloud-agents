@@ -1,9 +1,6 @@
-export interface Task {
-  id: string;
-  title: string;
-  done: boolean;
-  createdAt: string;
-}
+import type { HealthResponse, Task } from "@cursor-cloud-agents/types";
+
+export type { Task };
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -14,7 +11,7 @@ async function json<T>(res: Response): Promise<T> {
 }
 
 export const api = {
-  async health(): Promise<{ status: string }> {
+  async health(): Promise<HealthResponse> {
     return json(await fetch("/api/health"));
   },
   async list(): Promise<Task[]> {
