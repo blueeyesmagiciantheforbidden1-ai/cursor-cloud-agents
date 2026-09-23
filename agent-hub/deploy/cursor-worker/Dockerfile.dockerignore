@@ -1,0 +1,11 @@
+**
+!agent_hub/
+!agent_hub/*.py
+!deploy/
+!deploy/cursor-worker/
+!deploy/cursor-worker/build_native.py
+!deploy/cursor-worker/prepare_release.py
+!deploy/cursor-worker/entrypoint.py
+!deploy/cursor-worker/metadata.py
+!deploy/cursor-worker/provenance/
+!deploy/cursor-worker/provenance/release.json

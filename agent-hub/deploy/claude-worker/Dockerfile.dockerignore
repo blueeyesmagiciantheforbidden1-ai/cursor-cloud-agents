@@ -1,0 +1,9 @@
+**
+!agent_hub/
+!agent_hub/*.py
+!deploy/
+!deploy/claude-worker/
+!deploy/claude-worker/Dockerfile
+!deploy/claude-worker/build_profile.py
+!deploy/claude-worker/entrypoint.py
+!deploy/claude-worker/eligibility_probe.py

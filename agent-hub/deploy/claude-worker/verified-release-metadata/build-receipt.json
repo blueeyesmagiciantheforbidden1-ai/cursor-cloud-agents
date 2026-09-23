@@ -1,0 +1,11 @@
+{
+  "version": "2.1.275",
+  "platform": "linux-x64",
+  "sha256": "13586f3150a7ca1655f36e1dba759fb404e0f7cf7021d4a3dcd5e6f604e56156",
+  "size": 232059192,
+  "manifest_sha256": "dc27fe6bb284b4b97fdee416a21bda71ad591233724c3e36c56d4a60d11aecdc",
+  "signing_key_fingerprint": "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE",
+  "manifest_url": "https://downloads.claude.ai/claude-code-releases/2.1.275/manifest.json",
+  "signature_verified": true,
+  "binary_verified": false
+}
