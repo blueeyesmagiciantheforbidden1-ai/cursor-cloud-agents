@@ -76,3 +76,19 @@ Findings, agreed across Alpha and Light:
 | Demand | WIN-4RR6E8E6DGC | Cursor worker directories only | gcloud, any checkout, hub URL or token, GitHub credential |
 
 No machine created a hub room (Alpha cannot look up the manager token; Retina's user declined), so a live five-agent test has to start from the operator's ChatGPT connector. Retina then re-reads the new document for `purpose` and Light lists the five job executions.
+
+### Verified 2026-09-23 00:39Z: hub fixed; all five worker slots blocked in the controller
+
+Fresh rooms on hub `00002-t7n` store `purpose="project"` at creation; the cursor and copilot workers claimed theirs and completed exit 0. Those two executions then drained (single-use warm jobs), so as of 00:45Z no worker is running.
+
+Why nothing relaunches (Retina read `runcrew-provider-auth`, Light listed executions): the controller service `runcrew-live-fleet` blocked all five `runcrew_fleet_state` slots at 23:01–23:02Z with `error=worker_failed_no_restart_loop` after the first `project_work_only` wave, and `tick()` returns immediately for `phase='blocked'` (`fleet_controller.py:121`); it has ticked "blocked" every minute since. Every execution after 23:02Z was started by hand outside the controller. The broker credential docs are clean for all five fleet slots (phase idle, no quarantine, version and fence equal their last release, `execution_uid` equal to each job's latest execution). The legacy `codex-ryan` slot is separately quarantined (`provider_refresh_uncertain`); not used by the fleet.
+
+The controller has no reset path (only `POST /tick`), so unblocking is a state write. Operator procedure, per slot document `runcrew_fleet_state/<provider>-<profile>` in database `runcrew-provider-auth` (`cloud_runtime.py:66-92`):
+
+1. Read the document; keep its `updateTime`. Parse `state_json`; confirm `phase == 'blocked'` and `error == 'worker_failed_no_restart_loop'`.
+2. Confirm what the next tick will check (`fleet_controller.py:88-104`): the job's `latestCreatedExecution` is terminal with `runningCount 0`, and the broker doc has `phase idle`, `quarantine_reason ''`, `version == last_release_version`, `fence == last_release_fence`, `execution_uid ==` that execution's uid. Retina verified all of these for codex-blueeyes, claude, grok, copilot and cursor at 00:45Z; re-check if anything ran since.
+3. Write `state_json` back with `phase` set to `'idle'` and the `error` key removed; change nothing else (`config_sha256`, `generation`, `grant_sha256`, intents and fences are checked by the controller). Set `updated_at`. Commit with `currentDocument.updateTime` equal to the value read in step 1 so a concurrent tick cannot be overwritten.
+4. Watch `runcrew_fleet_tick` logs: the slot should go `binding_intent -> binding_ready -> launch_intent -> launch_submitted -> active`, and a new execution with `RUNCREW_EXECUTION_GRANT` appears. Do not start jobs by hand; a plain execute has no grant and exits `live_worker_startup_failed`.
+5. Then create one five-agent room; the current images already pass the purpose check on `00002-t7n`. Rebuilding images from this branch is only needed for the clearer error codes.
+
+Follow-up worth doing before this happens again: give the controller an explicit, audited unblock operation (a `POST /reset` that applies steps 1-3 with the same checks) instead of relying on hand edits of `state_json`.
