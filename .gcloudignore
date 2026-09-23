@@ -1,0 +1,12 @@
+# Upload only source for `gcloud builds submit` from the repository root.
+# A .gcloudignore replaces .gitignore for uploads, so include it: whatever git
+# ignores (.env, keys, credential files) never reaches the build bucket.
+#!include:.gitignore
+.git
+.gcloudignore
+**/__pycache__
+**/node_modules
+imported/
+hub/
+.claude/
+*.log

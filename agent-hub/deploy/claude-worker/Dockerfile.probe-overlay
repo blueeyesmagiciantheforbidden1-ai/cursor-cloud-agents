@@ -1,0 +1,7 @@
+# Source-only protocol fix on the verified native image. No downloads or keys.
+FROM us-central1-docker.pkg.dev/project-0c6d31fa-509e-4116-a2c/runcrew-hub/claude-worker@sha256:d4b3c8541a1bc29f879c8486ea778578d797128b4cb28d8a3520cfb9fa069185
+USER root
+COPY --chown=root:root deploy/claude-worker/eligibility_probe.py /opt/runcrew/eligibility_probe.py
+RUN chmod 0444 /opt/runcrew/eligibility_probe.py
+USER 10001:10001
+RUN python -I -B /opt/runcrew/entrypoint.py --check

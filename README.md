@@ -2,6 +2,10 @@
 
 Starter environment for Cursor Cloud Agents — a full-stack TypeScript monorepo you can run, extend, and demo end to end.
 
+## Hub pack
+
+`agent-hub/`, `live-worker-runtime/`, `hub.py`, and the live-fleet helper scripts are the RunCrew hub source imported from Alpha's local pack at `C:\API_KEYS`. Live API keys, tokens, and `.env` files are not in this tree. Owner emails, the billing account id, and live ChatGPT connector ids in the public copy are placeholders. See `STATUS.md` for what landed and the next steps for Light, Retina, and Demand.
+
 ## Stack
 
 - **client/** — React 18 + Vite 6 + TypeScript single-page app (Task Board UI)

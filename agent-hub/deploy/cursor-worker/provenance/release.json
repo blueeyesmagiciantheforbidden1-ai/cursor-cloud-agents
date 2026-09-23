@@ -1,0 +1,2904 @@
+{
+  "schema": 1,
+  "version": "2026.09.18-9a7762b",
+  "platform": "linux-x64",
+  "url": "https://downloads.cursor.com/lab/2026.09.18-9a7762b/linux/x64/agent-cli-package.tar.gz",
+  "bytes": 182574768,
+  "sha256": "b1308f5a2fc05458b9d8966752986bb23a971bbcc67c842c1df94c4b8132bad9",
+  "expanded_bytes": 582097800,
+  "publisher_signature_verified": false,
+  "provenance": "official_https_observation",
+  "executed": false,
+  "files": [
+    {
+      "path": "dist-package",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/merkle-tree-napi.linux-x64-gnu.node",
+      "bytes": 4307840,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/file_service.linux-x64-gnu.node",
+      "bytes": 46332624,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_sqlite3.node",
+      "bytes": 1978072,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/index.js",
+      "bytes": 7927473,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5333.index.js",
+      "bytes": 2845,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/pty.node",
+      "bytes": 72664,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4766.index.js",
+      "bytes": 5472,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5474.index.js",
+      "bytes": 6069,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/6320.index.js",
+      "bytes": 906,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/3129.index.js",
+      "bytes": 1092,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5230.index.js",
+      "bytes": 5605,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5336.index.js",
+      "bytes": 3811,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/1021.index.js",
+      "bytes": 2515,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4835.index.js",
+      "bytes": 42557,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4339.index.js",
+      "bytes": 24505,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/531.index.js",
+      "bytes": 2086,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/8245.index.js",
+      "bytes": 24798,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/796.index.js",
+      "bytes": 28885,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2103.index.js",
+      "bytes": 18688,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2124.index.js",
+      "bytes": 17156,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7866.index.js",
+      "bytes": 16417,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4888.index.js",
+      "bytes": 2115,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/67.index.js",
+      "bytes": 1161,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4722.index.js",
+      "bytes": 28982,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/6168.index.js",
+      "bytes": 662,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7302.index.js",
+      "bytes": 666,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4531.index.js",
+      "bytes": 4181,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9009.index.js",
+      "bytes": 11784,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9931.index.js",
+      "bytes": 1380,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5904.index.js",
+      "bytes": 1506,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/3635.index.js",
+      "bytes": 16885,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2869.index.js",
+      "bytes": 967,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4896.index.js",
+      "bytes": 95632,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/3837.index.js",
+      "bytes": 2463,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5589.index.js",
+      "bytes": 10723,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9890.index.js",
+      "bytes": 14977,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/1699.index.js",
+      "bytes": 115011,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9385.index.js",
+      "bytes": 9136,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2088.index.js",
+      "bytes": 7404,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4128.index.js",
+      "bytes": 6599,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/8546.index.js",
+      "bytes": 11612,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7453.index.js",
+      "bytes": 11888,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4529.index.js",
+      "bytes": 241,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9803.index.js",
+      "bytes": 36181,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4837.index.js",
+      "bytes": 7285,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4326.index.js",
+      "bytes": 7464,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7021.index.js",
+      "bytes": 1064314,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/407.index.js",
+      "bytes": 2945,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/6654.index.js",
+      "bytes": 8222,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2969.index.js",
+      "bytes": 1824,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/6953.index.js",
+      "bytes": 20524,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5380.index.js",
+      "bytes": 35112,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/8914.index.js",
+      "bytes": 695,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4343.index.js",
+      "bytes": 665,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9539.index.js",
+      "bytes": 11850,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2906.index.js",
+      "bytes": 2458,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7502.index.js",
+      "bytes": 5203,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/489.index.js",
+      "bytes": 23426,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/6944.index.js",
+      "bytes": 5921,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/1607.index.js",
+      "bytes": 328585,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/159.index.js",
+      "bytes": 399559,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/6165.index.js",
+      "bytes": 920,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/9334.index.js",
+      "bytes": 10030,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/8891.index.js",
+      "bytes": 3241578,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2240.index.js",
+      "bytes": 221412,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/8096.index.js",
+      "bytes": 2340629,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7923.index.js",
+      "bytes": 16729,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/190.index.js",
+      "bytes": 133961,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5912.index.js",
+      "bytes": 52223,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7260.index.js",
+      "bytes": 29050,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/2469.index.js",
+      "bytes": 21242,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/3233.index.js",
+      "bytes": 397202,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/97f64a4d8eca9a2e35bb.mp4",
+      "bytes": 63178,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/5926.index.js",
+      "bytes": 87077,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/4723.index.js",
+      "bytes": 131082,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/7714.index.js",
+      "bytes": 50214,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/1493.index.js",
+      "bytes": 19840,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/8096.index.js.LICENSE.txt",
+      "bytes": 2501,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/index.js.LICENSE.txt",
+      "bytes": 1719,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/96a3f0d3b00ef5b34e9a.js",
+      "bytes": 2685,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/LICENSE",
+      "bytes": 1079,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/bin.js",
+      "bytes": 2094,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/build-test.js",
+      "bytes": 398,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/index.js",
+      "bytes": 390,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/node-gyp-build.js",
+      "bytes": 6078,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/optional.js",
+      "bytes": 143,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/package.json",
+      "bytes": 1004,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/README.md",
+      "bytes": 2485,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/node-gyp-build/SECURITY.md",
+      "bytes": 193,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/addon_data.h",
+      "bytes": 1033,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/binding.cc",
+      "bytes": 798,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/conversions.cc",
+      "bytes": 4271,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/conversions.h",
+      "bytes": 707,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/language.cc",
+      "bytes": 2927,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/language.h",
+      "bytes": 381,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/logger.cc",
+      "bytes": 1821,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/logger.h",
+      "bytes": 386,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/lookaheaditerator.cc",
+      "bytes": 4452,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/lookaheaditerator.h",
+      "bytes": 995,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/node.cc",
+      "bytes": 31279,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/node.h",
+      "bytes": 956,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/parser.cc",
+      "bytes": 9171,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/parser.h",
+      "bytes": 1051,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/query.cc",
+      "bytes": 13190,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/query.h",
+      "bytes": 1239,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/tree.cc",
+      "bytes": 9119,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/tree.h",
+      "bytes": 1340,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/tree_cursor.cc",
+      "bytes": 8804,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/src/tree_cursor.h",
+      "bytes": 1969,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/test",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/test/lookahead_iterable_test.js",
+      "bytes": 1434,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/test/node_test.js",
+      "bytes": 36780,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/test/parser_test.js",
+      "bytes": 24623,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/test/query_test.js",
+      "bytes": 36549,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/test/tree_test.js",
+      "bytes": 19983,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests/constants.js",
+      "bytes": 657,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests/parse_input.js",
+      "bytes": 243,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests/runit.js",
+      "bytes": 298,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests/test.test.js",
+      "bytes": 5985,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests/test2.test.js",
+      "bytes": 614,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/jest-tests/test3.test.js",
+      "bytes": 624,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/.github",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/.github/workflows",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/.github/workflows/build.yml",
+      "bytes": 1713,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/wasm",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/wasm/stdlib-symbols.txt",
+      "bytes": 253,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/wasm/stdlib.c",
+      "bytes": 2830,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/wasm/wasm-stdlib.h",
+      "bytes": 95558,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/ICU_SHA",
+      "bytes": 41,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/LICENSE",
+      "bytes": 21001,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/README.md",
+      "bytes": 1270,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/ptypes.h",
+      "bytes": 72,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/umachine.h",
+      "bytes": 14865,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/urename.h",
+      "bytes": 72,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/utf.h",
+      "bytes": 72,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/utf16.h",
+      "bytes": 23878,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode/utf8.h",
+      "bytes": 31698,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/alloc.c",
+      "bytes": 1542,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/alloc.h",
+      "bytes": 892,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/array.h",
+      "bytes": 10420,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/atomic.h",
+      "bytes": 1384,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/clock.h",
+      "bytes": 3551,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/error_costs.h",
+      "bytes": 294,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/get_changed_ranges.c",
+      "bytes": 15514,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/get_changed_ranges.h",
+      "bytes": 836,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/host.h",
+      "bytes": 520,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/language.c",
+      "bytes": 6400,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/language.h",
+      "bytes": 8368,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/length.h",
+      "bytes": 1242,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/lexer.c",
+      "bytes": 13091,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/lexer.h",
+      "bytes": 1151,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/lib.c",
+      "bytes": 313,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/node.c",
+      "bytes": 21883,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/parser.c",
+      "bytes": 73561,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/parser.h",
+      "bytes": 5534,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/point.h",
+      "bytes": 1594,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/query.c",
+      "bytes": 141258,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/reduce_action.h",
+      "bytes": 772,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/reusable_node.h",
+      "bytes": 2747,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/stack.c",
+      "bytes": 28201,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/stack.h",
+      "bytes": 4474,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/subtree.c",
+      "bytes": 35490,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/subtree.h",
+      "bytes": 12013,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/tree.c",
+      "bytes": 5137,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/tree.h",
+      "bytes": 601,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/tree_cursor.c",
+      "bytes": 22905,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/tree_cursor.h",
+      "bytes": 1142,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/unicode.h",
+      "bytes": 964,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/wasm_store.c",
+      "bytes": 58793,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/src/wasm_store.h",
+      "bytes": 973,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/include",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/include/tree_sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/include/tree_sitter/api.h",
+      "bytes": 39793,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/lib/README.md",
+      "bytes": 324,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/LICENSE",
+      "bytes": 1085,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/vendor/tree-sitter/README.md",
+      "bytes": 1146,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/node-addon-api@8.5.0",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/.gitignore",
+      "bytes": 129,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/.npmignore",
+      "bytes": 159,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/LICENSE",
+      "bytes": 1078,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/README.md",
+      "bytes": 2385,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/binding.gyp",
+      "bytes": 1947,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/index.js",
+      "bytes": 25643,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/package.json",
+      "bytes": 1757,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/tree-sitter.d.ts",
+      "bytes": 6732,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/config.gypi",
+      "bytes": 18621,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Makefile",
+      "bytes": 15885,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/tree_sitter.target.mk",
+      "bytes": 4232,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/tree_sitter_runtime_binding.target.mk",
+      "bytes": 5323,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/binding.Makefile",
+      "bytes": 147,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter/vendor",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter/vendor/tree-sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter/vendor/tree-sitter/lib",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter/vendor/tree-sitter/lib/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter/vendor/tree-sitter/lib/src/lib.o",
+      "bytes": 255424,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter.a.ar-file-list",
+      "bytes": 64,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter.a",
+      "bytes": 262596,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/binding.o",
+      "bytes": 48056,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/conversions.o",
+      "bytes": 84368,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/language.o",
+      "bytes": 80160,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/logger.o",
+      "bytes": 63824,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/lookaheaditerator.o",
+      "bytes": 115760,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/node.o",
+      "bytes": 168944,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/parser.o",
+      "bytes": 129704,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/query.o",
+      "bytes": 148816,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/tree.o",
+      "bytes": 140896,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding/src/tree_cursor.o",
+      "bytes": 121936,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/obj.target/tree_sitter_runtime_binding.node",
+      "bytes": 926656,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter/vendor",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter/vendor/tree-sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter/vendor/tree-sitter/lib",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter/vendor/tree-sitter/lib/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter/vendor/tree-sitter/lib/src/lib.o.d",
+      "bytes": 6228,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/binding.o.d",
+      "bytes": 9621,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/conversions.o.d",
+      "bytes": 2643,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/language.o.d",
+      "bytes": 9141,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/logger.o.d",
+      "bytes": 2501,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/lookaheaditerator.o.d",
+      "bytes": 9368,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/node.o.d",
+      "bytes": 9374,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/parser.o.d",
+      "bytes": 9336,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/query.o.d",
+      "bytes": 9330,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/tree.o.d",
+      "bytes": 9319,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding/src/tree_cursor.o.d",
+      "bytes": 9426,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/obj.target/tree_sitter_runtime_binding.node.d",
+      "bytes": 936,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/tree_sitter.a.d",
+      "bytes": 211,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/.deps/Release/tree_sitter_runtime_binding.node.d",
+      "bytes": 325,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/node-addon-api@8.5.0",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/tree_sitter.a",
+      "bytes": 262596,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter/build/Release/tree_sitter_runtime_binding.node",
+      "bytes": 926656,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/tree_sitter",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/tree_sitter/alloc.h",
+      "bytes": 958,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/tree_sitter/array.h",
+      "bytes": 10361,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/tree_sitter/parser.h",
+      "bytes": 5534,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/parser.c",
+      "bytes": 10241220,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/scanner.c",
+      "bytes": 45453,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/grammar.json",
+      "bytes": 179302,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/src/node-types.json",
+      "bytes": 49267,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/queries",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/queries/highlights.scm",
+      "bytes": 577,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/bindings",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/bindings/node",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/bindings/node/binding.cc",
+      "bytes": 575,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/bindings/node/index.js",
+      "bytes": 201,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/bindings/node/index.d.ts",
+      "bytes": 452,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/linux-x64",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/linux-x64/tree-sitter-bash.node",
+      "bytes": 1383184,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/win32-x64",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/win32-x64/tree-sitter-bash.node",
+      "bytes": 1556480,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/darwin-x64",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/darwin-x64/tree-sitter-bash.node",
+      "bytes": 1398560,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/darwin-arm64",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/prebuilds/darwin-arm64/tree-sitter-bash.node",
+      "bytes": 1491344,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/node-addon-api@7.1.0",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/LICENSE",
+      "bytes": 1080,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/binding.gyp",
+      "bytes": 410,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/grammar.js",
+      "bytes": 30081,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/package.json",
+      "bytes": 1616,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/README.md",
+      "bytes": 1485,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/config.gypi",
+      "bytes": 18621,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Makefile",
+      "bytes": 15409,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/tree_sitter_bash_binding.target.mk",
+      "bytes": 5018,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/binding.Makefile",
+      "bytes": 132,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/bindings",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/bindings/node",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/bindings/node/binding.o",
+      "bytes": 48432,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/src/parser.o",
+      "bytes": 1364560,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding/src/scanner.o",
+      "bytes": 17880,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/obj.target/tree_sitter_bash_binding.node",
+      "bytes": 1706128,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding/bindings",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding/bindings/node",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding/bindings/node/binding.o.d",
+      "bytes": 2207,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding/src/parser.o.d",
+      "bytes": 1223,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding/src/scanner.o.d",
+      "bytes": 1347,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/obj.target/tree_sitter_bash_binding.node.d",
+      "bytes": 458,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/.deps/Release/tree_sitter_bash_binding.node.d",
+      "bytes": 307,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/node-addon-api@7.1.0",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/tree-sitter-bash/build/Release/tree_sitter_bash_binding.node",
+      "bytes": 1706128,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/bindings",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/bindings/package.json",
+      "bytes": 660,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/bindings/bindings.js",
+      "bytes": 5986,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/bindings/LICENSE.md",
+      "bytes": 1108,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/bindings/README.md",
+      "bytes": 3476,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/test",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/test/test.js",
+      "bytes": 666,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/test/tests.json",
+      "bytes": 810,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/package.json",
+      "bytes": 717,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/.npmignore",
+      "bytes": 14,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/README.md",
+      "bytes": 2073,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/LICENSE",
+      "bytes": 1083,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/index.js",
+      "bytes": 1723,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/.travis.yml",
+      "bytes": 472,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/index.d.ts",
+      "bytes": 77,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/file-uri-to-path/History.md",
+      "bytes": 433,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/bind-map.cpp",
+      "bytes": 1587,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/binder.cpp",
+      "bytes": 6060,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/constants.cpp",
+      "bytes": 9068,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/custom-aggregate.cpp",
+      "bytes": 3952,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/custom-function.cpp",
+      "bytes": 1550,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/custom-table.cpp",
+      "bytes": 14960,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/data-converter.cpp",
+      "bytes": 460,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/data.cpp",
+      "bytes": 9639,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/helpers.cpp",
+      "bytes": 4439,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/macros.cpp",
+      "bytes": 4574,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/query-macros.cpp",
+      "bytes": 4138,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/util/row-builder.cpp",
+      "bytes": 1017,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/backup.cpp",
+      "bytes": 4146,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/database.cpp",
+      "bytes": 14198,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/statement-iterator.cpp",
+      "bytes": 3339,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/statement.cpp",
+      "bytes": 13173,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/backup.hpp",
+      "bytes": 705,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/database.hpp",
+      "bytes": 3129,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/statement-iterator.hpp",
+      "bytes": 1391,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/objects/statement.hpp",
+      "bytes": 1373,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/addon.cpp",
+      "bytes": 1283,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/src/better_sqlite3.cpp",
+      "bytes": 2851,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/aggregate.js",
+      "bytes": 1932,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/backup.js",
+      "bytes": 2380,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/function.js",
+      "bytes": 1396,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/inspect.js",
+      "bytes": 174,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/pragma.js",
+      "bytes": 536,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/serialize.js",
+      "bytes": 625,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/table.js",
+      "bytes": 7144,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/transaction.js",
+      "bytes": 2792,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/methods/wrappers.js",
+      "bytes": 1145,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/database.js",
+      "bytes": 4149,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/index.js",
+      "bytes": 110,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/sqlite-error.js",
+      "bytes": 717,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/lib/util.js",
+      "bytes": 331,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/sqlite3/sqlite3.c",
+      "bytes": 9507980,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/sqlite3/sqlite3.h",
+      "bytes": 690725,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/sqlite3/sqlite3ext.h",
+      "bytes": 39175,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/patches",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/patches/1208.patch",
+      "bytes": 597,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/test_extension.c",
+      "bytes": 587,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/sqlite3.gyp",
+      "bytes": 2542,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/common.gypi",
+      "bytes": 1584,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/defines.gypi",
+      "bytes": 1160,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/copy.js",
+      "bytes": 897,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/deps/download.sh",
+      "bytes": 3913,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/LICENSE",
+      "bytes": 1078,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/binding.gyp",
+      "bytes": 942,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/package.json",
+      "bytes": 1436,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/README.md",
+      "bytes": 5666,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/config.gypi",
+      "bytes": 18621,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Makefile",
+      "bytes": 14654,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/deps/locate_sqlite3.target.mk",
+      "bytes": 2133,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/deps/sqlite3.target.mk",
+      "bytes": 6419,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/deps/sqlite3.Makefile",
+      "bytes": 141,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/test_extension.target.mk",
+      "bytes": 4457,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/better_sqlite3.target.mk",
+      "bytes": 4553,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/binding.Makefile",
+      "bytes": 137,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/ba23eeee118cd63e16015df367567cb043fed872.intermediate.d",
+      "bytes": 584,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/deps/locate_sqlite3.stamp.d",
+      "bytes": 103,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/sqlite3/gen",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/sqlite3/gen/sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/sqlite3/gen/sqlite3/sqlite3.o.d",
+      "bytes": 2048,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/better_sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/better_sqlite3/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/better_sqlite3/src/better_sqlite3.o.d",
+      "bytes": 9974,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/better_sqlite3.node.d",
+      "bytes": 372,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/test_extension",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/test_extension/deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/test_extension/deps/test_extension.o.d",
+      "bytes": 1265,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/obj.target/test_extension.node.d",
+      "bytes": 335,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/sqlite3.a.d",
+      "bytes": 197,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/better_sqlite3.node.d",
+      "bytes": 247,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/.deps/Release/test_extension.node.d",
+      "bytes": 247,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj/gen",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj/gen/sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj/gen/sqlite3/sqlite3.c",
+      "bytes": 9507980,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj/gen/sqlite3/sqlite3.h",
+      "bytes": 690725,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj/gen/sqlite3/sqlite3ext.h",
+      "bytes": 39175,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/deps/locate_sqlite3.stamp",
+      "bytes": 0,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/deps/sqlite3.a.ar-file-list",
+      "bytes": 49,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/deps/sqlite3.a",
+      "bytes": 2591556,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/sqlite3/gen",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/sqlite3/gen/sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/sqlite3/gen/sqlite3/sqlite3.o",
+      "bytes": 2584544,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/better_sqlite3",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/better_sqlite3/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/better_sqlite3/src/better_sqlite3.o",
+      "bytes": 177288,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/better_sqlite3.node",
+      "bytes": 2497824,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/test_extension",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/test_extension/deps",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/test_extension/deps/test_extension.o",
+      "bytes": 1808,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/obj.target/test_extension.node",
+      "bytes": 15752,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/sqlite3.a",
+      "bytes": 2591556,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+      "bytes": 2497824,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/better-sqlite3/build/Release/test_extension.node",
+      "bytes": 15752,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/src",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/src/task_queue",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/src/worker_pool",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/array_queue.js",
+      "bytes": 862,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/common.js",
+      "bytes": 113,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/fixed_queue.js",
+      "bytes": 6594,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/index.js",
+      "bytes": 3723,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/array_queue.d.ts",
+      "bytes": 230,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/common.d.ts",
+      "bytes": 415,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/fixed_queue.d.ts",
+      "bytes": 667,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/task_queue/index.d.ts",
+      "bytes": 1569,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/worker_pool",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/worker_pool/index.js",
+      "bytes": 6654,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/worker_pool/index.d.ts",
+      "bytes": 1614,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/abort.js",
+      "bytes": 690,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/common.js",
+      "bytes": 3159,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/errors.js",
+      "bytes": 551,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/index.js",
+      "bytes": 33387,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/main.js",
+      "bytes": 272,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/symbols.js",
+      "bytes": 686,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/types.js",
+      "bytes": 220,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/worker.js",
+      "bytes": 8248,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/esm-wrapper.mjs",
+      "bytes": 496,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/abort.d.ts",
+      "bytes": 812,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/common.d.ts",
+      "bytes": 1074,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/errors.d.ts",
+      "bytes": 213,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/index.d.ts",
+      "bytes": 3620,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/main.d.ts",
+      "bytes": 49,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/symbols.d.ts",
+      "bytes": 321,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/types.d.ts",
+      "bytes": 1441,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/dist/worker.d.ts",
+      "bytes": 11,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/eval-async.js",
+      "bytes": 267,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/eval.js",
+      "bytes": 93,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/multiple.js",
+      "bytes": 116,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/notify-then-sleep-or.js",
+      "bytes": 347,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/resource-limits.js",
+      "bytes": 109,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/send-buffer-then-get-length.js",
+      "bytes": 313,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/send-transferrable-then-get-length.js",
+      "bytes": 642,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/sleep.js",
+      "bytes": 277,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/vm.js",
+      "bytes": 164,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/esm-async.mjs",
+      "bytes": 241,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/test/fixtures/esm-export.mjs",
+      "bytes": 91,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark/fixtures",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark/fixtures/add.js",
+      "bytes": 52,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark/piscina-queue-comparison.js",
+      "bytes": 1093,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark/queue-comparison.js",
+      "bytes": 758,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark/simple-benchmark-fixed-queue.js",
+      "bytes": 801,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/benchmark/simple-benchmark.js",
+      "bytes": 743,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/examples",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/examples/typescript.md",
+      "bytes": 2286,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/update-log",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/update-log/changelog.md",
+      "bytes": 109,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/update-log/release-notes.md",
+      "bytes": 2770,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/api-overview.md",
+      "bytes": 9251,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/class.md",
+      "bytes": 7126,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/event.md",
+      "bytes": 884,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/interface.md",
+      "bytes": 1283,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/method.md",
+      "bytes": 3299,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/property.md",
+      "bytes": 3835,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/api-reference/static-property.md",
+      "bytes": 1178,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/docs/docs/Introduction.md",
+      "bytes": 1767,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/.taprc",
+      "bytes": 298,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/LICENSE",
+      "bytes": 1209,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/package.json",
+      "bytes": 2842,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/CHANGELOG.md",
+      "bytes": 6029,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/CODE_OF_CONDUCT.md",
+      "bytes": 5268,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/CONTRIBUTING.md",
+      "bytes": 2817,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/piscina/README.md",
+      "bytes": 39331,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/dec",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/dec/webp_dec.js",
+      "bytes": 34823,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/dec/README.md",
+      "bytes": 380,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/dec/webp_dec.d.ts",
+      "bytes": 211,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/dec/webp_dec.wasm",
+      "bytes": 137960,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc",
+      "bytes": 0,
+      "type": "directory"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc_simd.js",
+      "bytes": 38646,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc.js",
+      "bytes": 38665,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/README.md",
+      "bytes": 405,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc_simd.d.ts",
+      "bytes": 41,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc.d.ts",
+      "bytes": 962,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc_simd.wasm",
+      "bytes": 345584,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/enc/webp_enc.wasm",
+      "bytes": 281261,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/Makefile.animated.backup",
+      "bytes": 2954,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/pre.js",
+      "bytes": 847,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/LICENSE.codec.md",
+      "bytes": 1495,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/codec/README.md",
+      "bytes": 91,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/LICENSE",
+      "bytes": 11343,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/decode.js",
+      "bytes": 1432,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/encode.js",
+      "bytes": 1946,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/index.js",
+      "bytes": 98,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/meta.js",
+      "bytes": 749,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/utils.js",
+      "bytes": 1272,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/package.json",
+      "bytes": 978,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/CHANGELOG.md",
+      "bytes": 1051,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/README.md",
+      "bytes": 3447,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/decode.d.ts",
+      "bytes": 822,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/emscripten-types.d.ts",
+      "bytes": 4086,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/encode.d.ts",
+      "bytes": 1236,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/index.d.ts",
+      "bytes": 133,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/meta.d.ts",
+      "bytes": 906,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node_modules/@jsquash/webp/utils.d.ts",
+      "bytes": 987,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/mac-webp-runtime.cjs",
+      "bytes": 307,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/diff-worker.js",
+      "bytes": 6008,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/diff-patch-worker.js",
+      "bytes": 6646,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/unified-diff-worker.js",
+      "bytes": 6816,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/pdf-worker.js",
+      "bytes": 480437,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/pdf-worker.js.LICENSE.txt",
+      "bytes": 795,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/rg",
+      "bytes": 5396392,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/node",
+      "bytes": 129074464,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/cursorsandbox",
+      "bytes": 4571576,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/crepectl",
+      "bytes": 23387432,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/cursor-askpass.js",
+      "bytes": 6053,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/cursor-askpass",
+      "bytes": 175,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/package.json",
+      "bytes": 64,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/cursor-agent",
+      "bytes": 1096,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/cursor-agent-sea",
+      "bytes": 137039040,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/better_sqlite3.node",
+      "bytes": 2497824,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/cursor-agent-worker-sea",
+      "bytes": 146083008,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/test_extension.node",
+      "bytes": 15752,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/tree_sitter_bash_binding.node",
+      "bytes": 1706128,
+      "type": "file"
+    },
+    {
+      "path": "dist-package/tree_sitter_runtime_binding.node",
+      "bytes": 926656,
+      "type": "file"
+    }
+  ]
+}
