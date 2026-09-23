@@ -77,6 +77,24 @@ def exit_line(agent, exit_code, outcome):
     return f'{name} worker exit {int(exit_code)}: {code}'
 
 
+def finish_exit(agent, result, last_exit, stream):
+    """Process exit code for a finished run; one stderr line only on failure.
+
+    0 for completed or idle_drained (nothing printed); QUOTA_EXIT_CODE when
+    the run recorded it, else 1. A failing stderr never changes the code:
+    a lost 75 would hide a quota park from the controller.
+    """
+    outcome = result.get('outcome') if isinstance(result, dict) else None
+    if outcome in ('completed', 'idle_drained'):
+        return 0
+    code = provider_errors.QUOTA_EXIT_CODE if last_exit == provider_errors.QUOTA_EXIT_CODE else 1
+    try:
+        print(exit_line(agent, code, result), file=stream, flush=True)
+    except (OSError, ValueError):
+        pass
+    return code
+
+
 def maintain_fault(error):
     """Classify an exception from adapter.maintain(): drain, retry, or fail.
 

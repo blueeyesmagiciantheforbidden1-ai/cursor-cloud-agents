@@ -503,6 +503,32 @@ class LoopTests(unittest.TestCase):
                 self.assertEqual(exit_line('grok', 1, bad), 'grok worker exit 1: unrecorded')
         self.assertEqual(exit_line('Bad Agent!', 1, {}), 'worker worker exit 1: unrecorded')
 
+    def test_finish_exit_prints_once_only_on_failure_and_keeps_75(self):
+        import io
+        from live_loop import finish_exit
+        for outcome in ('completed', 'idle_drained'):
+            stream = io.StringIO()
+            self.assertEqual(finish_exit('codex', {'outcome': outcome}, 0, stream), 0)
+            self.assertEqual(stream.getvalue(), '')
+        stream = io.StringIO()
+        self.assertEqual(finish_exit('codex', {'outcome': 'failed', 'error_code': 'claim_response_uncertain'}, 1,
+                                     stream), 1)
+        self.assertEqual(stream.getvalue().splitlines(), ['codex worker exit 1: claim_response_uncertain'])
+        stream = io.StringIO()
+        self.assertEqual(finish_exit('claude', {'outcome': 'failed', 'error_code': 'claude_quota_exhausted'},
+                                     provider_errors.QUOTA_EXIT_CODE, stream), provider_errors.QUOTA_EXIT_CODE)
+        self.assertEqual(stream.getvalue().splitlines(), ['claude worker exit 75: claude_quota_exhausted'])
+
+        class Broken:
+            def write(self, _):
+                raise OSError('stderr closed')
+
+            def flush(self):
+                raise OSError('stderr closed')
+        self.assertEqual(finish_exit('claude', {'outcome': 'failed', 'error_code': 'claude_quota_exhausted'},
+                                     provider_errors.QUOTA_EXIT_CODE, Broken()), provider_errors.QUOTA_EXIT_CODE)
+        self.assertEqual(finish_exit('grok', None, None, io.StringIO()), 1)
+
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):
             self.assertTrue(provider_errors.is_quota(code))
