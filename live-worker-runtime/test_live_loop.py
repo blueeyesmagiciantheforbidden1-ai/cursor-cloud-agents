@@ -173,14 +173,16 @@ class LoopTests(unittest.TestCase):
 
     def test_lost_claim_response_is_not_retried(self):
         # A lost /v1/tasks/claim may have assigned a room, so it is not polled
-        # again. While still idle that ends as a clean drain, not exit 1.
+        # again, and it is a counted failure: the room it may have leased
+        # stalls, and the controller's backoff and three-strike bound apply.
         worker, client, adapter, _ = self.setup_worker(); client.fail_claim = True
         result = worker.run()
         self.assertEqual(client.claims, 1); self.assertNotIn('execute', adapter.calls)
         self.assertIn('close', adapter.calls)
-        self.assertEqual(result['outcome'], 'idle_drained')
-        self.assertNotIn('error_code', result)
-        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['error_code'], 'claim_response_uncertain')
+        self.assertTrue(result['claim_attempted']); self.assertFalse(result['model_call_attempted'])
+        self.assertEqual(worker.last_exit, 1)
         self.assertNotIn('network', str(result))
 
     def test_completion_redelivers_identical_result_without_inference(self):
@@ -281,8 +283,62 @@ class LoopTests(unittest.TestCase):
         self.assertIn('close', adapter.calls)
         self.assertEqual(clock.now, 100)
 
-    def test_idle_transient_maintain_errors_are_retried(self):
-        for error in (OSError('transient native pipe'), CodeError('hub_lease_lost'),
+    def test_unvetted_maintain_error_fails_instead_of_idling(self):
+        # 2026-09-23 review: a cursor startup-deadline MetadataError (no vetted
+        # code) was retried for the whole warm window; the worker reported idle,
+        # never claimed, and exited 0 every hour. It must fail at once instead.
+        for error in (OSError('native pipe'), ValueError('native_metadata_deadline'),
+                      RuntimeError('credential_lease_not_active')):
+            with self.subTest(error=type(error).__name__):
+                worker, client, adapter, clock = self.setup_worker(); client.empty = True
+                def maintain(handle, error=error):
+                    adapter.calls.append('maintain'); raise error
+                adapter.maintain = maintain
+                result = worker.run()
+                self.assertEqual(adapter.calls.count('maintain'), 1)
+                self.assertEqual(client.claims, 0)
+                self.assertEqual(result['outcome'], 'failed')
+                self.assertEqual(result['error_code'], 'native_or_connection_failure')
+                self.assertEqual(worker.last_exit, 1)
+                self.assertIn('close', adapter.calls)
+
+    def test_maintain_retries_are_bounded(self):
+        worker, client, adapter, clock = self.setup_worker(); client.empty = True
+        def maintain(handle):
+            adapter.calls.append('maintain'); raise CodeError('claude_hub_heartbeat_lost')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(adapter.calls.count('maintain'), 4)  # first try + MAX_MAINTAIN_RETRIES
+        self.assertEqual(result['error_code'], 'claude_hub_heartbeat_lost')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(client.claims, 0)
+
+    def test_maintain_retry_counter_resets_after_success(self):
+        worker, client, adapter, clock = self.setup_worker(); client.empty = True
+        seen = {'n': 0}
+        def maintain(handle):
+            seen['n'] += 1; adapter.calls.append('maintain')
+            if seen['n'] % 2: raise CodeError('grok_hub_heartbeat_lost')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained'); self.assertEqual(worker.last_exit, 0)
+
+    def test_hub_blip_before_prepare_does_not_fail_the_run(self):
+        # The credential is leased before run(); a failed first report used to
+        # exit 1 with nothing releasing it, blocking the slot outright.
+        worker, client, adapter, clock = self.setup_worker(); client.empty = True
+        original = client.post; state = {'first': True}
+        def post(path, value):
+            if path.endswith('/report') and state['first']:
+                state['first'] = False; raise OSError('hub blip')
+            return original(path, value)
+        client.post = post
+        result = worker.run()
+        self.assertIn('prepare', adapter.calls)
+        self.assertEqual(result['outcome'], 'idle_drained'); self.assertEqual(worker.last_exit, 0)
+
+    def test_idle_hub_heartbeat_codes_from_maintain_are_retried(self):
+        for error in (CodeError('hub_lease_lost'),
                       CodeError('claude_hub_heartbeat_lost'), CodeError('cursor_lease_lost'),
                       CodeError('copilot_hub_heartbeat_lost')):
             with self.subTest(error=str(error)):
@@ -296,7 +352,6 @@ class LoopTests(unittest.TestCase):
                 result = worker.run()
                 self.assertEqual(result['outcome'], 'idle_drained')
                 self.assertNotIn('error_code', result)
-                self.assertNotIn('transient native pipe', str(result))
                 self.assertGreater(adapter.calls.count('maintain'), 1)
                 self.assertEqual(worker.last_exit, 0)
                 self.assertEqual(clock.now, 160)
@@ -637,8 +692,8 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(client.claims, 1)
         self.assertEqual(clock.now, 100)
         self.assertLess(clock.now - 100, 45)
-        self.assertEqual(result['outcome'], 'idle_drained')
-        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(result['error_code'], 'claim_response_uncertain')
+        self.assertEqual(worker.last_exit, 1)
         self.assertIn('close', adapter.calls)
         self.assertNotIn('execute', adapter.calls)
 

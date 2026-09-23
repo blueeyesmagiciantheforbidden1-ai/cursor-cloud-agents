@@ -39,16 +39,37 @@ _IDLE_RETRY_CODES = frozenset({
 })
 
 
-def idle_fault(error):
-    """Classify an exception raised while waiting for a task: drain, retry, or fail.
+# Consecutive idle maintain() retries before the execution fails with the code.
+MAX_MAINTAIN_RETRIES = 3
 
-    Vetted provider codes still fail the execution. Anything else is a hub or
-    native transport error and must not be recorded as native_or_connection_failure.
+
+def idle_fault(error):
+    """Classify an exception from this loop's own idle hub calls: drain, retry, or fail.
+
+    Only report() uses it. A hub transport error there (no vetted code) is
+    retried on the next poll; vetted codes fail the execution.
     """
     code = provider_errors.error_code(error)
     if code in _IDLE_DRAIN_CODES:
         return 'drain'
     if code is None or code in _IDLE_RETRY_CODES:
+        return 'retry'
+    return 'fail'
+
+
+def maintain_fault(error):
+    """Classify an exception from adapter.maintain(): drain, retry, or fail.
+
+    Stricter than idle_fault: only vetted idle hub-heartbeat codes are retried.
+    An exception without a vetted code comes from the native process, its
+    protocol, or the credential broker, and must end the execution rather than
+    be polled for the rest of the warm window (2026-09-23 review: a cursor
+    startup-deadline MetadataError silently disabled claiming for an hour).
+    """
+    code = provider_errors.error_code(error)
+    if code in _IDLE_DRAIN_CODES:
+        return 'drain'
+    if code in _IDLE_RETRY_CODES:
         return 'retry'
     return 'fail'
 
@@ -233,7 +254,13 @@ class Worker:
                    'automatic_improvement_ready': False, 'capability': 'text_collaboration',
                    'model_call_attempted': False, 'automatic_retry_count': 0}
         try:
-            self.report(force=True)
+            try:
+                self.report(force=True)
+            except Exception as error:
+                # A hub blip before prepare() must not fail the run: the
+                # credential is already leased and nothing would release it.
+                if idle_fault(error) != 'retry':
+                    raise
             self.handle = self.adapter.prepare(self.session, self.heartbeat,
                                                self.clock() + self.settings.startup_seconds)
             self.ready = True
@@ -243,16 +270,20 @@ class Worker:
             except Exception as error:
                 if idle_fault(error) != 'retry':
                     raise
+            maintain_retries = 0
             while self.clock() < idle_deadline and not self.stopping:
                 try:
                     self.adapter.maintain(self.handle)
+                    maintain_retries = 0
                 except Exception as error:
-                    fault = idle_fault(error)
+                    fault = maintain_fault(error)
                     if fault == 'drain':
                         break
-                    # A closed or quarantined handle must not be polled until
-                    # idle_deadline. The original code stays the outcome.
-                    if fault != 'retry' or handle_released(self.handle):
+                    # A closed or quarantined handle must not be polled again,
+                    # and retries are bounded. The original code stays the outcome.
+                    maintain_retries += 1
+                    if (fault != 'retry' or handle_released(self.handle)
+                            or maintain_retries > MAX_MAINTAIN_RETRIES):
                         raise
                     self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))
                     continue
@@ -278,14 +309,16 @@ class Worker:
                 if self.stopping:
                     break
                 self.claim_attempted = True
-                # An uncertain claim ends this execution. Never silently claim
-                # again after a lost response that may have assigned a task.
+                # An uncertain claim ends this execution as a failure. The hub
+                # may have leased a room whose reply was lost; that room stalls,
+                # so the record must say so and the controller must count it
+                # (backoff, three-strike block). Never claim again here.
                 try:
                     result = self.client.post(path, {})
                 except Exception as error:
-                    if idle_fault(error) == 'fail':
+                    if provider_errors.error_code(error) is not None:
                         raise
-                    break
+                    raise LiveError('claim_response_uncertain') from None
                 require(isinstance(result, dict) and 'task' in result, 'claim_response_invalid')
                 if result['task'] is None:
                     self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))
