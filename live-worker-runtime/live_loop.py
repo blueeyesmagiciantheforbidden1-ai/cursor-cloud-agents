@@ -150,6 +150,9 @@ class Worker:
         self.stopping = False
         self.next_report = 0.0
         self.last_exit = None
+        # Set only when the hub itself answered that this task lease is no
+        # longer active; the hub refuses a completion for it.
+        self.lease_revoked = False
         self.claim_attempted = False
         self.model_call_attempted = False
         self.completion_payload = None
@@ -174,7 +177,9 @@ class Worker:
             if self.task:
                 receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                                            {'lease_token': self.task['lease_token']})
-                require(receipt.get('active') is True, 'task_lease_lost')
+                if not isinstance(receipt, dict) or receipt.get('active') is not True:
+                    self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
+                    return False
             self.report()
             return True
         except Exception:
@@ -330,6 +335,12 @@ class Worker:
                     continue
                 self.task = result['task']
                 deadline, prompt = self._prepare_task()
+                # SIGTERM between the claim and the model call: Cloud Run kills
+                # the process about 10 s later, so a turn started now would die
+                # mid-call with the credential lease held. Hand the step back
+                # instead: no model call, one structured failure completion.
+                if self.stopping:
+                    raise LiveError('worker_stopping')
                 self.model_call_attempted = True
                 reply = self.adapter.execute(self.handle, prompt, deadline, task_kind='project')
                 require(isinstance(reply, dict) and isinstance(reply.get('text'), str)
@@ -386,6 +397,10 @@ class Worker:
                 outcome['provider_quota_exhausted'] = True
             if self.completion_payload is not None:
                 outcome['completion_delivery'] = 'unconfirmed'
+            elif self.lease_revoked:
+                # The hub revoked this lease; a completion for it would be
+                # refused after three POSTs. Its own expiry path records it.
+                outcome['completion_delivery'] = 'skipped_lease_revoked'
             elif self.cleaned and self.task and isinstance(self.task, dict) and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', '')):
                 if quota:
                     text = ('The ' + self.settings.agent + ' worker could not answer: the provider refused the '
