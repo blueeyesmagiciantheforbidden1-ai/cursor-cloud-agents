@@ -59,3 +59,5 @@ python3 -B tools/test_verify_fleet.py
 The tests start a local `http.server` fake hub. They cover a five-for-five pass,
 a failed agent, a stalled room, and a failure that resets the consecutive
 counter. They do not call Cloud Run, Firestore, or a live hub.
+
+`--room-timeout SECONDS` sets each room's `timeout_seconds` (default 300, allowed 120-900; the hub refuses less than 120 with codex on the room). Until the `live-20260923c` worker images are deployed, use `--room-timeout 180`: the deployed claude worker does not renew its credential lease during a turn, and a room deadline of 150-180 s ends a slow turn inside that lease instead of quarantining the credential.

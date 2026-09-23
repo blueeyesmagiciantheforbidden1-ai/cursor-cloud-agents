@@ -214,6 +214,18 @@ class VerifyFleetTests(unittest.TestCase):
             self.assertIn(f"{agent} exit_code=0 text={vf.expected_reply(agent)}", result["stdout"])
         self.assertIn("consecutive=1/1", result["stdout"])
 
+    def test_room_timeout_option_sets_timeout_seconds(self):
+        result = self._run([ok_outcome()], ["--consecutive", "1", "--max-rooms", "1", "--room-timeout", "180"])
+        self.assertEqual(result["code"], 0)
+        self.assertEqual(result["posts"][0]["body"]["timeout_seconds"], 180)
+
+    def test_room_timeout_below_the_codex_floor_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(StringIO()):
+            code = vf.main(["--hub", "http://127.0.0.1:9", "--ledger", str(Path(directory) / "l.json"),
+                            "--room-timeout", "90"],
+                           env={"HUB_MANAGER_TOKEN": MANAGER, "HUB_ID_TOKEN": IDENTITY})
+        self.assertEqual(code, 1)
+
     def test_failed_agent_is_not_five_for_five(self):
         outcome = {"status": "failed", "queued_polls": 0, "messages": _messages(
             {"codex": "CODEX | OK", "claude": "provider exploded"},

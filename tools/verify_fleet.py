@@ -138,6 +138,7 @@ class HubClient:
         self.manager_token = manager_token
         self.identity_token = identity_token
         self.timeout = timeout
+        self.room_timeout = 300
         self.opener = build_opener(_NoRedirect())
 
     @property
@@ -178,7 +179,7 @@ class HubClient:
         return self.request("POST", "/v1/rooms", {
             "prompt": PROMPT,
             "agents": list(AGENTS),
-            "timeout_seconds": 300,
+            "timeout_seconds": self.room_timeout,
             "workspace": "default",
             "purpose": "project",
         })
@@ -340,6 +341,9 @@ def main(argv=None, *, env=None, sleep=time.sleep, clock=time.monotonic,
     parser.add_argument("--max-rooms", type=_positive_int, default=8,
                         help="Stop after this many rooms (default 8)")
     parser.add_argument("--ledger", required=True, help="Path of the JSON ledger to write")
+    parser.add_argument("--room-timeout", type=_positive_int, default=300,
+                        help="timeout_seconds for each room (default 300; the hub refuses "
+                             "less than 120 with codex on the room)")
     args = parser.parse_args(argv)
     source = os.environ if env is None else env
     try:
@@ -349,7 +353,10 @@ def main(argv=None, *, env=None, sleep=time.sleep, clock=time.monotonic,
             raise ValueError("consecutive must be less than or equal to max-rooms")
         manager = token_from_env(source, "HUB_MANAGER_TOKEN")
         identity = token_from_env(source, "HUB_ID_TOKEN")
+        if not 120 <= args.room_timeout <= 900:
+            raise ValueError("room-timeout must be from 120 to 900 seconds")
         client = HubClient(args.hub, manager, identity)
+        client.room_timeout = args.room_timeout
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
