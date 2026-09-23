@@ -28,9 +28,10 @@ import transport
 MODEL, EFFORT = 'gpt-6-astra', 'ultra'
 MAX_PROMPT, MAX_ANSWER = 200000, 15000
 WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
-# execute() refuses a task deadline shorter than this. A claim also needs it
-# still left on warm_deadline, or setup (_collect, gate, poll_idle) runs into
-# the warm-window edge and dies before the model call.
+# execute() refuses a task deadline shorter than this. The live loop's claim
+# gate also requires this much time left on warm_deadline. Cloud Run's job
+# timeout (5400 s) already reserves a full task past that window, so execute()
+# does not cap the native deadline on warm_deadline.
 EXECUTE_WARM_FLOOR = FINALIZE_RESERVE + 30
 # Recorded by the successful pinned Linux build in two independent empty homes.
 CONFIG_SHA = 'c584ec84021d23203d0c444cf474c3f184a0b759faf51bed0ba1fc16361af9cf'
@@ -123,7 +124,13 @@ class WarmRPC(transport.TurnRPC):
 
     def poll_idle(self):
         need(self.protocol_state == 'thread_ready' and not self.turn_submitted, 'native_idle_phase_required')
-        self.tick()
+        try:
+            self.tick()
+        except Exception as error:
+            # tick() calls renew() and only then advances next_renew. Let a lost
+            # hub heartbeat leave that renew due, and do not fail the warm process.
+            if not _idle_hub_loss(getattr(self, '_idle_handle', None), error):
+                raise
         need(self.process.poll() is None, 'native_not_running')
         # Drain only already queued frames; no request or model call is issued.
         while True:
@@ -193,6 +200,12 @@ class Handle:
 
 def _enter(handle):
     need(isinstance(handle, Handle) and handle.lock.acquire(blocking=False), 'concurrent_provider_operation')
+
+
+def _idle_hub_loss(handle, error):
+    """A missed hub heartbeat is retried only while the warm process is still idle."""
+    return (isinstance(handle, Handle) and handle.state == 'ready' and not handle.consumed
+            and provider_errors.error_code(error) == 'hub_lease_lost')
 
 
 def _renew(handle):
@@ -339,6 +352,7 @@ def prepare(session, heartbeat, deadline):
         startup_end = min(deadline, time.monotonic() + 120)
         handle.native = WarmRPC(session.home, lambda: _renew(handle),
             timeout_seconds=max(30, math.ceil(startup_end - time.monotonic())), execution_mode='read_only_review')
+        handle.native._idle_handle = handle
         handle.native.deadline = startup_end
         handle.native.request('initialize', {'clientInfo': {'name': 'runcrew_codex_live', 'version': '1'}})
         _collect(handle)
@@ -367,7 +381,9 @@ def maintain(handle):
             except Exception as error:
                 # Idle renew only reaches the hub. A dropped heartbeat is retried
                 # on the next maintain; closing the native process fails the warm run.
-                if provider_errors.error_code(error) != 'hub_lease_lost':
+                # _renew sets next_renew only after the heartbeat returns, so a
+                # miss stays due. A non-vetted broker failure still fails below.
+                if not _idle_hub_loss(handle, error):
                     raise
         return handle.readiness
     except Exception as error:
@@ -384,14 +400,11 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         task_deadline = _deadline(task_deadline)
         remaining = task_deadline - time.monotonic()
         need(EXECUTE_WARM_FLOOR <= remaining <= 900, 'task_deadline_out_of_bounds')
-        # Same floor against the warm session. A claim in the last seconds of
-        # WARM_SECONDS otherwise reaches _collect/poll_idle and fails there.
-        need(handle.warm_deadline - time.monotonic() >= EXECUTE_WARM_FLOOR, 'warm_session_expired')
+        need(time.monotonic() < handle.warm_deadline, 'warm_session_expired')
         need(isinstance(prompt, str) and 0 < len(prompt.encode()) <= MAX_PROMPT, 'bounded_prompt_required')
         handle.consumed = True
         handle.state = 'executing'
-        handle.native.deadline = min(task_deadline - FINALIZE_RESERVE, handle.warm_deadline,
-                                      time.monotonic() + NATIVE_SECONDS)
+        handle.native.deadline = min(task_deadline - FINALIZE_RESERVE, time.monotonic() + NATIVE_SECONDS)
         handle.session.broker.assert_current(handle.session.lease)
         _renew(handle)
         _collect(handle)

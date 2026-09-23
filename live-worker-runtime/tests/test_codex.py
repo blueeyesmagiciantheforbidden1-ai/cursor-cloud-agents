@@ -314,6 +314,7 @@ class CodexLive(unittest.TestCase):
         self.heartbeat.return_value = False
         handle.next_renew = 0
         readiness = c.maintain(handle)
+        self.assertLessEqual(handle.next_renew, time.monotonic())
         self.assertEqual(handle.state, 'ready')
         self.assertTrue(readiness['ready_for_project_prompt'])
         self.assertEqual(self.prompt_count(), 0)
@@ -324,14 +325,70 @@ class CodexLive(unittest.TestCase):
         self.session.broker.renew.assert_called()
         c.close(handle)
 
-    def test_short_warm_window_does_not_start_execute_setup(self):
+    def test_tick_driven_renew_heartbeat_loss_keeps_the_warm_process_and_retries(self):
         handle = self.prepare()
-        handle.warm_deadline = time.monotonic() + c.EXECUTE_WARM_FLOOR - 1
+        # The explicit maintain() renew stays in the future. Only tick() is due,
+        # and it must not advance next_renew when renew() raises.
+        handle.next_renew = time.monotonic() + 1000
+        handle.native.next_renew = time.monotonic() - 1
+        self.heartbeat.return_value = False
+        before = self.session.broker.renew.call_count
+        readiness = c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertFalse(handle.consumed)
+        self.assertTrue(readiness['ready_for_project_prompt'])
+        self.assertLessEqual(handle.native.next_renew, time.monotonic())
+        self.assertEqual(self.session.broker.renew.call_count, before + 1)
+        self.assertEqual(self.prompt_count(), 0)
+        self.session.finish.assert_not_called()
+        self.assertNotIn('stop', self.native.order)
+        self.assertIsNone(self.native.process.poll())
+        self.heartbeat.return_value = True
+        c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertGreater(handle.native.next_renew, time.monotonic())
+        self.assertEqual(self.session.broker.renew.call_count, before + 2)
+        self.session.finish.assert_not_called()
+        c.close(handle)
+
+    def _broker_renew_failure(self, handle):
+        self.session.broker.renew.side_effect = RuntimeError('SYNTHETIC_BROKER_DOWN')
+        with self.assertRaises(c.LiveCodexError) as caught:
+            c.maintain(handle)
+        self.assertEqual(str(caught.exception), 'codex_live_operation_failed')
+        self.assertNotIn('SYNTHETIC', str(caught.exception))
+        self.assertEqual(handle.state, 'closed')
+        self.assertEqual(self.prompt_count(), 0)
+
+    def test_explicit_idle_broker_renew_failure_still_fails(self):
+        handle = self.prepare()
+        handle.next_renew = 0
+        handle.native.next_renew = time.monotonic() + 1000
+        self._broker_renew_failure(handle)
+
+    def test_tick_idle_broker_renew_failure_still_fails(self):
+        handle = self.prepare()
+        handle.next_renew = time.monotonic() + 1000
+        handle.native.next_renew = time.monotonic() - 1
+        self._broker_renew_failure(handle)
+
+    def test_expired_warm_window_does_not_start_execute_setup(self):
+        handle = self.prepare()
+        handle.warm_deadline = time.monotonic() - 1
         with self.assertRaisesRegex(c.LiveCodexError, 'warm_session_expired') as caught:
             c.execute(handle, 'Project task.', time.monotonic() + 180)
         self.assertEqual(self.prompt_count(), 0)
         self.assertFalse(caught.exception.model_call_attempted)
         self.assertEqual(handle.state, 'closed')
+
+    def test_execute_native_deadline_is_not_capped_by_the_warm_window(self):
+        handle = self.prepare()
+        started = time.monotonic()
+        handle.warm_deadline = started + 100
+        c.execute(handle, 'Project task.', started + 500)
+        self.assertEqual(self.native.deadline, started + 500 - c.FINALIZE_RESERVE)
+        self.assertGreater(self.native.deadline, handle.warm_deadline)
+        self.assertEqual(self.prompt_count(), 1)
 
     def test_execute_setup_transport_error_stays_a_fixed_code(self):
         handle = self.prepare()
