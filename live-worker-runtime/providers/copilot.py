@@ -27,10 +27,12 @@ MODEL, EFFORT = 'kimi-k3', 'max'
 # The prepare() argument is only the startup budget. The live loop then waits
 # up to an hour. This cap does not slide; maintain() must not push it forward.
 WARM_SECONDS = 3600
-# Idle maintain() failures that are not "the warm session is gone". These keep
-# their own codes so a clean idle drain cannot hide them.
-IDLE_MAINTAIN_FAILURES = frozenset((
-    'copilot_tools_forbidden', 'copilot_unexpected_pre_prompt_activity', 'copilot_hub_heartbeat_lost'))
+# Idle maintain() failures that mean the warm native session is gone. A dead
+# stdio pipe is the third case and arrives as OSError, which has no code.
+# Every other vetted CopilotError keeps its own code. copilot_hub_heartbeat_lost
+# is not in this set: the handle stays open so the next maintain() can renew.
+IDLE_SESSION_LOSS = frozenset((
+    'copilot_warm_process_ended', 'copilot_idle_deadline_expired'))
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 EXPECTED_LOGIN = 'blueeyesmagiciantheforbidden1-ai'
 NATIVE = '/opt/runcrew/copilot/copilot'
@@ -570,13 +572,22 @@ def prepare(session, heartbeat, deadline):
 
 
 def maintain(handle):
-    """Renew an idle session. Loss of that session is copilot_warm_session_lost.
+    """Renew an idle session.
 
     The live loop sleeps between calls. The Copilot CLI can destroy a native
     session that has never received a prompt during that gap (its stale-session
     cleanup fires after about 35 minutes of idle). The next maintain() sees the
-    process gone. Tool use, pre-prompt model output, and a lost hub heartbeat
-    keep their own codes.
+    process gone, the idle deadline passed, or a dead pipe. Only those become
+    copilot_warm_session_lost.
+
+    copilot_hub_heartbeat_lost is re-raised with the native session still
+    alive. Native._tick advances next_renew only after renew() returns, so the
+    renew stays due and the next maintain() retries it.
+
+    Every other vetted CopilotError closes the handle and is re-raised with
+    its own code. BrokerError and MutationUncertain from renew(), and any
+    other non-vetted exception, close the handle and become
+    copilot_idle_renew_failed.
     """
     need(not handle.finished and not handle.attempted and not handle.close_failed and handle.native is not None,
          'copilot_handle_not_idle')
@@ -586,10 +597,16 @@ def maintain(handle):
         return handle.readiness
     except Exception as error:
         code = provider_errors.error_code(error)
-        close(handle)
-        if code in IDLE_MAINTAIN_FAILURES:
+        # Leave the native process and the due renew in place. Closing here
+        # would make the retry target a finished handle.
+        if code == 'copilot_hub_heartbeat_lost':
             raise
-        raise CopilotError('copilot_warm_session_lost') from None
+        close(handle)
+        if isinstance(error, OSError) or code in IDLE_SESSION_LOSS:
+            raise CopilotError('copilot_warm_session_lost') from None
+        if isinstance(error, CopilotError):
+            raise
+        raise CopilotError('copilot_idle_renew_failed') from None
 
 
 def execute(handle, prompt, task_deadline, *, task_kind='project'):
