@@ -4,7 +4,9 @@ Same image as the `live-image-controller-live-20260922c` pack (Dockerfile layout
 
 Build (from the repository root, under the deployer identity, never the shared human account):
 
-    gcloud builds submit --config live-image-controller/cloudbuild.json .
+    gcloud builds submit --config live-image-controller/cloudbuild.json \n      --gcs-source-staging-dir=gs://project-0c6d31fa-509e-4116-a2c_cloudbuild/source .
+
+The config runs the build as `runcrew-op-deploy` (`serviceAccount` in `cloudbuild.json`), because the project's default Cloud Build runtime account holds no roles. The explicit staging directory is required: the deployer identity deliberately lacks `storage.buckets.list`, which `builds submit` otherwise calls. The deployer needs object read on that bucket, `artifactregistry.writer` on `runcrew-hub`, `logging.logWriter`, and `serviceusage.serviceUsageConsumer`.
 
 The build fails if `test_fleet_controller.py` (14 tests, including the reset checks), `test_dynamic_broker_review.py`, `test_dynamic_broker.py` or `serve.py --check` fail, so a build status of `SUCCESS` from `gcloud builds describe <id>` is the gate: Docker does not produce an image if any RUN line fails. Build logs go to Cloud Logging only (as in the pack); reading them is optional. The base image is the tag `python:3.12-slim-bookworm`, as in the pack; after the first build, pin the digest it resolved (from the build's pull line) in the Dockerfile for reproducibility.
 
