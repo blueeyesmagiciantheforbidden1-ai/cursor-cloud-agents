@@ -258,8 +258,14 @@ class ExecutionGrantStore:
 
     def _record(self, execution, execution_uid):
         b = self.binding
-        require(_execution(b.profile, execution) == execution and isinstance(execution_uid, str)
-                and UID.fullmatch(execution_uid), 'execution_not_authorized')
+        # Cloud Run echoes execution names with the project ID or the project
+        # number, not consistently (2026-09-22/23). _execution() scopes the name
+        # and returns the canonical number form; accept either and record that.
+        try:
+            execution = _execution(b.profile, execution)
+        except BrokerError:
+            raise BoundaryError('execution_not_authorized') from None
+        require(isinstance(execution_uid, str) and UID.fullmatch(execution_uid), 'execution_not_authorized')
         return {**b.profile.binding(), 'caller_subject': b.caller_subject,
                 'caller_service_account': b.caller_service_account, 'grant_sha256': b.grant_sha256,
                 'expires_at': b.expires_at, 'execution': execution, 'execution_uid': execution_uid}
@@ -277,6 +283,7 @@ class ExecutionGrantStore:
     def publish(self, execution, execution_uid):
         require(self.clock() < self.binding.expires_at <= self.clock() + 86400, 'execution_grant_expired')
         record = self._record(execution, execution_uid)
+        execution = record['execution']
         observed = CloudCredentialBroker(self.binding.profile, rest=self.rest)._execution_status(execution)
         require(observed.get('uid') == execution_uid
                 and observed.get('template', {}).get('serviceAccount') == self.binding.caller_service_account

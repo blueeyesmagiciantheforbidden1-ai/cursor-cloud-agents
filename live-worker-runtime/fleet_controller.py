@@ -97,13 +97,31 @@ class Controller:
             require(state.get('execution_uid') == previous['uid'], 'credential_release_execution_mismatch')
         return state
 
-    def current_terminal(self, job):
+    def never_bound(self, state, value):
+        """True when the latest execution is this slot's own launch whose grant was never published.
+
+        Such an execution could not acquire the credential (the worker dies at
+        bootstrap without a grant), so the broker's release record still names
+        the previous holder; demanding equality with it would deadlock the slot.
+        """
+        if not isinstance(state, dict) or state.get('execution_uid') != value.get('uid'):
+            return False
+        if value.get('failedCount') != 1 or value.get('succeededCount', 0) != 0:
+            return False
+        grant_sha256, expires_at = state.get('grant_sha256'), state.get('expires_at')
+        if not (isinstance(grant_sha256, str) and re.fullmatch(r'[a-f0-9]{64}', grant_sha256) and type(expires_at) is int):
+            return False
+        return self.grant_factory(self.policy.binding(grant_sha256, expires_at)).read() is None
+
+    def current_terminal(self, job, state=None):
         latest = job.get('latestCreatedExecution', {}).get('name')
         require(isinstance(latest, str) and latest, 'prior_execution_required')
         if '/' not in latest: latest = self.policy.profile.job_name + '/executions/' + latest
         value = exact_execution(self.policy, self.cloud.get(latest))
         require(terminal(value) and value.get('runningCount', 0) == 0, 'prior_execution_still_active')
-        self.idle_credential(value)
+        # A clean release is always required; the releasing execution must be
+        # this one unless this one never held the credential at all.
+        self.idle_credential(None if self.never_bound(state, value) else value)
         return value
 
     def save(self, state, version, **changes):
@@ -128,7 +146,7 @@ class Controller:
             if phase == 'idle':
                 if self.clock() < state.get('next_launch_at', 0):
                     return {'status': 'replacement_cooldown', 'generation': state['generation']}
-                job = self.job(); previous = self.current_terminal(job)
+                job = self.job(); previous = self.current_terminal(job, state)
                 grant = secrets.token_urlsafe(48)
                 state, version = self.save(state, version, phase='binding_intent',
                     generation=state['generation'] + 1, intent=uuid.uuid4().hex,
@@ -139,7 +157,7 @@ class Controller:
                 state, version = self.save(state, version, phase='binding_ready')
                 continue
             if phase == 'binding_ready':
-                job = self.job(); previous = self.current_terminal(job)
+                job = self.job(); previous = self.current_terminal(job, state)
                 require(previous['uid'] == state['previous_uid'], 'another_execution_intervened')
                 require(state['expires_at'] > self.clock() + 6000, 'fresh_grant_required')
                 state, version = self.save(state, version, phase='launch_intent',
@@ -163,10 +181,14 @@ class Controller:
                     return {'status': state['phase'], 'generation': state['generation']}
                 execution = exact_execution(self.policy, matches[0], state['intent'])
                 require(not terminal(execution), 'worker_finished_before_grant')
+                # Cloud Run echoes the project ID; the grant store, the broker
+                # and the profiles use the project number. Store and publish the
+                # canonical form, or publish is refused and the slot parks here.
+                name = canonical_name(execution['name'])
                 state, version = self.save(state, version, phase='grant_intent',
-                    execution=execution['name'], execution_uid=execution['uid'])
+                    execution=name, execution_uid=execution['uid'])
                 binding = self.policy.binding(state['grant_sha256'], state['expires_at'])
-                self.grant_factory(binding).publish(execution['name'], execution['uid'])
+                self.grant_factory(binding).publish(name, execution['uid'])
                 state, version = self.save(state, version, phase='active', grant=None)
                 return {'status': 'job_running_readiness_separate', 'execution': state['execution'],
                         'worker_id': self.policy.profile.provider + '-live-' + state['execution_uid'].replace('-', ''),
@@ -211,7 +233,7 @@ class Controller:
         require(state is not None and state.get('config_sha256') == self.config_sha, 'controller_config_changed')
         require(state.get('phase') in self.STOPPED, 'slot_not_stopped')
         phase = state['phase']
-        previous = self.current_terminal(self.job())
+        previous = self.current_terminal(self.job(), state)
         state_error = state.get('error')
         cleared = {key: value for key, value in state.items() if key != 'error'}
         state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'])

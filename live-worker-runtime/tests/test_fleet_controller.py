@@ -9,6 +9,7 @@ SOURCE = Path('C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(SOURCE))
 
 from fleet_controller import Controller, ControllerError, digest
+from agent_hub.credential_broker_service import BoundaryError
 from test_dynamic_broker import POLICY
 
 PRIOR_UID = '11111111-1111-1111-1111-111111111111'
@@ -65,11 +66,15 @@ class Bindings:
 
 
 class Grants:
-    def __init__(self): self.calls = 0; self.lose_reply = False
+    def __init__(self): self.calls = 0; self.lose_reply = False; self.refuse = 0; self.published = []
     def factory(self, binding): return self
+    def read(self): return self.published[-1] if self.published else None
     def publish(self, execution, uid):
         self.calls += 1
         if self.lose_reply: raise OSError('offline lost publication acknowledgement')
+        if self.refuse:
+            self.refuse -= 1; raise BoundaryError('execution_not_authorized')
+        self.published.append((execution, uid))
 
 
 class FleetReviewTests(unittest.TestCase):
@@ -135,21 +140,62 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(cloud.run_count, 2); self.assertEqual(store.state['generation'], 2)
 
     def test_reset_reconciles_slot_stuck_in_grant_intent(self):
-        # A refused or lost grant publication leaves the slot at grant_intent
-        # forever and the worker dies at bootstrap without a grant.
+        # A lost grant publication leaves the slot at grant_intent forever and
+        # the worker dies at bootstrap without a grant. The broker's release
+        # record still names the PREVIOUS execution, because this one never
+        # held the credential; the slot must not deadlock on that.
         controller, store, cloud, broker, _, grants = self.make(); grants.lose_reply = True
         with self.assertRaises(OSError): controller.tick()
         self.assertEqual(store.state['phase'], 'grant_intent')
         with self.assertRaises(ControllerError): controller.reset()  # execution still running
         cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
             reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
-        broker.state.update(execution_uid=NEXT_UID)
+        self.assertEqual(broker.state['execution_uid'], PRIOR_UID)
         result = controller.reset()
         self.assertEqual(result['status'], 'idle'); self.assertEqual(result['from_phase'], 'grant_intent')
         self.assertEqual(store.state['phase'], 'idle'); self.assertEqual(cloud.run_count, 1)
         grants.lose_reply = False; controller.clock = lambda: 1100
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
         self.assertEqual(cloud.run_count, 2)
+
+    def test_never_bound_rule_needs_an_unpublished_grant_and_a_failed_execution(self):
+        controller, store, cloud, broker, _, grants = self.make(); controller.tick()
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        # The grant WAS published, so this execution held the credential: the
+        # broker record must name it, and the mismatch is a real refusal.
+        self.assertEqual(len(grants.published), 1)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        with self.assertRaises(ControllerError) as caught: controller.reset()
+        self.assertEqual(str(caught.exception), 'credential_release_execution_mismatch')
+
+    def test_execution_names_are_stored_and_published_in_canonical_form(self):
+        controller, store, cloud, _, _, grants = self.make()
+        original_run = cloud.run
+        def run(name, request):
+            result = original_run(name, request)
+            cloud.executions_by_name[NEXT]['name'] = NEXT.replace('projects/496481413971/', 'projects/project-0c6d31fa-509e-4116-a2c/', 1)
+            return result
+        cloud.run = run
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['execution'], NEXT)
+        self.assertEqual(grants.published, [(NEXT, NEXT_UID)])
+
+    def test_refused_grant_publication_parks_the_slot_for_reconciliation(self):
+        controller, store, _, _, _, grants = self.make(); grants.refuse = 1
+        with self.assertRaises(BoundaryError): controller.tick()
+        self.assertEqual(grants.calls, 1); self.assertEqual(store.state['phase'], 'grant_intent')
+
+    def test_never_bound_requires_this_slots_own_failed_execution(self):
+        for change in ({'succeededCount': 1, 'failedCount': 0}, {'uid': '44444444-4444-4444-4444-444444444444'}):
+            with self.subTest(change=change):
+                controller, store, cloud, _, _, grants = self.make(); grants.lose_reply = True
+                with self.assertRaises(OSError): controller.tick()
+                cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+                    reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+                cloud.executions_by_name[NEXT].update(change)
+                with self.assertRaises(ControllerError): controller.reset()
+                self.assertEqual(store.state['phase'], 'grant_intent')
 
     def test_reset_refuses_unless_credential_cleanly_released(self):
         for change in ({'phase': 'quarantined'}, {'quarantine_reason': 'provider_refresh_uncertain'},
@@ -235,6 +281,19 @@ class FleetReviewTests(unittest.TestCase):
         original = cloud.get
         cloud.get = lambda name: original(name) if name in cloud.executions_by_name else deepcopy(cloud.job)
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+
+
+class GrantStoreNameFormTests(unittest.TestCase):
+    def test_record_accepts_either_echo_form_and_stores_the_canonical_one(self):
+        from types import SimpleNamespace
+        from agent_hub.credential_broker_service import BoundaryError, ExecutionGrantStore
+        binding = POLICY.binding('a' * 64, 2000)
+        store = ExecutionGrantStore(binding, rest=SimpleNamespace(), clock=lambda: 1000)
+        id_form = NEXT.replace('projects/496481413971/', 'projects/project-0c6d31fa-509e-4116-a2c/', 1)
+        self.assertEqual(store._record(id_form, NEXT_UID)['execution'], NEXT)
+        self.assertEqual(store._record(NEXT, NEXT_UID)['execution'], NEXT)
+        with self.assertRaises(BoundaryError):
+            store._record('projects/496481413971/locations/us-central1/jobs/other-job/executions/other-job-abcde', NEXT_UID)
 
 
 if __name__ == '__main__': unittest.main()
