@@ -22,6 +22,7 @@ import time
 
 import metadata
 import protocol_gate
+import broker_renew
 import provider_errors
 import transport
 
@@ -35,6 +36,7 @@ WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
 # timeout (5400 s) already reserves a full task past that window, so execute()
 # does not cap the native deadline on warm_deadline.
 EXECUTE_WARM_FLOOR = FINALIZE_RESERVE + 30
+RENEW_SECONDS = 20
 # Recorded by the successful pinned Linux build in two independent empty homes.
 CONFIG_SHA = 'c584ec84021d23203d0c444cf474c3f184a0b759faf51bed0ba1fc16361af9cf'
 REQUIREMENTS_SHA = '25b86fa3671a4ee1ea904a1f5777c164347763d01dda591fcac3022b64235e10'
@@ -115,6 +117,9 @@ def _deadline(value):
 
 class WarmRPC(transport.TurnRPC):
     """Original strict transport with serialized metadata on an idle thread."""
+    # FixtureRPC skips __init__, so the retry slot has to exist on the class.
+    renew_retry_at = None
+
     def __init__(self, *args, **kwargs):
         try:
             super().__init__(*args, **kwargs)
@@ -137,6 +142,12 @@ class WarmRPC(transport.TurnRPC):
             self.protocol_state = 'thread_ready'
         self._idle_metadata = False
         return result
+
+    def tick(self):
+        super().tick()  # base-image NativeRPC.tick sets next_renew = now+25 once renew() returns
+        retry, self.renew_retry_at = self.renew_retry_at, None
+        if retry is not None:
+            self.next_renew = min(self.next_renew, retry)
 
     def _notification(self, value):
         if getattr(self, '_idle_metadata', False):
@@ -232,6 +243,7 @@ class Handle:
     session: object = field(repr=False)
     heartbeat: object = field(repr=False)
     warm_deadline: float
+    lease_clock: object = field(default=None, repr=False)
     native: object = field(default=None, repr=False)
     gate: object = field(default=None, repr=False)
     thread_response: dict | None = field(default=None, repr=False)
@@ -268,10 +280,13 @@ def _idle_hub_loss(handle, error):
             and provider_errors.error_code(error) == 'hub_lease_lost')
 
 
-def _renew(handle):
-    handle.session.broker.renew(handle.session.lease)
+def _renew(handle, *, strict=False):
+    renewed = handle.lease_clock.renew(handle.session.broker, handle.session.lease, strict=strict)
     need(handle.heartbeat() is True, 'hub_lease_lost')
-    handle.next_renew = time.monotonic() + 20
+    handle.next_renew = broker_renew.next_due(renewed, RENEW_SECONDS)
+    if renewed is False and handle.native is not None:
+        handle.native.renew_retry_at = handle.next_renew
+    return renewed
 
 
 def _quota(value, canonical):
@@ -413,7 +428,8 @@ def prepare(session, heartbeat, deadline):
          'exact_broker_profile_execution_required')
     need(not getattr(session, '_codex_live_prepared', False), 'native_session_already_prepared')
     session._codex_live_prepared = True
-    handle = Handle(session, heartbeat, time.monotonic() + WARM_SECONDS)
+    handle = Handle(session, heartbeat, time.monotonic() + WARM_SECONDS,
+                    lease_clock=broker_renew.LeaseClock.for_lease(session.lease, LiveCodexError, 'codex'))
     try:
         broker.assert_current(lease)
         _prepare_home(session)
@@ -441,18 +457,20 @@ def maintain(handle):
     try:
         need(handle.state == 'ready' and not handle.consumed, 'prepared_handle_required')
         need(time.monotonic() < handle.warm_deadline, 'warm_session_expired')
-        handle.native.deadline = min(handle.warm_deadline, time.monotonic() + 30)
-        handle.native.poll_idle()
-        if time.monotonic() >= handle.next_renew:
-            try:
+        # A failed renew attempt can take about 30s, and NativeRPC.tick checks
+        # the deadline after renew (native_metadata_timeout).
+        handle.native.deadline = min(handle.warm_deadline, time.monotonic() + 45)
+        try:
+            handle.native.poll_idle()
+            if time.monotonic() >= handle.next_renew:
                 _renew(handle)
-            except Exception as error:
-                # Idle renew only reaches the hub. A dropped heartbeat is retried
-                # on the next maintain; closing the native process fails the warm run.
-                # _renew sets next_renew only after the heartbeat returns, so a
-                # miss stays due. A non-vetted broker failure still fails below.
-                if not _idle_hub_loss(handle, error):
-                    raise
+        except Exception as error:
+            # Idle renew only reaches the hub. A dropped heartbeat is retried
+            # on the next maintain; closing the native process fails the warm run.
+            # _renew sets next_renew only after the heartbeat returns, so a
+            # miss stays due. A non-vetted broker failure still fails below.
+            if not _idle_hub_loss(handle, error):
+                raise
         return handle.readiness
     except Exception as error:
         _fail(handle, error)
@@ -474,7 +492,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         handle.state = 'executing'
         handle.native.deadline = min(task_deadline - FINALIZE_RESERVE, time.monotonic() + NATIVE_SECONDS)
         handle.session.broker.assert_current(handle.session.lease)
-        _renew(handle)
+        _renew(handle, strict=True)
         _collect(handle)
         handle.gate.accept_thread(handle.thread_response)
         handle.gate._fresh()

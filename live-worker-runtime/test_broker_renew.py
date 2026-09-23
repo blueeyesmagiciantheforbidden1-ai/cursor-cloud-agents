@@ -1,0 +1,195 @@
+"""Unit tests for the shared broker-renew tolerance helper."""
+import time
+import unittest
+from pathlib import Path
+
+import broker_renew
+import dynamic_broker
+import provider_errors
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
+from agent_hub.credential_broker_service import BoundaryError
+
+
+class CodeError(provider_errors.ProviderCodeError, RuntimeError):
+    pass
+
+
+class Clock:
+    def __init__(self, now=0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def broker(effect):
+    def renew(lease):
+        effect()
+    return type('Broker', (), {'renew': staticmethod(renew)})()
+
+
+class BrokerRenewTests(unittest.TestCase):
+    def clock_for(self, provider='grok', anchor=0, now=0):
+        clock = Clock(now)
+        return broker_renew.LeaseClock(CodeError, provider, anchor, clock=clock), clock
+
+    def test_classification(self):
+        for code in ('broker_http_outcome_uncertain', 'broker_acknowledgement_invalid'):
+            self.assertTrue(broker_renew.transient(MutationUncertain(code)))
+        for code in broker_renew.TRANSIENT_BOUNDARY_CODES:
+            self.assertTrue(broker_renew.transient(BoundaryError(code)))
+        self.assertFalse(broker_renew.transient(Conflict('broker_operation_rejected')))
+        self.assertFalse(broker_renew.transient(BrokerError('broker_request_denied')))
+        self.assertFalse(broker_renew.transient(BrokerError('exact_secret_version_required')))
+        for code in ('credential_fence_lost', 'request_invalid', 'message_too_large'):
+            self.assertFalse(broker_renew.transient(BoundaryError(code)))
+        self.assertFalse(broker_renew.transient(RuntimeError('transport_failed')))
+
+    def test_window_edge_tolerates_180_and_fails_above(self):
+        lease_clock, clock = self.clock_for(anchor=0, now=0)
+
+        def fail():
+            raise MutationUncertain('broker_http_outcome_uncertain')
+
+        clock.now = broker_renew.TOLERANCE_SECONDS
+        self.assertIs(lease_clock.renew(broker(fail), None), False)
+        self.assertEqual(lease_clock.renewed_at, 0)
+        self.assertTrue(lease_clock.degraded)
+        clock.now = broker_renew.TOLERANCE_SECONDS + 1
+        with self.assertRaises(CodeError) as caught:
+            lease_clock.renew(broker(fail), None)
+        self.assertEqual(str(caught.exception), 'grok_broker_renew_failed')
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn('broker_http', str(caught.exception))
+
+    def test_attempt_duration_counts_toward_the_window(self):
+        lease_clock, clock = self.clock_for(anchor=0, now=0)
+
+        def slow():
+            clock.now = broker_renew.TOLERANCE_SECONDS + 1
+            raise BoundaryError('transport_failed')
+
+        with self.assertRaisesRegex(CodeError, '^grok_broker_renew_failed$'):
+            lease_clock.renew(broker(slow), None)
+        lease_clock, clock = self.clock_for(anchor=0, now=0)
+
+        def inside():
+            clock.now = broker_renew.TOLERANCE_SECONDS
+            raise BoundaryError('transport_limit')
+
+        self.assertIs(lease_clock.renew(broker(inside), None), False)
+
+    def test_success_anchors_at_attempt_start_and_clears_failures(self):
+        lease_clock, clock = self.clock_for(anchor=0, now=10)
+        lease_clock.failures = 2
+
+        def renew():
+            clock.now = 40
+
+        self.assertIs(lease_clock.renew(broker(renew), None), True)
+        self.assertEqual(lease_clock.renewed_at, 10)
+        self.assertEqual(lease_clock.failures, 0)
+        self.assertFalse(lease_clock.degraded)
+
+    def test_rejections_are_immediate_and_do_not_move_the_anchor(self):
+        for error in (Conflict('broker_operation_rejected'), BrokerError('broker_request_denied'),
+                      BoundaryError('credential_fence_lost'), BoundaryError('request_invalid'),
+                      BoundaryError('message_too_large')):
+            with self.subTest(error=type(error).__name__ + ':' + str(error)):
+                lease_clock, clock = self.clock_for(provider='copilot', anchor=5, now=5)
+
+                def fail(error=error):
+                    raise error
+
+                with self.assertRaises(CodeError) as caught:
+                    lease_clock.renew(broker(fail), None)
+                self.assertEqual(str(caught.exception), 'copilot_broker_renew_rejected')
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(caught.exception.__suppress_context__)
+                self.assertNotIn(str(error), str(caught.exception))
+                self.assertEqual(lease_clock.renewed_at, 5)
+                self.assertEqual(lease_clock.failures, 0)
+
+    def test_strict_fails_a_transient_inside_the_window(self):
+        lease_clock, clock = self.clock_for(provider='claude', anchor=0, now=1)
+
+        def fail():
+            raise MutationUncertain('broker_acknowledgement_invalid')
+
+        with self.assertRaisesRegex(CodeError, '^claude_broker_renew_failed$'):
+            lease_clock.renew(broker(fail), None, strict=True)
+        self.assertEqual(lease_clock.renewed_at, 0)
+
+    def test_non_broker_and_base_exception_propagate(self):
+        lease_clock, clock = self.clock_for()
+
+        def bug():
+            raise RuntimeError('adapter bug')
+
+        with self.assertRaises(RuntimeError) as caught:
+            lease_clock.renew(broker(bug), None)
+        self.assertIn('adapter bug', str(caught.exception))
+        self.assertEqual(lease_clock.failures, 0)
+
+        def stop():
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            lease_clock.renew(broker(stop), None)
+
+    def test_check_backstop_and_invalid_construction(self):
+        lease_clock, clock = self.clock_for(provider='cursor', anchor=0, now=broker_renew.TOLERANCE_SECONDS)
+        lease_clock.check()
+        clock.now = broker_renew.TOLERANCE_SECONDS + 1
+        with self.assertRaisesRegex(CodeError, '^cursor_broker_renew_failed$'):
+            lease_clock.check()
+        with self.assertRaises(TypeError):
+            broker_renew.LeaseClock(CodeError, 'other', 0)
+        with self.assertRaises(TypeError):
+            broker_renew.LeaseClock(RuntimeError, 'grok', 0)
+        with self.assertRaises(TypeError):
+            broker_renew.LeaseClock(CodeError, 'grok', True)
+
+    def test_acquire_anchor_registry_and_prepare_fallback(self):
+        lease_id = 'ab' * 16
+        started = 12.5
+        with self.subTest('recorded'):
+            broker_renew._acquire_started.pop(lease_id, None)
+            broker_renew.record_acquire_start(lease_id, started)
+            clock = Clock(99)
+            lease = type('Lease', (), {'lease_id': lease_id})()
+            lease_clock = broker_renew.LeaseClock.for_lease(lease, CodeError, 'codex', clock=clock)
+            self.assertEqual(lease_clock.renewed_at, started)
+            self.assertIs(lease_clock.clock, clock)
+        with self.subTest('fallback'):
+            clock = Clock(40)
+            lease_clock = broker_renew.LeaseClock.for_lease(object(), CodeError, 'codex', clock=clock)
+            self.assertEqual(lease_clock.renewed_at, 40)
+        broker_renew._acquire_started.pop(lease_id, None)
+
+    def test_next_due(self):
+        clock = Clock(100)
+        self.assertEqual(broker_renew.next_due(False, 20, clock), 100 + broker_renew.RETRY_SECONDS)
+        self.assertEqual(broker_renew.next_due(True, 20, clock), 120)
+        self.assertEqual(broker_renew.next_due(None, 8, clock), 108)
+        self.assertEqual(broker_renew.next_due(False, 25, clock), 110)
+
+    def test_lease_seconds_matches_policy_default(self):
+        default = dynamic_broker.Policy.__dataclass_fields__['lease_seconds'].default
+        self.assertEqual(broker_renew.LEASE_SECONDS, default)
+        self.assertEqual(broker_renew.TOLERANCE_SECONDS, broker_renew.LEASE_SECONDS - broker_renew.CLOSE_RESERVE_SECONDS)
+        self.assertEqual(broker_renew.TOLERANCE_SECONDS, 180)
+        self.assertEqual(broker_renew.RETRY_SECONDS, 10)
+
+    def test_entrypoint_stamps_acquire_start(self):
+        source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')
+        acquire_at = source.index('lease = broker.acquire(')
+        before, after = source[:acquire_at], source[acquire_at:]
+        self.assertIn('acquire_started = time.monotonic()', before)
+        self.assertLess(before.rindex('time.monotonic()'), acquire_at)
+        self.assertIn('broker_renew.record_acquire_start(lease.lease_id, acquire_started)', after)
+
+
+if __name__ == '__main__':
+    unittest.main()

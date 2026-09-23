@@ -5,7 +5,7 @@ The five worker images (claude, codex, copilot, cursor, grok) are not built dire
 They are built from packs kept outside git (`live-image-<provider>-<version>-source/`: `Dockerfile`, `cloudbuild.json`, `agent_hub/`, `live/`). `refresh_packs.py` makes a new versioned pack from a base pack and this checkout:
 
 - `Dockerfile` and `agent_hub/` are taken from the base pack unchanged (each worker `FROM`s its provider's verified base image by digest; image-only modules such as `metadata`, `transport`, `protocol_gate` and the codex `credential_state` come from that base).
-- `live/` is replaced with this checkout's `live_loop.py`, `provider_errors.py`, `entrypoint.py`, `dynamic_broker.py`, the provider adapter, `_grok_protocol.py` for grok, `credential_state_<provider>.py` renamed to `credential_state.py` for claude and cursor, `cursor_native/` for cursor, and the tests the Dockerfile runs.
+- `live/` is replaced with this checkout's `live_loop.py`, `provider_errors.py`, `broker_renew.py`, `entrypoint.py`, `dynamic_broker.py`, the provider adapter, `_grok_protocol.py` for grok, `credential_state_<provider>.py` renamed to `credential_state.py` for claude and cursor, `cursor_native/` for cursor, and the tests the Dockerfile runs.
 - The owner pin is restored from `--owner-email` in the three pinned files. The tool refuses to overwrite an existing pack.
 
     python live-image-workers/refresh_packs.py --packs C:\API_KEYS\cloud-agent-online \

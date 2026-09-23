@@ -28,6 +28,7 @@ from agent_hub import claude_runtime as rt
 from agent_hub import subscription_auth as auth
 from agent_hub.adapters import Command
 from agent_hub.billing_policy import AuthEvidence, BillingPolicy, enforce_billing_policy
+import broker_renew
 import provider_errors
 
 MODEL = 'claude-fable-5-1'
@@ -200,14 +201,17 @@ class Native:
 
         Used while idle (maintain) and while a prompt is in flight (send/receive).
         next_renew advances only after renew returns, so a failed renewal stays due.
-        Anything renew raises that is not already a vetted provider code becomes one.
+        A tolerated broker failure re-arms after the retry interval; a confirmed
+        renew keeps the 20s cadence. Anything renew raises that is not already a
+        vetted provider code becomes one.
         """
         need(time.monotonic() < self.deadline, 'claude_deadline')
         need(not self.frames.failed.is_set(), 'claude_protocol_output_invalid')
         if time.monotonic() < self.next_renew:
             return
+        renewed = None
         try:
-            self.renew()
+            renewed = self.renew()
         except Exception as error:
             code = provider_errors.error_code(error)
             if code:
@@ -216,7 +220,7 @@ class Native:
             if not provider_errors.SAFE_CODE.fullmatch(text):
                 text = 'claude_lease_renew_failed'
             raise NativeError(text) from None
-        self.next_renew = time.monotonic() + 20
+        self.next_renew = broker_renew.next_due(renewed, 20)
 
     def send(self, value, *, close=False):
         payload = (json.dumps(value, ensure_ascii=False, allow_nan=False) + '\n').encode('utf-8')
@@ -379,6 +383,7 @@ NativeProcess = Native
 class Handle:
     session: object = field(repr=False)
     heartbeat: object = field(repr=False)
+    lease_clock: object = field(default=None, repr=False)
     native: object = field(default=None, repr=False)
     environment: dict = field(default_factory=dict, repr=False)
     preflight: dict = field(default_factory=dict)
@@ -399,8 +404,9 @@ class Handle:
 
 
 def _renew(handle):
-    handle.session.broker.renew(handle.session.lease)
+    renewed = handle.lease_clock.renew(handle.session.broker, handle.session.lease)
     need(handle.heartbeat() is True, 'claude_hub_heartbeat_lost')
+    return renewed
 
 
 def _token(session):
@@ -439,7 +445,8 @@ def prepare(session, heartbeat, deadline):
     """Authenticate and create one warm, model/effort-verified headless session."""
     _deadline(deadline)
     need(session.state == 'active' and session.lease.account_ref == ACCOUNT_REF, 'claude_owner_lease_required')
-    handle = Handle(session=session, heartbeat=heartbeat)
+    handle = Handle(session=session, heartbeat=heartbeat,
+                    lease_clock=broker_renew.LeaseClock.for_lease(session.lease, NativeError, 'claude'))
     try:
         session.broker.assert_current(session.lease)
         environment = auth.claude_environment(_token(session))
@@ -502,6 +509,9 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(task_kind == 'project', 'claude_automatic_improvement_not_enabled')
         need(type(prompt) is str and 0 < len(prompt.encode()) <= MAX_PROMPT_BYTES, 'claude_prompt_limit')
         handle.native.deadline = _deadline(task_deadline)
+        if handle.lease_clock.degraded:
+            handle.lease_clock.renew(handle.session.broker, handle.session.lease, strict=True)
+            handle.native.next_renew = time.monotonic() + 20
         need(handle.heartbeat() is True, 'claude_hub_heartbeat_lost')
         handle.attempted = True
         result = handle.native.prompt(prompt)

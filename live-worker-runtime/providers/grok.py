@@ -1,7 +1,8 @@
 """Warm, single-task Grok subscription adapter for explicit project prompts.
 
-No commissioning room, browser receipt, cloud client or automatic task claim is
-imported. The caller owns the exact execution grant, task journal and budgets.
+No commissioning room, browser receipt or automatic task claim is imported;
+broker exception types come only through broker_renew. The caller owns the
+exact execution grant, task journal and budgets.
 Deadlines are absolute time.monotonic() values. Call maintain() during idle wait
 and close() on every drain. This first route denies all tools and improvement.
 """
@@ -16,6 +17,7 @@ import re
 import time
 from uuid import uuid4
 
+import broker_renew
 from ._grok_protocol import Native, NativeError, NativeStartupStopped, need, unwrap
 
 MODEL = 'grok-4.7'
@@ -188,6 +190,7 @@ lsp_tools=false
 class Handle:
     session: object = field(repr=False)
     heartbeat: object = field(repr=False)
+    lease_clock: object = field(default=None, repr=False)
     native: object = field(default=None, repr=False)
     sid: str = field(default='', repr=False)
     preflight: dict = field(default_factory=dict)
@@ -209,8 +212,9 @@ class Handle:
 
 
 def _renew(handle):
-    handle.session.broker.renew(handle.session.lease)
+    renewed = handle.lease_clock.renew(handle.session.broker, handle.session.lease)
     need(handle.heartbeat() is True, 'grok_hub_heartbeat_lost')
+    return renewed
 
 
 def close(handle):
@@ -241,7 +245,8 @@ def prepare(session, heartbeat, deadline):
     """Authenticate and create one warm, model/effort-verified headless session."""
     _deadline(deadline)
     need(session.state == 'active' and session.lease.account_ref == ACCOUNT_REF, 'grok_owner_lease_required')
-    handle = Handle(session=session, heartbeat=heartbeat)
+    handle = Handle(session=session, heartbeat=heartbeat,
+                    lease_clock=broker_renew.LeaseClock.for_lease(session.lease, NativeError, 'grok'))
     try:
         session.broker.assert_current(session.lease)
         _home(session)
@@ -281,12 +286,11 @@ def prepare(session, heartbeat, deadline):
 
 
 def maintain(handle):
-    """Call during idle polling at least every 20s, before the 180s lease expires."""
+    """Call during idle polling. The lease is 240s; transient renew failures are tolerated for 180s."""
     need(not handle.finished and not handle.attempted and not handle.close_failed and handle.native is not None, 'grok_handle_not_idle')
     need(handle.native.process.poll() is None, 'grok_warm_process_ended')
     if time.monotonic() >= handle.native.next_renew:
-        _renew(handle)
-        handle.native.next_renew = time.monotonic()+20
+        handle.native.next_renew = broker_renew.next_due(_renew(handle), 20)
     return handle.readiness
 
 
@@ -332,6 +336,9 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(type(prompt) is str and 0 < len(prompt.encode()) <= MAX_PROMPT_BYTES, 'grok_prompt_limit')
         handle.native.deadline = _deadline(task_deadline)
         handle.preflight = _fresh_metadata(handle.native)  # Never reuse stale idle-time quota.
+        if handle.lease_clock.degraded:  # never send the prompt on an unconfirmed lease
+            handle.lease_clock.renew(handle.session.broker, handle.session.lease, strict=True)
+            handle.native.next_renew = time.monotonic() + 20
         need(handle.heartbeat() is True, 'grok_hub_heartbeat_lost')
         nonce = str(uuid4())
         handle.native.notifications.clear()

@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from agent_hub.cloud_credential_broker import BrokerError, MutationUncertain
+import broker_renew
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
+from agent_hub.credential_broker_service import BoundaryError
 from providers import copilot as c
 
 
@@ -53,6 +55,7 @@ class FakeNative:
         self.instances.append(self)
 
     def request(self, method, params=None):
+        c.Native._tick(self)
         self.calls.append((method, copy.deepcopy(params)))
         if method == 'connect': return {'protocolVersion': 3}
         if method == 'auth.getStatus': return copy.deepcopy(self.owner)
@@ -75,15 +78,15 @@ class FakeNative:
 
     def maintain(self):
         # Same order as Native._tick: a raising renew leaves next_renew due.
-        if time.monotonic() >= self.next_renew:
-            self.renew()
-            self.next_renew = time.monotonic() + 20
+        c.Native._tick(self)
         if self.maintain_error is not None: raise self.maintain_error
         if self.fail_maintain: raise c.CopilotError('copilot_native_deadline_expired')
         if self.fail_maintain_code: raise c.CopilotError(self.fail_maintain_code)
         if self.process.poll() is not None: raise c.CopilotError('copilot_warm_process_ended')
 
-    def next_event(self): return self.events.pop(0)
+    def next_event(self):
+        c.Native._tick(self)
+        return self.events.pop(0)
 
     def drain_after_shutdown(self):
         self.native_stopped = True
@@ -275,22 +278,113 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(handle.finished)
         self.assertIs(handle.native, native)
 
-    def test_broker_renew_errors_close_as_idle_renew_failed(self):
-        for error in (BrokerError('private broker detail'), MutationUncertain('private mutation detail')):
-            with self.subTest(error=type(error).__name__):
+    def test_transient_renew_failure_keeps_idle_session_and_retries(self):
+        errors = (MutationUncertain('private mutation detail'), BoundaryError('transport_failed'),
+                  BoundaryError('metadata_identity_unavailable'))
+        for error in errors:
+            with self.subTest(error=type(error).__name__ + ':' + str(error)):
                 self.session.state = 'active'
+                self.broker.renew.side_effect = error
+                self.heartbeat.reset_mock()
+                handle = self.prepare(); native = handle.native
+                anchor = handle.lease_clock.renewed_at
+                native.next_renew = time.monotonic() - 1
+                readiness = c.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertFalse(handle.finished)
+                self.assertFalse(handle.close_failed)
+                self.assertIs(handle.native, native)
+                self.assertIsNone(native.process.poll())
+                self.assertEqual(self.broker.renew.call_count, 1)
+                self.heartbeat.assert_called()
+                self.session.finish.assert_not_called()
+                self.broker.quarantine.assert_not_called()
+                self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                now = time.monotonic()
+                self.assertGreater(native.next_renew, now)
+                self.assertLessEqual(native.next_renew, now + broker_renew.RETRY_SECONDS)
+                self.broker.renew.side_effect = None
+                native.next_renew = time.monotonic() - 1
+                c.maintain(handle)
+                self.assertEqual(self.broker.renew.call_count, 2)
+                self.assertGreater(handle.lease_clock.renewed_at, anchor)
+                self.assertFalse(handle.lease_clock.degraded)
+                self.assertAlmostEqual(native.next_renew, time.monotonic() + 20, delta=1)
+                self.broker.renew.reset_mock()
+
+    def test_renew_tolerance_exhausted_fails_with_vetted_code(self):
+        handle = self.prepare(); native = handle.native
+        handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+        self.broker.renew.side_effect = MutationUncertain('private detail')
+        native.next_renew = time.monotonic() - 1
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_broker_renew_failed$') as caught:
+            c.maintain(handle)
+        self.assertNotIn('private', str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertTrue(handle.finished)
+        self.assertIsNone(handle.native)
+        self.assertTrue(native.native_stopped)
+        self.session.finish.assert_called_once()
+        self.broker.quarantine.assert_not_called()
+        self.assertNotIn('session.send', [x[0] for x in native.calls])
+
+    def test_conflict_denied_and_local_boundary_are_rejected_at_once(self):
+        for error in (Conflict('broker_operation_rejected'), BrokerError('broker_request_denied'),
+                      BoundaryError('credential_fence_lost')):
+            with self.subTest(error=str(error)):
+                self.session.state = 'active'
+                self.broker.renew.reset_mock()
                 self.broker.renew.side_effect = error
                 handle = self.prepare(); native = handle.native
                 native.next_renew = time.monotonic() - 1
-                with self.assertRaisesRegex(c.CopilotError, '^copilot_idle_renew_failed$') as caught:
+                with self.assertRaisesRegex(c.CopilotError, '^copilot_broker_renew_rejected$'):
                     c.maintain(handle)
-                self.assertNotIn('private', str(caught.exception))
-                self.assertIsNone(caught.exception.__cause__)
+                self.assertEqual(self.broker.renew.call_count, 1)
                 self.assertTrue(handle.finished)
-                self.assertIsNone(handle.native)
                 self.assertTrue(native.native_stopped)
-                self.assertNotIn('session.send', [x[0] for x in native.calls])
-                self.broker.renew.side_effect = None
+
+    def test_tolerated_renew_still_heartbeats_and_lost_heartbeat_keeps_renew_due(self):
+        handle = self.prepare(); native = handle.native
+        due = native.next_renew = time.monotonic() - 1
+        self.broker.renew.side_effect = MutationUncertain('x')
+        self.heartbeat.return_value = False
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_hub_heartbeat_lost$'):
+            c.maintain(handle)
+        self.assertFalse(handle.finished)
+        self.assertEqual(native.next_renew, due)
+        self.heartbeat.assert_called()
+
+    def test_success_anchor_is_attempt_start_and_uncertain_never_moves_it(self):
+        handle = self.prepare(); native = handle.native
+        seen = {}
+
+        def effect(lease):
+            seen['t'] = time.monotonic()
+
+        self.broker.renew.side_effect = effect
+        native.next_renew = time.monotonic() - 1
+        c.maintain(handle)
+        self.assertLessEqual(handle.lease_clock.renewed_at, seen['t'])
+        anchor = handle.lease_clock.renewed_at
+        self.broker.renew.side_effect = MutationUncertain('x')
+        native.next_renew = time.monotonic() - 1
+        c.maintain(handle)
+        self.assertEqual(handle.lease_clock.renewed_at, anchor)
+
+    def test_prepare_anchors_lease_clock(self):
+        before = time.monotonic()
+        handle = self.prepare()
+        after = time.monotonic()
+        self.assertGreaterEqual(handle.lease_clock.renewed_at, before)
+        self.assertLessEqual(handle.lease_clock.renewed_at, after)
+        c.close(handle)
+        self.session.lease.lease_id = 'ab' * 16
+        t0 = time.monotonic() - 4
+        with patch.dict(broker_renew._acquire_started, {self.session.lease.lease_id: t0}):
+            self.session.state = 'active'
+            handle = self.prepare()
+        self.assertEqual(handle.lease_clock.renewed_at, t0)
 
     def test_dead_pipe_is_warm_session_lost(self):
         handle = self.prepare(); native = handle.native
@@ -307,11 +401,84 @@ class Lifecycle(unittest.TestCase):
         handle = self.prepare(); native = handle.native
         def boom(): raise RuntimeError('private native path must not escape')
         native.maintain = boom
-        with self.assertRaisesRegex(c.CopilotError, '^copilot_idle_renew_failed$') as caught:
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_idle_maintain_failed$') as caught:
             c.maintain(handle)
         self.assertNotIn('private', str(caught.exception))
         self.assertIsNone(caught.exception.__cause__)
         self.assertTrue(handle.finished)
+
+    def test_execute_turn_survives_one_uncertain_renew(self):
+        handle = self.prepare(); native = handle.native
+        original = native.next_event
+
+        def next_event():
+            native.next_renew = time.monotonic() - 1
+            return original()
+
+        native.next_event = next_event
+        state = {'n': 0}
+
+        def effect(lease):
+            state['n'] += 1
+            if state['n'] == 1:
+                raise MutationUncertain('x')
+
+        self.broker.renew.side_effect = effect
+        beats = self.heartbeat.call_count
+        result = c.execute(handle, 'project', time.monotonic() + 100)
+        self.assertEqual(result['text'], 'The project answer.')
+        self.assertEqual(result['credential_writeback'], 'committed')
+        self.session.finish.assert_called_once()
+        self.assertEqual(sum(name == 'session.send' for name, _ in native.calls), 1)
+        self.assertGreater(self.heartbeat.call_count, beats)
+
+    def test_execute_renew_past_window_is_broker_renew_failed(self):
+        handle = self.prepare(); native = handle.native
+        handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+        original = native.next_event
+
+        def next_event():
+            native.next_renew = time.monotonic() - 1
+            return original()
+
+        native.next_event = next_event
+        self.broker.renew.side_effect = MutationUncertain('private detail')
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_broker_renew_failed$') as caught:
+            c.execute(handle, 'project', time.monotonic() + 100)
+        self.assertNotEqual(str(caught.exception), 'copilot_task_outcome_requires_reconciliation')
+        self.assertTrue(handle.finished)
+        self.assertLessEqual(sum(name == 'session.send' for name, _ in native.calls), 1)
+
+    def test_degraded_lease_gets_strict_renew_before_send(self):
+        handle = self.prepare(); native = handle.native
+        native.next_renew = time.monotonic() - 1
+        self.broker.renew.side_effect = MutationUncertain('x')
+        c.maintain(handle)
+        self.assertTrue(handle.lease_clock.degraded)
+        order = []
+        self.broker.renew.side_effect = lambda lease: order.append('renew')
+        self.broker.assert_current.side_effect = lambda lease: order.append('assert')
+        result = c.execute(handle, 'project', time.monotonic() + 100)
+        self.assertEqual(result['text'], 'The project answer.')
+        self.assertEqual(sum(name == 'session.send' for name, _ in native.calls), 1)
+        self.assertLess(order.index('renew'), order.index('assert'))
+        self.session.state = 'active'
+        handle = self.prepare(); native = handle.native
+        native.next_renew = time.monotonic() - 1
+        self.broker.renew.side_effect = MutationUncertain('x')
+        self.broker.assert_current.side_effect = None
+        c.maintain(handle)
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_broker_renew_failed$'):
+            c.execute(handle, 'project', time.monotonic() + 100)
+        self.assertEqual(sum(name == 'session.send' for name, _ in native.calls), 0)
+        self.assertTrue(handle.finished)
+        self.session.state = 'active'
+        handle = self.prepare(); native = handle.native
+        before = self.broker.renew.call_count
+        self.broker.renew.side_effect = None
+        self.broker.assert_current.side_effect = None
+        c.execute(handle, 'project', time.monotonic() + 100)
+        self.assertEqual(self.broker.renew.call_count, before)
 
     def test_idle_deadline_does_not_slide(self):
         handle = self.prepare(); original = handle.idle_deadline
@@ -418,6 +585,22 @@ class Transport(unittest.TestCase):
             count = min(3, len(value)); chunks.append(bytes(value[:count])); return count
         with patch.object(c.os, 'write', side_effect=write): native.write_frame(b'abcdefghij')
         self.assertEqual(b''.join(chunks), b'abcdefghij')
+
+    def test_tick_throttles_retry_after_tolerated_renew(self):
+        native = bare_native()
+        native.renew = Mock(return_value=False)
+        native.next_renew = time.monotonic() - 1
+        native.maintain()
+        self.assertEqual(native.renew.call_count, 1)
+        native.maintain()
+        self.assertEqual(native.renew.call_count, 1)
+        now = time.monotonic()
+        self.assertGreater(native.next_renew, now)
+        self.assertLessEqual(native.next_renew, now + broker_renew.RETRY_SECONDS)
+        native.renew.return_value = None
+        native.next_renew = time.monotonic() - 1
+        native.maintain()
+        self.assertAlmostEqual(native.next_renew, time.monotonic() + c.RENEW_SECONDS, delta=1)
 
     def test_native_maintain_leaves_renew_due_when_renew_raises(self):
         native = bare_native()

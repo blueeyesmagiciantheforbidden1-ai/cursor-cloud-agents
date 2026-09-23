@@ -2,6 +2,7 @@
 import json, os, queue, re, signal, subprocess, threading, time
 from pathlib import Path
 import provider_errors
+import broker_renew
 
 NATIVE='/opt/runcrew/grok/grok'
 MAX_MESSAGE=2*1024*1024
@@ -155,7 +156,7 @@ class Native:
         self.send({'jsonrpc':'2.0','id':ident,'method':wire_method,'params':params})
         while True:
             now=time.monotonic();need(now<self.deadline,'native_deadline')
-            if now>=self.next_renew:self.renew();self.next_renew=time.monotonic()+20
+            if now>=self.next_renew:self.next_renew=broker_renew.next_due(self.renew(),20)
             try:kind,item=self.events.get(timeout=.25)
             except queue.Empty:continue
             need(kind=='message','native_'+kind)

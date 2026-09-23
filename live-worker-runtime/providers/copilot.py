@@ -21,9 +21,11 @@ import subprocess
 import time
 from uuid import uuid4
 
+import broker_renew
 import provider_errors
 
 MODEL, EFFORT = 'kimi-k3', 'max'
+RENEW_SECONDS = 20
 TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
 # The prepare() argument is only the startup budget. The live loop then waits
 # up to an hour. This cap does not slide; maintain() must not push it forward.
@@ -32,6 +34,9 @@ WARM_SECONDS = 3600
 # stdio pipe is the third case and arrives as OSError, which has no code.
 # Every other vetted CopilotError keeps its own code. copilot_hub_heartbeat_lost
 # is not in this set: the handle stays open so the next maintain() can renew.
+# copilot_broker_renew_failed and copilot_broker_renew_rejected are fail codes
+# and must never join IDLE_SESSION_LOSS. If they did, the
+# copilot_warm_session_lost idle-drain path would exit 0.
 IDLE_SESSION_LOSS = frozenset((
     'copilot_warm_process_ended', 'copilot_idle_deadline_expired'))
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
@@ -231,7 +236,7 @@ class Native:
     """Bounded native stdio transport; no server request/tool authorization."""
     def __init__(self, home, renew, deadline):
         self.deadline, self.renew = _deadline(deadline), renew
-        self.next_renew = time.monotonic()+20
+        self.next_renew = time.monotonic()+RENEW_SECONDS
         self.process, self.selector = None, None
         self.buffer, self.events = bytearray(), []
         self.total = self.index = self.event_count = 0
@@ -303,8 +308,7 @@ class Native:
     def _tick(self):
         need(time.monotonic() < self.deadline, 'copilot_native_deadline_expired')
         if time.monotonic() >= self.next_renew:
-            self.renew()
-            self.next_renew = time.monotonic()+20
+            self.next_renew = broker_renew.next_due(self.renew(), RENEW_SECONDS)
         need(time.monotonic() < self.deadline, 'copilot_native_deadline_expired')
 
     def pump(self, wait=0.25):
@@ -489,6 +493,7 @@ class Handle:
     session: object = field(repr=False)
     heartbeat: object = field(repr=False)
     idle_deadline: float
+    lease_clock: object = field(default=None, repr=False)
     native: object = field(default=None, repr=False)
     sid: str = field(default='', repr=False)
     preflight: dict = field(default_factory=dict)
@@ -509,8 +514,9 @@ class Handle:
 
 
 def _renew(handle):
-    handle.session.broker.renew(handle.session.lease)
+    renewed = handle.lease_clock.renew(handle.session.broker, handle.session.lease)
     need(handle.heartbeat() is True, 'copilot_hub_heartbeat_lost')
+    return renewed
 
 
 def _fresh_metadata(handle):
@@ -571,7 +577,8 @@ def prepare(session, heartbeat, deadline):
     deadline = _deadline(deadline, maximum=3600)
     need(session.state == 'active' and session.lease.account_ref == ACCOUNT_REF
          and callable(heartbeat), 'copilot_active_owner_lease_required')
-    handle = Handle(session, heartbeat, deadline)
+    handle = Handle(session, heartbeat, deadline,
+                    lease_clock=broker_renew.LeaseClock.for_lease(session.lease, CopilotError, 'copilot'))
     try:
         session.broker.assert_current(session.lease)
         verify_native()
@@ -620,6 +627,12 @@ def prepare(session, heartbeat, deadline):
 def maintain(handle):
     """Renew an idle session.
 
+    Transient broker renew failures are absorbed in Native._tick: the session
+    stays open and the next attempt is due after the retry interval. An
+    exhausted window or a rejected renew arrives as a CopilotError
+    (copilot_broker_renew_failed or copilot_broker_renew_rejected), which
+    closes the handle and is re-raised.
+
     The live loop sleeps between calls. The Copilot CLI can destroy a native
     session that has never received a prompt during that gap (its stale-session
     cleanup fires after about 35 minutes of idle). The next maintain() sees the
@@ -631,9 +644,8 @@ def maintain(handle):
     renew stays due and the next maintain() retries it.
 
     Every other vetted CopilotError closes the handle and is re-raised with
-    its own code. BrokerError and MutationUncertain from renew(), and any
-    other non-vetted exception, close the handle and become
-    copilot_idle_renew_failed.
+    its own code. An opaque non-broker, non-OSError error closes the handle
+    and becomes copilot_idle_maintain_failed.
     """
     need(not handle.finished and not handle.attempted and not handle.close_failed and handle.native is not None,
          'copilot_handle_not_idle')
@@ -652,7 +664,7 @@ def maintain(handle):
             raise CopilotError('copilot_warm_session_lost') from None
         if isinstance(error, CopilotError):
             raise
-        raise CopilotError('copilot_idle_renew_failed') from None
+        raise CopilotError('copilot_idle_maintain_failed') from None
 
 
 def execute(handle, prompt, task_deadline, *, task_kind='project'):
@@ -666,6 +678,9 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         handle.native.deadline = _deadline(task_deadline, maximum=900)
         handle.preflight = _fresh_metadata(handle)  # Billing never reuses the idle-time snapshot.
         _applied(handle.native.request('session.model.getCurrent', {'sessionId': handle.sid}))
+        if handle.lease_clock.degraded:  # never send the prompt on an unconfirmed lease
+            handle.lease_clock.renew(handle.session.broker, handle.session.lease, strict=True)
+            handle.native.next_renew = time.monotonic() + RENEW_SECONDS
         handle.session.broker.assert_current(handle.session.lease)
         need(handle.heartbeat() is True, 'copilot_hub_heartbeat_lost')
         handle.attempted = True

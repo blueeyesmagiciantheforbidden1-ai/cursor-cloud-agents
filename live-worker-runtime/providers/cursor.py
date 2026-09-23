@@ -5,7 +5,8 @@ off, ask mode, deny-all local permissions, abort on any observed tool event).
 prepare() exchanges the enrolled user key, verifies the account owner, creates
 one configured session and waits. execute() sends exactly one prompt.
 close() kills the process group and commits/releases the credential lease
-before a result is delivered. No retries. Deadlines are time.monotonic().
+before a result is delivered. Transient broker renew failures are tolerated
+for 180 seconds and then fail; a conflict is rejected at once. Deadlines are time.monotonic().
 
 Runtime imports: `metadata` and `cursor_review_runtime` are the same pinned
 modules the review image used (/opt/runcrew and /opt/runcrew/app).
@@ -24,6 +25,7 @@ import sys
 import time
 
 from agent_hub.cloud_credential_broker import BrokerError
+import broker_renew
 import provider_errors
 
 NATIVE_DIR = Path(__file__).resolve().parents[1] / 'cursor_native'
@@ -115,8 +117,9 @@ class LiveProcess(metadata.NativeProcess):
 
     def pump(self):
         if time.monotonic() >= self.next_heartbeat:
-            need(self.heartbeat() is True, 'cursor_lease_lost')
-            self.next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
+            renewed = self.heartbeat()
+            need(type(renewed) is bool, 'cursor_lease_lost')
+            self.next_heartbeat = broker_renew.next_due(renewed, HEARTBEAT_SECONDS)
         super().pump()
 
     def alive(self):
@@ -153,7 +156,9 @@ class LiveProcess(metadata.NativeProcess):
                  and params['prompt'][0]['type'] == 'text' and isinstance(params['prompt'][0]['text'], str)
                  and 0 < len(params['prompt'][0]['text'].encode()) <= MAX_PROMPT_BYTES,
                  'cursor_prompt_not_authorized')
-            need(self.heartbeat() is True, 'cursor_lease_lost_before_prompt')
+            renewed = self.heartbeat()
+            need(renewed is not False, 'cursor_broker_renew_failed')
+            need(renewed is True, 'cursor_lease_lost_before_prompt')
             self.prompt_sent = True  # a write error is still an uncertain attempt
         self.stage += 1
         request_id = self.stage
@@ -251,8 +256,9 @@ def _metadata_process(command, environment, workspace, deadline, heartbeat):
     class HeartbeatMetadata(metadata.NativeProcess):
         def pump(self):
             if time.monotonic() >= getattr(self, 'next_heartbeat', 0):
-                need(heartbeat() is True, 'cursor_lease_lost_during_metadata')
-                self.next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
+                renewed = heartbeat()
+                need(type(renewed) is bool, 'cursor_lease_lost_during_metadata')
+                self.next_heartbeat = broker_renew.next_due(renewed, HEARTBEAT_SECONDS)
             return super().pump()
     return HeartbeatMetadata(command, environment, workspace, deadline)
 
@@ -268,6 +274,7 @@ def _acp_process(environment, workspace, deadline, heartbeat):
 class Handle:
     session: object = field(repr=False)
     heartbeat: object = field(repr=False)
+    lease_clock: object = field(default=None, repr=False)
     native: object = field(default=None, repr=False)
     secret: str = field(default='', repr=False)
     settings: object = field(default=None, repr=False)
@@ -290,9 +297,9 @@ class Handle:
 
 
 def _renew(handle):
-    handle.session.broker.renew(handle.session.lease)
+    renewed = handle.lease_clock.renew(handle.session.broker, handle.session.lease)
     need(handle.heartbeat() is True, 'cursor_hub_heartbeat_lost')
-    return True
+    return renewed
 
 
 def _key(session):
@@ -340,7 +347,8 @@ def prepare(session, heartbeat, deadline):
     # 180s) is not reused after success.
     started = time.monotonic()
     need(session.state == 'active' and session.lease.account_ref == ACCOUNT_REF, 'cursor_owner_lease_required')
-    handle = Handle(session=session, heartbeat=heartbeat)
+    handle = Handle(session=session, heartbeat=heartbeat,
+                    lease_clock=broker_renew.LeaseClock.for_lease(session.lease, NativeError, 'cursor'))
     try:
         session.broker.assert_current(session.lease)
         handle.secret = _key(session)
@@ -427,6 +435,7 @@ def maintain(handle):
     need(handle.native.alive(), 'cursor_warm_process_ended')
     try:
         handle.native.idle_pump()
+        handle.lease_clock.check()
     except Exception as error:
         code = _idle_code(error)
         if code is None:
