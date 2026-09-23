@@ -65,6 +65,7 @@ class FixtureRPC(c.WarmRPC):
         self.answer, self.stop_error, self.fail_prompt = 'A real-parser offline answer.', False, False
         self.refresh_notification = False
         self.bad_tool = False
+        self.turn_error = None
 
     def _send(self, value=None, *, close=False):
         if close:
@@ -97,6 +98,11 @@ class FixtureRPC(c.WarmRPC):
             raise AssertionError('unexpected fixture method')
         self.wire.append({'id': value['id'], 'result': copy.deepcopy(result)})
         if method == 'turn/start':
+            if self.turn_error is not None:
+                self.wire.append({'method': 'turn/completed', 'params': {
+                    'threadId': 'thread-live', 'turn': {'id': 'turn-live', 'status': 'failed',
+                                                       'error': copy.deepcopy(self.turn_error)}}})
+                return
             item = {'id': 'answer-1', 'type': 'agentMessage', 'text': self.answer, 'phase': 'final_answer'}
             if self.bad_tool:
                 item = {'id': 'tool-1', 'type': 'commandExecution'}
@@ -401,6 +407,73 @@ class CodexLive(unittest.TestCase):
         self.assertNotIn('SYNTHETIC', str(caught.exception))
         self.assertEqual(self.prompt_count(), 0)
         self.assertFalse(caught.exception.model_call_attempted)
+
+    def test_quota_signal_helper_maps_tokens_not_transient_429(self):
+        secret = 'insufficient_quota for user@example.com balance'
+        self.assertTrue(c._quota_exhausted_signal({'turn': {'error': {'code': 'insufficient_quota',
+                                                                        'message': secret}}}))
+        self.assertTrue(c._quota_exhausted_signal({'error': {'type': 'usage_limit'}}))
+        self.assertTrue(c._quota_exhausted_signal({'error': {'message': 'billing hard limit reached'}}))
+        self.assertTrue(c._quota_exhausted_signal({'error': {'message': 'credit exhausted'}}))
+        self.assertFalse(c._quota_exhausted_signal({'error': {'code': 429, 'message': 'rate_limit'}}))
+        self.assertFalse(c._quota_exhausted_signal({'error': {'code': 429, 'type': 'rate_limit'}}))
+        self.assertFalse(c._quota_exhausted_signal({'error': {'message': 'temporary rate limit'}}))
+        self.assertIs(c._quota_exhausted_signal(secret), True)
+
+    def test_content_events_with_billing_words_are_not_quota(self):
+        text = 'Room notes about billing, credit, and usage limit policies.'
+        content_events = (
+            {'method': 'item/completed', 'params': {
+                'threadId': 'thread-live', 'turnId': 'turn-live',
+                'item': {'id': 'answer-1', 'type': 'agentMessage', 'text': text,
+                         'phase': 'final_answer'}}},
+            {'method': 'item/agentMessage/delta', 'params': {
+                'threadId': 'thread-live', 'turnId': 'turn-live', 'delta': text}},
+            {'method': 'turn/completed', 'params': {
+                'threadId': 'thread-live',
+                'turn': {'id': 'turn-live', 'status': 'completed', 'error': None}}},
+        )
+        for event in content_events:
+            self.assertFalse(c._midturn_quota_exhausted(event), event.get('method'))
+        handle = self.prepare()
+        self.native.answer = text
+        result = c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(result['text'], text)
+
+    def test_failed_turn_and_jsonrpc_quota_events_are_codex_quota_exhausted(self):
+        failed = {'method': 'turn/completed', 'params': {
+            'threadId': 'thread-live',
+            'turn': {'id': 'turn-live', 'status': 'failed',
+                     'error': {'code': 'insufficient_quota',
+                               'message': 'You exceeded your current quota'}}}}
+        self.assertTrue(c._midturn_quota_exhausted(failed))
+        self.assertTrue(c._midturn_quota_exhausted({
+            'jsonrpc': '2.0', 'id': 7,
+            'error': {'code': 'insufficient_quota', 'message': 'billing hard limit'}}))
+        self.assertFalse(c._midturn_quota_exhausted({
+            'jsonrpc': '2.0', 'id': 8,
+            'error': {'code': 429, 'message': 'rate_limit'}}))
+
+    def test_midturn_quota_event_is_codex_quota_exhausted(self):
+        handle = self.prepare()
+        self.native.turn_error = {
+            'code': 'insufficient_quota',
+            'message': 'You exceeded your current quota for user@example.com',
+        }
+        with self.assertRaises(c.LiveCodexError) as caught:
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(str(caught.exception), 'codex_quota_exhausted')
+        self.assertNotIn('example.com', str(caught.exception))
+        self.assertTrue(caught.exception.model_call_attempted)
+
+    def test_transient_429_without_exhaustion_token_stays_generic(self):
+        handle = self.prepare()
+        self.native.turn_error = {'code': 429, 'message': 'rate_limit try again shortly'}
+        with self.assertRaises(c.LiveCodexError) as caught:
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertNotEqual(str(caught.exception), 'codex_quota_exhausted')
+        self.assertNotIn('rate_limit', str(caught.exception))
+        self.assertNotEqual(str(caught.exception), 'included_quota_exhausted')
 
     def test_idle_maintenance_renews_without_inference_and_drains_expiry(self):
         handle = self.prepare(); handle.next_renew = 0

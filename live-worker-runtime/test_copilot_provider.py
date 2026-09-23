@@ -502,5 +502,55 @@ class Transport(unittest.TestCase):
         process.stdin.close.assert_called_once()
 
 
+class MidTurnQuota(unittest.TestCase):
+    def test_quota_signal_helper_maps_tokens_not_transient_429(self):
+        secret = 'insufficient_quota for user@example.com'
+        self.assertTrue(c._quota_exhausted_signal({'code': 'insufficient_quota', 'message': secret}))
+        self.assertTrue(c._quota_exhausted_signal({'type': 'usage_limit'}))
+        self.assertTrue(c._quota_exhausted_signal({'message': 'billing hard limit'}))
+        self.assertTrue(c._quota_exhausted_signal({'message': 'credit exhausted'}))
+        self.assertFalse(c._quota_exhausted_signal({'code': 429, 'message': 'rate_limit'}))
+        self.assertFalse(c._quota_exhausted_signal({'code': 429, 'type': 'rate_limit'}))
+        self.assertIs(c._quota_exhausted_signal(secret), True)
+
+    def test_model_call_failure_with_quota_token_is_copilot_quota_exhausted(self):
+        events = [{'type': 'assistant.turn_start', 'data': {}},
+                  {'type': 'model.call_failure', 'data': {
+                      'code': 'insufficient_quota',
+                      'message': 'quota exceeded for user@example.com'}}]
+        with self.assertRaises(c.CopilotError) as caught:
+            c._response(SimpleNamespace(next_event=lambda: events.pop(0)))
+        self.assertEqual(str(caught.exception), 'copilot_quota_exhausted')
+        self.assertNotIn('example.com', str(caught.exception))
+
+    def test_session_error_transient_429_stays_generic(self):
+        events = [{'type': 'session.error', 'data': {'code': 429, 'message': 'rate_limit'}}]
+        with self.assertRaises(c.CopilotError) as caught:
+            c._response(SimpleNamespace(next_event=lambda: events.pop(0)))
+        self.assertEqual(str(caught.exception), 'copilot_native_turn_failed_or_changed')
+        self.assertNotIn('rate_limit', str(caught.exception))
+
+    def test_jsonrpc_error_with_quota_token_is_copilot_quota_exhausted(self):
+        native = bare_native()
+        native.write_frame = Mock()
+        native.frame = Mock(return_value={
+            'jsonrpc': '2.0', 'id': 1,
+            'error': {'code': 429, 'message': 'insufficient_quota for user@example.com'}})
+        with self.assertRaises(c.CopilotError) as caught:
+            native.request('account.getQuota')
+        self.assertEqual(str(caught.exception), 'copilot_quota_exhausted')
+        self.assertNotIn('example.com', str(caught.exception))
+
+    def test_jsonrpc_error_plain_429_stays_generic(self):
+        native = bare_native()
+        native.write_frame = Mock()
+        native.frame = Mock(return_value={
+            'jsonrpc': '2.0', 'id': 1,
+            'error': {'code': 429, 'message': 'rate_limit'}})
+        with self.assertRaises(c.CopilotError) as caught:
+            native.request('account.getQuota')
+        self.assertEqual(str(caught.exception), 'copilot_native_request_failed')
+
+
 if __name__ == '__main__':
     unittest.main()

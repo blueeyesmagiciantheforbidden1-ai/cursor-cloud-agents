@@ -404,6 +404,43 @@ class TransportSmoke(unittest.TestCase):
                 native.request('x.ai/auth/info', {})
             native.close()
 
+    def test_rpc_quota_token_is_grok_quota_exhausted(self):
+        secret = 'insufficient_quota for user@example.com'
+        process = self.transport([{
+            'jsonrpc': '2.0', 'id': '1',
+            'error': {'code': 429, 'message': secret}}])
+        with patch.object(wire.subprocess, 'Popen', return_value=process), patch.object(wire.os, 'killpg', create=True), \
+                patch.object(wire.signal, 'SIGKILL', 9, create=True):
+            native = wire.Native(Path('/offline'), lambda: None, time.monotonic()+5)
+            with self.assertRaises(g.NativeError) as caught:
+                native.request('x.ai/auth/info', {})
+            self.assertEqual(str(caught.exception), 'grok_quota_exhausted')
+            self.assertNotIn('example.com', str(caught.exception))
+            native.close()
+
+    def test_rpc_plain_429_stays_native_rpc_code(self):
+        process = self.transport([{
+            'jsonrpc': '2.0', 'id': '1',
+            'error': {'code': 429, 'message': 'rate_limit'}}])
+        with patch.object(wire.subprocess, 'Popen', return_value=process), patch.object(wire.os, 'killpg', create=True), \
+                patch.object(wire.signal, 'SIGKILL', 9, create=True):
+            native = wire.Native(Path('/offline'), lambda: None, time.monotonic()+5)
+            with self.assertRaises(g.NativeError) as caught:
+                native.request('x.ai/auth/info', {})
+            self.assertEqual(str(caught.exception), 'native_rpc_429')
+            self.assertNotEqual(str(caught.exception), 'grok_quota_exhausted')
+            native.close()
+
+    def test_quota_signal_helper_maps_tokens_not_transient_429(self):
+        self.assertTrue(wire.quota_exhausted_signal({'code': 'usage_limit'}))
+        self.assertTrue(wire.quota_exhausted_signal({'message': 'quota_exceeded'}))
+        self.assertTrue(wire.quota_exhausted_signal({'message': 'billing'}))
+        self.assertTrue(wire.quota_exhausted_signal({'message': 'credit'}))
+        self.assertFalse(wire.quota_exhausted_signal({'code': 429, 'message': 'rate_limit'}))
+        self.assertEqual(wire.rpc_error_code({'code': 429, 'message': 'insufficient_quota'}),
+                         'grok_quota_exhausted')
+        self.assertEqual(wire.rpc_error_code({'code': 429, 'message': 'rate_limit'}), 'native_rpc_429')
+
 
 if __name__ == '__main__':
     unittest.main()
