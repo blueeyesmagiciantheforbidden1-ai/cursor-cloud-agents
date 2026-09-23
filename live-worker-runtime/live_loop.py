@@ -181,6 +181,41 @@ class Worker:
                     raise LiveError('completion_delivery_uncertain') from None
                 self.sleep(attempt + 1)
 
+    def _task_budget(self):
+        """Warm seconds a claim must still have, or the task dies before the model call.
+
+        checked_deadline withholds completion_reserve and still requires 5s.
+        Providers may add EXECUTE_WARM_FLOOR (codex: the execute() minimum).
+        """
+        floor = getattr(self.adapter, 'EXECUTE_WARM_FLOOR', 0)
+        if type(floor) is not int or floor < 0:
+            floor = 0
+        return self.settings.completion_reserve + 5 + floor
+
+    def _warm_remaining(self, idle_deadline):
+        remaining = idle_deadline - self.clock()
+        warm = getattr(self.handle, 'warm_deadline', None)
+        if type(warm) in (int, float) and math.isfinite(warm):
+            remaining = min(remaining, warm - self.clock())
+        return remaining
+
+    def _prepare_task(self):
+        """Deadline, room, and prompt. Transport errors retry; vetted codes do not."""
+        for attempt in range(3):
+            try:
+                deadline = self.checked_deadline(self.task)
+                room = self.client.get_room(self.task['room_id'])
+                prompt = task_prompt(self.task, room, self.settings.agent)
+                require(self.clock() + 5 < deadline, 'task_deadline_insufficient')
+                self.report(force=True)
+                return deadline, prompt
+            except Exception as error:
+                if idle_fault(error) != 'retry' or attempt == 2:
+                    if idle_fault(error) == 'retry':
+                        raise LiveError('task_setup_unavailable') from None
+                    raise
+                self.sleep(attempt + 1)
+
     def run(self):
         outcome = {'agent': self.settings.agent, 'outcome': 'failed',
                    'automatic_improvement_ready': False, 'capability': 'text_collaboration',
@@ -214,6 +249,16 @@ class Worker:
                         raise
                 path = ('/v1/rooms/' + self.settings.exact_room + '/claim'
                         if self.settings.exact_room else '/v1/tasks/claim')
+                # A claim this late cannot finish inside the warm window. execute()
+                # would raise warm_session_expired or a native error before the
+                # model call. Drain instead of taking the task.
+                if self._warm_remaining(idle_deadline) < self._task_budget():
+                    warm = getattr(self.handle, 'warm_deadline', None)
+                    if (type(warm) in (int, float) and math.isfinite(warm)
+                            and warm - self.clock() < self._task_budget()) or self.stopping:
+                        break
+                    self.sleep(max(0, idle_deadline - self.clock()))
+                    break
                 self.claim_attempted = True
                 # An uncertain claim ends this execution. Never silently claim
                 # again after a lost response that may have assigned a task.
@@ -228,11 +273,7 @@ class Worker:
                     self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))
                     continue
                 self.task = result['task']
-                deadline = self.checked_deadline(self.task)
-                room = self.client.get_room(self.task['room_id'])
-                prompt = task_prompt(self.task, room, self.settings.agent)
-                require(self.clock() + 5 < deadline, 'task_deadline_insufficient')
-                self.report(force=True)
+                deadline, prompt = self._prepare_task()
                 self.model_call_attempted = True
                 reply = self.adapter.execute(self.handle, prompt, deadline, task_kind='project')
                 require(isinstance(reply, dict) and isinstance(reply.get('text'), str)

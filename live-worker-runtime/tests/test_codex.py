@@ -324,6 +324,27 @@ class CodexLive(unittest.TestCase):
         self.session.broker.renew.assert_called()
         c.close(handle)
 
+    def test_short_warm_window_does_not_start_execute_setup(self):
+        handle = self.prepare()
+        handle.warm_deadline = time.monotonic() + c.EXECUTE_WARM_FLOOR - 1
+        with self.assertRaisesRegex(c.LiveCodexError, 'warm_session_expired') as caught:
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(self.prompt_count(), 0)
+        self.assertFalse(caught.exception.model_call_attempted)
+        self.assertEqual(handle.state, 'closed')
+
+    def test_execute_setup_transport_error_stays_a_fixed_code(self):
+        handle = self.prepare()
+        def poll_idle():
+            raise OSError('SYNTHETIC_NATIVE_PIPE')
+        handle.native.poll_idle = poll_idle
+        with self.assertRaises(c.LiveCodexError) as caught:
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(str(caught.exception), 'codex_live_operation_failed')
+        self.assertNotIn('SYNTHETIC', str(caught.exception))
+        self.assertEqual(self.prompt_count(), 0)
+        self.assertFalse(caught.exception.model_call_attempted)
+
     def test_idle_maintenance_renews_without_inference_and_drains_expiry(self):
         handle = self.prepare(); handle.next_renew = 0
         count = len(self.native.requests)

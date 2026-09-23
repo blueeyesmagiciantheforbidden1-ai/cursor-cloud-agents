@@ -251,7 +251,9 @@ class LoopTests(unittest.TestCase):
             self.skipTest('codex adapter not in this image')
         source = (PROVIDERS / 'codex.py').read_text(encoding='utf-8')
         finalize = module_constant(ast.parse(source), 'FINALIZE_RESERVE')
-        need = int(re.search(r'need\(FINALIZE_RESERVE \+ (\d+) <= remaining', source).group(1))
+        need = int(re.search(r'EXECUTE_WARM_FLOOR = FINALIZE_RESERVE \+ (\d+)', source).group(1))
+        self.assertIn('need(EXECUTE_WARM_FLOOR <= remaining <= 900', source)
+        self.assertIn('warm_deadline - time.monotonic() >= EXECUTE_WARM_FLOOR', source)
         self.assertLessEqual(finalize + need + reserve, hub_codex_minimum)
 
     def test_idle_drains_and_releases_without_prompt(self):
@@ -349,6 +351,70 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result['error_code'], 'heartbeat_not_acknowledged')
         self.assertEqual(client.claims, 0)
 
+    def test_claim_waits_out_a_warm_window_that_cannot_host_a_task(self):
+        # codex-qmhhc claimed in the last ~21s of the warm window and died
+        # before the model call. Below the task budget the loop drains idle.
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        adapter.EXECUTE_WARM_FLOOR = 75
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            return SimpleNamespace(state='ready', warm_deadline=clock.now + 20)
+        adapter.prepare = prepare
+        worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertNotIn('error_code', result)
+        self.assertFalse(result['model_call_attempted'])
+        self.assertEqual(client.claims, 0)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIn('close', adapter.calls)
+        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(clock.now, 100)
+
+    def test_claim_proceeds_when_the_warm_window_covers_the_task(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        adapter.EXECUTE_WARM_FLOOR = 75
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            return SimpleNamespace(state='ready', warm_deadline=clock.now + 3600)
+        adapter.prepare = prepare
+        worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(client.claims, 1)
+        self.assertEqual(adapter.calls.count('execute'), 1)
+
+    def test_room_read_transport_error_retries_then_uses_a_fixed_code(self):
+        worker, client, adapter, _ = self.setup_worker()
+        faults = [1]
+        original = client.get_room
+        def get_room(room):
+            if faults[0]:
+                faults[0] -= 1
+                raise OSError('transient room read')
+            return original(room)
+        client.get_room = get_room
+        result = worker.run()
+        self.assertEqual(faults[0], 0)
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('transient room read', str(result))
+        self.assertEqual(adapter.calls.count('execute'), 1)
+
+        worker, client, adapter, _ = self.setup_worker()
+        def get_room_down(room):
+            raise OSError('transient room read')
+        client.get_room = get_room_down
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'task_setup_unavailable')
+        self.assertFalse(result['model_call_attempted'])
+        self.assertTrue(result['claim_attempted'])
+        self.assertEqual(client.claims, 1)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertNotIn('transient room read', str(result) + str(client.completions))
+        self.assertIn('(task_setup_unavailable)', client.completions[0]['output'])
+
     def test_report_error_after_claim_still_fails(self):
         worker, client, adapter, _ = self.setup_worker()
         original = client.post
@@ -360,9 +426,11 @@ class LoopTests(unittest.TestCase):
         client.post = post
         result = worker.run()
         self.assertEqual(result['outcome'], 'failed')
-        self.assertEqual(result['error_code'], 'native_or_connection_failure')
+        self.assertEqual(result['error_code'], 'task_setup_unavailable')
+        self.assertFalse(result['model_call_attempted'])
         self.assertNotIn('execute', adapter.calls)
         self.assertNotIn('transient hub socket', str(result) + str(client.completions))
+        self.assertIn('(task_setup_unavailable)', client.completions[0]['output'])
         self.assertEqual(worker.last_exit, 1)
 
     def test_provider_error_is_never_retried_or_leaked(self):
