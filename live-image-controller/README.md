@@ -6,7 +6,7 @@ Build (from the repository root, under the deployer identity, never the shared h
 
     gcloud builds submit --config live-image-controller/cloudbuild.json .
 
-The build fails if `test_fleet_controller.py` (14 tests, including the reset checks), `test_dynamic_broker_review.py`, `test_dynamic_broker.py` or `serve.py --check` fail; confirm those RUN lines appear in the build log before deploying.
+The build fails if `test_fleet_controller.py` (14 tests, including the reset checks), `test_dynamic_broker_review.py`, `test_dynamic_broker.py` or `serve.py --check` fail, so a build status of `SUCCESS` from `gcloud builds describe <id>` is the gate: Docker does not produce an image if any RUN line fails. Build logs go to Cloud Logging only (as in the pack); reading them is optional. The base image is the tag `python:3.12-slim-bookworm`, as in the pack; after the first build, pin the digest it resolved (from the build's pull line) in the Dockerfile for reproducibility.
 
 Deploy as a new revision of the service `runcrew-live-fleet`, keeping every existing environment variable name, the `/run/config/fleet.json` mount, the service account and `RUNCREW_ROLE=fleet`; only the image changes:
 
