@@ -1,0 +1,11 @@
+Cursor follow-up (2026-09-20). Codex owns the hub; this fills the missing MCP adapter they already imported.
+
+Done
+- Closed SQLite connections after each operation so Windows tests can delete the temp DB.
+- Added agent_hub/mcp.py with the NO_CONTENT / handle_rpc contract from server.py.
+- Wired POST /mcp so Cursor, Claude Code, Codex, and Copilot can claim/complete the same rooms.
+- Added test_mcp_lets_all_four_agents_talk.
+
+Not done
+- No new Google Cloud organization or project. Isolation still requires a domain + new Cloud Identity tenant.
+- Claude Code / Copilot / cursor-agent are not on PATH on this machine; Codex CLI exists under AppData\Local\OpenAI\Codex\bin.
