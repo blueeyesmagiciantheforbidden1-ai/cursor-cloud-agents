@@ -205,6 +205,18 @@ class LoopTests(unittest.TestCase):
                 worker, client, adapter, _ = self.setup_worker(); client.room.update(change)
                 worker.run(); self.assertNotIn('execute', adapter.calls)
 
+    def test_room_without_purpose_field_is_project_work(self):
+        # Rooms stored by a hub revision that never wrote purpose failed every
+        # worker with project_work_only; the hub's own default is 'project'.
+        worker, client, adapter, _ = self.setup_worker(); del client.room['purpose']
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed'); self.assertIn('execute', adapter.calls)
+        for value in ('improvement', '', None, 'PROJECT'):
+            with self.subTest(purpose=value):
+                worker, client, adapter, _ = self.setup_worker(); client.room['purpose'] = value
+                result = worker.run()
+                self.assertEqual(result['error_code'], 'project_work_only'); self.assertNotIn('execute', adapter.calls)
+
     def test_idle_drains_and_releases_without_prompt(self):
         worker, client, adapter, clock = self.setup_worker(); client.empty = True
         result = worker.run()

@@ -50,7 +50,10 @@ class Settings:
 
 def task_prompt(task, room, agent):
     require(isinstance(room, dict) and room.get('id') == task.get('room_id'), 'room_identity_changed')
-    require(room.get('purpose') == 'project', 'project_work_only')
+    # The hub defaults an unset purpose to 'project' (core.create); rooms
+    # written by a revision that never stored the field are project rooms.
+    # Only an explicit non-project purpose is refused.
+    require(room.get('purpose', 'project') == 'project', 'project_work_only')
     require(room.get('status') == 'running' and room.get('step') == task.get('step'), 'room_step_changed')
     require(task.get('workspace') == room.get('workspace') == 'default', 'workspace_not_enabled')
     require(task.get('prompt') == room.get('prompt') and task.get('messages') == room.get('messages'),
