@@ -28,6 +28,10 @@ import transport
 MODEL, EFFORT = 'gpt-6-astra', 'ultra'
 MAX_PROMPT, MAX_ANSWER = 200000, 15000
 WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
+# execute() refuses a task deadline shorter than this. A claim also needs it
+# still left on warm_deadline, or setup (_collect, gate, poll_idle) runs into
+# the warm-window edge and dies before the model call.
+EXECUTE_WARM_FLOOR = FINALIZE_RESERVE + 30
 # Recorded by the successful pinned Linux build in two independent empty homes.
 CONFIG_SHA = 'c584ec84021d23203d0c444cf474c3f184a0b759faf51bed0ba1fc16361af9cf'
 REQUIREMENTS_SHA = '25b86fa3671a4ee1ea904a1f5777c164347763d01dda591fcac3022b64235e10'
@@ -358,7 +362,13 @@ def maintain(handle):
         handle.native.deadline = min(handle.warm_deadline, time.monotonic() + 30)
         handle.native.poll_idle()
         if time.monotonic() >= handle.next_renew:
-            _renew(handle)
+            try:
+                _renew(handle)
+            except Exception as error:
+                # Idle renew only reaches the hub. A dropped heartbeat is retried
+                # on the next maintain; closing the native process fails the warm run.
+                if provider_errors.error_code(error) != 'hub_lease_lost':
+                    raise
         return handle.readiness
     except Exception as error:
         _fail(handle, error)
@@ -373,12 +383,15 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(handle.state == 'ready' and not handle.consumed, 'single_project_prompt_required')
         task_deadline = _deadline(task_deadline)
         remaining = task_deadline - time.monotonic()
-        need(FINALIZE_RESERVE + 30 <= remaining <= 900, 'task_deadline_out_of_bounds')
-        need(time.monotonic() < handle.warm_deadline, 'warm_session_expired')
+        need(EXECUTE_WARM_FLOOR <= remaining <= 900, 'task_deadline_out_of_bounds')
+        # Same floor against the warm session. A claim in the last seconds of
+        # WARM_SECONDS otherwise reaches _collect/poll_idle and fails there.
+        need(handle.warm_deadline - time.monotonic() >= EXECUTE_WARM_FLOOR, 'warm_session_expired')
         need(isinstance(prompt, str) and 0 < len(prompt.encode()) <= MAX_PROMPT, 'bounded_prompt_required')
         handle.consumed = True
         handle.state = 'executing'
-        handle.native.deadline = min(task_deadline - FINALIZE_RESERVE, time.monotonic() + NATIVE_SECONDS)
+        handle.native.deadline = min(task_deadline - FINALIZE_RESERVE, handle.warm_deadline,
+                                      time.monotonic() + NATIVE_SECONDS)
         handle.session.broker.assert_current(handle.session.lease)
         _renew(handle)
         _collect(handle)
