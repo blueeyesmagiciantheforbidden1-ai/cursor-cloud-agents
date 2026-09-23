@@ -508,6 +508,11 @@ class ClaudeAdapter(unittest.TestCase):
         odd = self._slow_prompt(waits=0, answer=[{'type': 'assistant', 'error': 'something new', 'message': {}},
                                                  result_event(is_error=True, result='failed')])
         self.assertEqual(str(odd.error), 'claude_provider_error')
+        server = self._slow_prompt(waits=0, returncode=1, answer=[
+            {'type': 'assistant', 'error': 'server_error', 'message': {}},
+            result_event(is_error=True, result='API Error: 500')])
+        self.assertEqual(str(server.error), 'claude_provider_server_error')
+        self.assertFalse(c.provider_errors.is_quota(str(server.error)))
         # A bare 429 is not proof of an account limit: its own code, a normal strike.
         for returncode in (0, 1):
             limited = self._slow_prompt(waits=0, returncode=returncode, answer=[
