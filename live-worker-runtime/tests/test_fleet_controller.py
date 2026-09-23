@@ -142,6 +142,14 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(store.state['error'], 'worker_failed_no_restart_loop')
         self.assertEqual(store.state['consecutive_failures'], 3); self.assertEqual(cloud.run_count, 1)
 
+    def test_reset_after_three_strikes_grants_a_fresh_budget(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        self.fail_current(cloud, broker)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(controller.reset()['status'], 'idle')
+        self.assertEqual(store.state['consecutive_failures'], 0)
+
     def test_success_resets_the_failure_count(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
         store.state['consecutive_failures'] = 2
@@ -159,7 +167,7 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(cloud.run_count, 1)
 
     def blocked(self):
-        """A slot stopped by a failed terminal execution whose credential was released."""
+        """A slot stopped by a failed execution whose credential release names another holder; the broker then catches up."""
         controller, store, cloud, broker, bindings, grants = self.make(); controller.tick()
         cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
             reconciling=False, runningCount=0, failedCount=1, succeededCount=0)

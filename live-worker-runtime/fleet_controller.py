@@ -262,6 +262,7 @@ class Controller:
         previous = self.current_terminal(self.job(), state)
         state_error = state.get('error')
         cleared = {key: value for key, value in state.items() if key != 'error'}
-        state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'])
+        # An operator reset grants a fresh failure budget.
+        state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'], consecutive_failures=0)
         cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
         return {'status': 'idle', 'cleared': cleared_code, 'from_phase': phase, 'generation': state['generation']}
