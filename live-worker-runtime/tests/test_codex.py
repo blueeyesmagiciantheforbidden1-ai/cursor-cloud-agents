@@ -309,6 +309,21 @@ class CodexLive(unittest.TestCase):
         self.assertEqual(self.session.finish.call_count, 1)
         self.assertEqual(handle.state, 'quarantined')
 
+    def test_idle_hub_heartbeat_loss_keeps_the_warm_process(self):
+        handle = self.prepare()
+        self.heartbeat.return_value = False
+        handle.next_renew = 0
+        readiness = c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertTrue(readiness['ready_for_project_prompt'])
+        self.assertEqual(self.prompt_count(), 0)
+        self.session.finish.assert_not_called()
+        self.heartbeat.return_value = True
+        c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.session.broker.renew.assert_called()
+        c.close(handle)
+
     def test_idle_maintenance_renews_without_inference_and_drains_expiry(self):
         handle = self.prepare(); handle.next_renew = 0
         count = len(self.native.requests)

@@ -28,6 +28,31 @@ def finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+# The adapter's own warm deadline starts when prepare() does, so it expires
+# while this loop still has startup time left on warm_seconds. That expiry is
+# the end of the idle window, not a crashed worker.
+_IDLE_DRAIN_CODES = frozenset({'warm_session_expired'})
+# No task is leased yet, so a missed hub heartbeat can be polled again.
+_IDLE_RETRY_CODES = frozenset({
+    'hub_lease_lost', 'claude_hub_heartbeat_lost', 'grok_hub_heartbeat_lost',
+    'cursor_hub_heartbeat_lost', 'cursor_lease_lost', 'copilot_hub_heartbeat_lost',
+})
+
+
+def idle_fault(error):
+    """Classify an exception raised while waiting for a task: drain, retry, or fail.
+
+    Vetted provider codes still fail the execution. Anything else is a hub or
+    native transport error and must not be recorded as native_or_connection_failure.
+    """
+    code = provider_errors.error_code(error)
+    if code in _IDLE_DRAIN_CODES:
+        return 'drain'
+    if code is None or code in _IDLE_RETRY_CODES:
+        return 'retry'
+    return 'fail'
+
+
 @dataclass(frozen=True)
 class Settings:
     agent: str
@@ -165,17 +190,39 @@ class Worker:
             self.handle = self.adapter.prepare(self.session, self.heartbeat,
                                                self.clock() + self.settings.startup_seconds)
             self.ready = True
-            self.report(force=True)
             idle_deadline = self.clock() + self.settings.warm_seconds
+            try:
+                self.report(force=True)
+            except Exception as error:
+                if idle_fault(error) != 'retry':
+                    raise
             while self.clock() < idle_deadline and not self.stopping:
-                self.adapter.maintain(self.handle)
-                self.report()
+                try:
+                    self.adapter.maintain(self.handle)
+                except Exception as error:
+                    fault = idle_fault(error)
+                    if fault == 'drain':
+                        break
+                    if fault != 'retry':
+                        raise
+                    self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))
+                    continue
+                try:
+                    self.report()
+                except Exception as error:
+                    if idle_fault(error) != 'retry':
+                        raise
                 path = ('/v1/rooms/' + self.settings.exact_room + '/claim'
                         if self.settings.exact_room else '/v1/tasks/claim')
                 self.claim_attempted = True
                 # An uncertain claim ends this execution. Never silently claim
                 # again after a lost response that may have assigned a task.
-                result = self.client.post(path, {})
+                try:
+                    result = self.client.post(path, {})
+                except Exception as error:
+                    if idle_fault(error) == 'fail':
+                        raise
+                    break
                 require(isinstance(result, dict) and 'task' in result, 'claim_response_invalid')
                 if result['task'] is None:
                     self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))

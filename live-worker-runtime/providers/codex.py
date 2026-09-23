@@ -358,7 +358,13 @@ def maintain(handle):
         handle.native.deadline = min(handle.warm_deadline, time.monotonic() + 30)
         handle.native.poll_idle()
         if time.monotonic() >= handle.next_renew:
-            _renew(handle)
+            try:
+                _renew(handle)
+            except Exception as error:
+                # Idle renew only reaches the hub. A dropped heartbeat is retried
+                # on the next maintain; closing the native process fails the warm run.
+                if provider_errors.error_code(error) != 'hub_lease_lost':
+                    raise
         return handle.readiness
     except Exception as error:
         _fail(handle, error)
