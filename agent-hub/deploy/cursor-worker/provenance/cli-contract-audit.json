@@ -1,0 +1,46 @@
+{
+  "CURSOR_DISABLE_AUTO_UPDATE": [],
+  "DISABLE_AUTO_UPDATE": [],
+  "CURSOR_CONFIG_DIR": [
+    {
+      "file": "dist-package/index.js",
+      "context": ">d,m4:()=>c,ok:()=>u,qA:()=>m});var n=r(\"node:crypto\"),s=r(\"node:os\"),i=r(\"node:path\"),o=r(\"../utils/dist/workspace-paths.js\");function a(){const e=process.env.CURSOR_CONFIG_DIR;if(null==e?void 0:e.trim())return e;const t=process.env.XDG_CONFIG_HOME;return(null==t?void 0:t.trim())?(0,i.join)(t,\"cursor\"):(0,i.join)((0,s.homedir)(),\".cursor\")}function u(){const e=process.env.CURSOR_DATA_DIR;return(null==e?void 0:e.t"
+    }
+  ],
+  "AGENT_CLI_CREDENTIAL_STORE": [
+    {
+      "file": "dist-package/index.js",
+      "context": "nues with the credentials it already has.${s.Sj}\\n${c}\\n`)}},\"./src/utils/credential-store.ts\"(e,t,r){\"use strict\";function n({env:e=process.env}={}){const t=e.AGENT_CLI_CREDENTIAL_STORE;return\"file\"===t?\"file\":\"memory\"===t?\"memory\":\"default\"}function s({platform:e=\"linux\",likelySshSession:t,isCI:r,credentialStoreKind:n}){return\"darwin\"===e&&t&&!r&&\"default\"===n}r.d(t,{SI:()=>n,it:()=>s})},\"./src/utils/direnv-environment.t"
+    }
+  ],
+  "--reasoning-effort": [],
+  "--effort": [],
+  "composer-2.5": [
+    {
+      "file": "dist-package/2469.index.js",
+      "context": "\"(e,t,n){n.d(t,{BT:()=>s,RP:()=>l,Tz:()=>i,UW:()=>c,_J:()=>d,hG:()=>r});var o=n(\"./src/bedrock/model-utils.ts\");function r(e){switch(e){case\"composer-2\":return\"composer-2.5\";case\"composer-2-fast\":return\"composer-2.5-fast\";default:return e}}function s(e){var t;return\"default\"===e.modelId||\"auto\"===e.displayModelId||\"auto\"===(null===(t=e.displayName)||void 0===t?void 0:t.toLowerCase())}function i(e,t){return t."
+    }
+  ],
+  "cursor-agent-sea": [
+    {
+      "file": "dist-package/9009.index.js",
+      "context": "ction l(e){var n;e.done?o(e.value):(n=e.value,n instanceof t?n:new t((function(e){e(n)}))).then(s,a)}l((r=r.apply(e,n||[])).next())}))};const g=\"DCNK4UB866\",p=\"cursor-agent-sea\",f=\"com.anysphere.cursor-agent\",h=\"cursor-agent-worker-sea\",v=\"com.anysphere.cursor-agent-worker\",m=[h],w=[v],S=\"CURSOR_AGENT_SIGNED_CLI_REEXEC\",I=\"CURSOR_AGENT_SIGNED_CLI\",E=\"CURSOR_AGENT_ALLOW_UNSIGNED_COMPUTER_USE\",y=\"CURSOR_AGENT_SIGNE"
+    }
+  ],
+  "--trust": [
+    {
+      "file": "dist-package/index.js",
+      "context": "nable or disable sandbox mode (overrides config)\").choices([\"enabled\",\"disabled\"])).option(\"--approve-mcps\",\"Automatically approve all MCP servers\",!1).option(\"--trust\",\"Trust the current workspace without prompting\",!1).option(\"--workspace <path-or-name>\",\"Workspace directory or saved workspace name to use (defaults to current working directory)\").addOption(new h.c$(\"--add-dir <path>\",\"Add an additional"
+    },
+    {
+      "file": "dist-package/7021.index.js",
+      "context": "irectory?\",\"\",`    ${o}${e}${s}`,\"\",`  ${r}To proceed, you can either:${s}`,`    ${r}\u2022${s} Run '${(0,O.mf)()}' interactively to decide`,`    ${r}\u2022${s} Pass ${o}--trust${s}, ${o}--yolo${s}, or ${o}-f${s} if you trust this directory`,\"\"].join(\"\\n\");(0,h.uQ)(1,i)}je&&(yield G(ze))}}else{if(!ie){const e=yield(0,S.i)({configProvider:k,credentialManager:C,backendUrl:he});\"skipped\"!==e&&(0,A.hg)(),\"installed\"=="
+    }
+  ],
+  "--sandbox": [
+    {
+      "file": "dist-package/index.js",
+      "context": "ing)\",!1).option(\"--auto-review\",\"Use Auto-review (Smart Auto): a server classifier auto-runs safe tool calls and prompts for the rest\",!1).addOption(new h.c$(\"--sandbox <mode>\",\"Explicitly enable or disable sandbox mode (overrides config)\").choices([\"enabled\",\"disabled\"])).option(\"--approve-mcps\",\"Automatically approve all MCP servers\",!1).option(\"--trust\",\"Trust the current workspace without prompting\",!"
+    }
+  ]
+}

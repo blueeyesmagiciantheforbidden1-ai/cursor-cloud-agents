@@ -1,0 +1,4 @@
+**
+!deploy/
+!deploy/claude-worker/
+!deploy/claude-worker/eligibility_probe.py

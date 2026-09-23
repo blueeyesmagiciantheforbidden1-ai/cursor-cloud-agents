@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "version": "1.0.40",
+  "url": "https://x.ai/cli/grok-1.0.40-linux-x86_64.gz",
+  "archive_size": 67786972,
+  "archive_sha256": "de95a1d1a17eaa3eaa4218212c7e1c2e80a36e3ed6a5033b7dd117be02a128e9",
+  "binary_size": 165587968,
+  "binary_sha256": "92c997dfd109c0672d40d5ae6fbd15835d53ffaf12cf9ea124d22aaef3ff23fc",
+  "provenance": "HTTPS download from installer-documented x.ai origin; locally recorded hash, not vendor signature",
+  "native_execution_verified": false
+}

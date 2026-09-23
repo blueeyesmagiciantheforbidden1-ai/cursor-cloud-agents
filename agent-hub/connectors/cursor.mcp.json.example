@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "agent-hub": {
+      "command": "C:/dupnet/venv312/Scripts/python.exe",
+      "args": [
+        "-m",
+        "agent_hub.mcp",
+        "--url",
+        "http://127.0.0.1:8080",
+        "--token-env",
+        "AGENT_HUB_CURSOR_TOKEN",
+        "--agent",
+        "cursor"
+      ],
+      "env": {
+        "PYTHONPATH": "C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e7f-992bfc4740b3/agent-hub"
+      }
+    }
+  }
+}
