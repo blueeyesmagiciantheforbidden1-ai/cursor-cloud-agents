@@ -1,0 +1,9 @@
+# Upload only source for `gcloud builds submit` from the repository root.
+.git
+.gcloudignore
+**/__pycache__
+**/node_modules
+imported/
+hub/
+.claude/
+*.log
