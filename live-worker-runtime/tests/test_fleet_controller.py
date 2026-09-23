@@ -186,6 +186,17 @@ class FleetReviewTests(unittest.TestCase):
         with self.assertRaises(BoundaryError): controller.tick()
         self.assertEqual(grants.calls, 1); self.assertEqual(store.state['phase'], 'grant_intent')
 
+    def test_never_bound_recovers_a_cancelled_launch_and_an_expired_binding(self):
+        # Cancelled before binding never held the credential either, and the
+        # operator may reconcile hours later, after the binding's expires_at.
+        controller, store, cloud, broker, _, grants = self.make(); grants.lose_reply = True
+        with self.assertRaises(OSError): controller.tick()
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, cancelledCount=1, failedCount=0, succeededCount=0)
+        store.state['expires_at'] = 1000 - 10000
+        self.assertEqual(controller.reset()['status'], 'idle')
+        self.assertEqual(broker.state['execution_uid'], PRIOR_UID)
+
     def test_never_bound_requires_this_slots_own_failed_execution(self):
         for change in ({'succeededCount': 1, 'failedCount': 0}, {'uid': '44444444-4444-4444-4444-444444444444'}):
             with self.subTest(change=change):

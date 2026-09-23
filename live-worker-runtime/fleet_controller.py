@@ -106,7 +106,8 @@ class Controller:
         """
         if not isinstance(state, dict) or state.get('execution_uid') != value.get('uid'):
             return False
-        if value.get('failedCount') != 1 or value.get('succeededCount', 0) != 0:
+        # Failed or cancelled before binding; a succeeded execution held the credential.
+        if value.get('succeededCount', 0) != 0:
             return False
         grant_sha256, expires_at = state.get('grant_sha256'), state.get('expires_at')
         if not (isinstance(grant_sha256, str) and re.fullmatch(r'[a-f0-9]{64}', grant_sha256) and type(expires_at) is int):
