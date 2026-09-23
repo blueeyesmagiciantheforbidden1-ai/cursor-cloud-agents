@@ -63,6 +63,20 @@ def idle_fault(error):
     return 'fail'
 
 
+def exit_line(agent, exit_code, outcome):
+    """One stderr line for a failed exit: agent, exit code and the vetted code only.
+
+    The outcome record carries the code, but Cloud Run's error reporting and a
+    quick log read look at stderr, and every failure on 2026-09-23 had none.
+    Never str(error): only a SAFE_CODE value or 'unrecorded'.
+    """
+    code = outcome.get('error_code') if isinstance(outcome, dict) else None
+    if not (isinstance(code, str) and provider_errors.SAFE_CODE.fullmatch(code)):
+        code = 'unrecorded'
+    name = agent if isinstance(agent, str) and provider_errors.SAFE_CODE.fullmatch(agent) else 'worker'
+    return f'{name} worker exit {int(exit_code)}: {code}'
+
+
 def maintain_fault(error):
     """Classify an exception from adapter.maintain(): drain, retry, or fail.
 

@@ -492,6 +492,17 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(client.completions, [])
         self.assertNotIn('execute', adapter.calls)
 
+    def test_exit_line_carries_only_vetted_codes(self):
+        from live_loop import exit_line
+        self.assertEqual(exit_line('copilot', 1, {'error_code': 'copilot_unexpected_pre_prompt_activity'}),
+                         'copilot worker exit 1: copilot_unexpected_pre_prompt_activity')
+        self.assertEqual(exit_line('claude', 75, {'error_code': 'claude_quota_exhausted'}),
+                         'claude worker exit 75: claude_quota_exhausted')
+        for bad in ({'error_code': 'C:/secret/path token=abc'}, {'error_code': None}, {}, None, 'x'):
+            with self.subTest(bad=bad):
+                self.assertEqual(exit_line('grok', 1, bad), 'grok worker exit 1: unrecorded')
+        self.assertEqual(exit_line('Bad Agent!', 1, {}), 'worker worker exit 1: unrecorded')
+
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):
             self.assertTrue(provider_errors.is_quota(code))

@@ -17,7 +17,7 @@ sys.path[:0] = [str(HERE), '/opt/runcrew', '/opt/runcrew/app']
 
 from agent_hub.worker import Config, HubClient, NoRedirect, WorkerError
 from dynamic_broker import load_client
-from live_loop import Settings, Worker
+from live_loop import Settings, Worker, exit_line
 import broker_renew
 import provider_errors
 
@@ -120,7 +120,9 @@ def main():
         result = worker.run()
         if result['outcome'] in ('completed', 'idle_drained'):
             return 0
-        return worker.last_exit if worker.last_exit == provider_errors.QUOTA_EXIT_CODE else 1
+        code = worker.last_exit if worker.last_exit == provider_errors.QUOTA_EXIT_CODE else 1
+        print(exit_line(agent, code, result), file=sys.stderr, flush=True)
+        return code
     finally:
         # prepare() owns cleanup if a native child was started but its handle
         # could not be returned. Only a known zero-native case can finish here.
