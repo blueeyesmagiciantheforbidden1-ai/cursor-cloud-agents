@@ -90,7 +90,92 @@ class Controller:
         require(set(slot) == {'job_uid', 'template_sha256', 'enabled'} and type(slot['enabled']) is bool
                 and re.fullmatch(r'[a-f0-9-]{36}', slot['job_uid'])
                 and re.fullmatch(r'[a-f0-9]{64}', slot['template_sha256']), 'slot_config_invalid')
-        self.config_sha = digest({'policy': asdict(policy), 'slot': slot})
+
+    @property
+    def config_sha(self):
+        return digest({'policy': asdict(self.policy), 'slot': self.slot})
+
+    def _policy_sha(self):
+        return digest(asdict(self.policy))
+
+    def _config_for_template(self, template_sha256):
+        slot = {'job_uid': self.slot['job_uid'], 'template_sha256': template_sha256,
+                'enabled': self.slot['enabled']}
+        return digest({'policy': asdict(self.policy), 'slot': slot})
+
+    def _binding_fields(self):
+        """Identity the state must carry so a later template rollout can be proved.
+
+        config_sha256 mixes the policy and the whole slot. Splitting policy_sha256
+        from the slot fields lets a template-only change be checked without
+        treating every image rollout as a new controller.
+        """
+        return {'policy_sha256': self._policy_sha(), 'slot_job_uid': self.slot['job_uid'],
+                'slot_enabled': self.slot['enabled'], 'slot_template_sha256': self.slot['template_sha256'],
+                'config_sha256': self.config_sha}
+
+    def _previous_template_sha256(self, state):
+        """Template digest the stored config_sha256 was computed with.
+
+        New states persist it. A document that only has config_sha256 (the
+        controller before this split) still proves a re-key when the live job
+        has not yet been updated: that template is the previous one, and
+        recomputing the digest with it must equal the stored config_sha256.
+        Once the image and the slot digest have both moved, the previous
+        template is no longer derivable; the tick that ran while they still
+        matched has to have saved it.
+        """
+        recorded = state.get('slot_template_sha256')
+        if isinstance(recorded, str) and re.fullmatch(r'[a-f0-9]{64}', recorded):
+            return recorded
+        job = self.cloud.get(self.policy.profile.job_name)
+        if (not isinstance(job, dict) or canonical_name(job.get('name')) != self.policy.profile.job_name
+                or job.get('uid') != self.slot['job_uid']):
+            return None
+        try:
+            derived = digest(job.get('template'))
+        except (TypeError, ValueError):
+            return None
+        return derived if re.fullmatch(r'[a-f0-9]{64}', derived) else None
+
+    def _template_only_change(self, state):
+        previous = self._previous_template_sha256(state)
+        if previous is None or previous == self.slot['template_sha256']:
+            return False
+        if state.get('policy_sha256') not in (None, self._policy_sha()):
+            return False
+        if state.get('slot_job_uid') not in (None, self.slot['job_uid']):
+            return False
+        if 'slot_enabled' in state and state.get('slot_enabled') != self.slot['enabled']:
+            return False
+        # Current policy + current job uid and enabled + the PREVIOUS template.
+        # Any other config edit fails this equality, including on a legacy
+        # document that stored nothing but config_sha256.
+        return self._config_for_template(previous) == state.get('config_sha256')
+
+    def _remember_binding(self, state, version):
+        fields = self._binding_fields()
+        if all(state.get(key) == value for key, value in fields.items()):
+            return state, version
+        return self.save(state, version, **fields)
+
+    def _adopt_config(self, state, version):
+        """Re-key a provable template-only change, or refuse.
+
+        Idle and blocked are the only phases that may take the new digest: the
+        next launch has not started, or the slot is already stopped. Binding,
+        launch, grant, and active keep controller_config_changed so a rollout
+        cannot retarget an attempt that is already in flight. The re-key is one
+        CAS of the new config_sha256 plus the split fields; the caller continues
+        on that state.
+        """
+        if state.get('config_sha256') == self.config_sha:
+            return self._remember_binding(state, version)
+        if state.get('phase') not in ('idle', 'blocked'):
+            raise ControllerError('controller_config_changed')
+        if not self._template_only_change(state):
+            raise ControllerError('controller_config_changed')
+        return self.save(state, version, **self._binding_fields())
 
     def job(self):
         value = self.cloud.get(self.policy.profile.job_name)
@@ -156,11 +241,19 @@ class Controller:
             return {'status': 'disabled'}
         state, version = self.store.read()
         if state is None:
-            state = {'schema_version': 1, 'config_sha256': self.config_sha, 'phase': 'idle',
-                     'generation': 0, 'updated_at': int(self.clock())}
+            state = {'schema_version': 1, 'phase': 'idle', 'generation': 0,
+                     'updated_at': int(self.clock()), **self._binding_fields()}
             version = self.store.cas(state, None)
-        require(state.get('config_sha256') == self.config_sha, 'controller_config_changed')
         for _ in range(8):
+            # Active is drained under the digest it launched with. A template-only
+            # change is refused until that execution is terminal; the idle or
+            # blocked transition that follows is what re-keys. Any other drift
+            # refuses immediately, including while the execution is still running.
+            if state['phase'] == 'active' and state.get('config_sha256') != self.config_sha:
+                if not self._template_only_change(state):
+                    raise ControllerError('controller_config_changed')
+            else:
+                state, version = self._adopt_config(state, version)
             phase = state['phase']
             if phase in ('blocked', 'launch_intent', 'binding_intent', 'grant_intent'):
                 # Another delivery may own this mutation, or its reply was lost.
@@ -221,6 +314,9 @@ class Controller:
                 execution = exact_execution(self.policy, self.cloud.get(state['execution']), state['intent'])
                 require(execution['uid'] == state['execution_uid'], 'execution_uid_changed')
                 if not terminal(execution):
+                    # The slot is still mid-execution. Do not adopt the new template yet.
+                    if state.get('config_sha256') != self.config_sha:
+                        raise ControllerError('controller_config_changed')
                     return {'status': 'job_running_readiness_separate', 'execution': state['execution'],
                             'worker_id': self.policy.profile.provider + '-live-' + state['execution_uid'].replace('-', ''),
                             'generation': state['generation']}
@@ -269,8 +365,12 @@ class Controller:
         grant and a fresh binding; a stale binding expires on its own.
         """
         state, version = self.store.read()
-        require(state is not None and state.get('config_sha256') == self.config_sha, 'controller_config_changed')
+        require(state is not None, 'controller_config_changed')
         require(state.get('phase') in self.STOPPED, 'slot_not_stopped')
+        # Same re-key rule as tick. Intent phases are in STOPPED but are not
+        # idle or blocked, so a template change while a launch is in flight
+        # still refuses here instead of resetting onto the new digest.
+        state, version = self._adopt_config(state, version)
         phase = state['phase']
         previous = self.current_terminal(self.job(), state)
         state_error = state.get('error')

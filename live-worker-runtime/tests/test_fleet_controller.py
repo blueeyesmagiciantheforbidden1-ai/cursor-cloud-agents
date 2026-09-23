@@ -1,5 +1,6 @@
 """Offline adversarial scheduler-delivery checks; no provider/cloud calls."""
 from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 import unittest
@@ -365,6 +366,182 @@ class FleetReviewTests(unittest.TestCase):
         original = cloud.get
         cloud.get = lambda name: original(name) if name in cloud.executions_by_name else deepcopy(cloud.job)
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+
+    def idled(self):
+        """One clean launch, then back to idle while the launch interval still holds."""
+        controller, store, cloud, broker, bindings, grants = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        self.assertEqual(store.state['phase'], 'idle')
+        return controller, store, cloud, broker, bindings, grants
+
+    def roll_template(self, controller, cloud, template=None):
+        template = {'offline': 'rolled-template'} if template is None else template
+        cloud.job['template'] = template
+        controller.slot['template_sha256'] = digest(template)
+        return template
+
+    def test_template_only_change_on_idle_rekeys_and_launches(self):
+        controller, store, cloud, _, _, _ = self.idled()
+        previous = store.state['slot_template_sha256']
+        self.roll_template(controller, cloud)
+        self.assertNotEqual(controller.config_sha, store.state['config_sha256'])
+        self.assertEqual(previous, digest({'offline': 'fixed-template'}))
+        controller.clock = lambda: 2000
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(controller.policy)))
+        self.assertEqual(cloud.run_count, 2)
+
+    def test_policy_or_job_uid_change_is_not_a_rekey(self):
+        cases = (
+            ('policy', lambda controller: setattr(controller, 'policy', replace(controller.policy, lease_seconds=180))),
+            ('job_uid', lambda controller: controller.slot.update(job_uid='44444444-4444-4444-4444-444444444444')),
+        )
+        for name, change in cases:
+            with self.subTest(change=name):
+                controller, store, cloud, _, _, _ = self.idled()
+                bound = store.state['config_sha256']
+                change(controller)
+                controller.clock = lambda: 2000
+                with self.assertRaises(ControllerError) as caught:
+                    controller.tick()
+                self.assertEqual(str(caught.exception), 'controller_config_changed')
+                self.assertEqual(store.state['config_sha256'], bound)
+                self.assertEqual(store.state['phase'], 'idle')
+                self.assertEqual(cloud.run_count, 1)
+
+    def test_template_change_while_active_waits_until_terminal(self):
+        controller, store, cloud, broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        bound = store.state['config_sha256']
+        self.roll_template(controller, cloud)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state['phase'], 'active')
+        self.assertEqual(store.state['config_sha256'], bound)
+        self.assertEqual(cloud.run_count, 1)
+        # Still running: a second delivery does not adopt the digest either.
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.clock = lambda: 2000
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
+        self.assertEqual(cloud.run_count, 2)
+
+    def test_template_change_mid_launch_is_refused(self):
+        controller, store, cloud, _, _, grants = self.make()
+        grants.lose_reply = True
+        with self.assertRaises(OSError):
+            controller.tick()
+        self.assertEqual(store.state['phase'], 'grant_intent')
+        bound = store.state['config_sha256']
+        self.roll_template(controller, cloud)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state['phase'], 'grant_intent')
+        self.assertEqual(store.state['config_sha256'], bound)
+        with self.assertRaises(ControllerError) as caught:
+            controller.reset()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state['config_sha256'], bound)
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_blocked_template_change_rekeys_without_launching(self):
+        controller, store, cloud, _, _, _ = self.blocked()
+        self.roll_template(controller, cloud)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['phase'], 'blocked')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(cloud.run_count, 1)
+        self.assertEqual(controller.reset()['status'], 'idle')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        controller.clock = lambda: 2000
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+    def _legacy_state(self, controller, store):
+        """State shape written before policy_sha256 and the slot fields were stored."""
+        store.state = {'schema_version': 1, 'config_sha256': controller.config_sha, 'phase': 'idle',
+                       'generation': 0, 'updated_at': 1}
+        store.version = 1
+
+    def test_legacy_state_rekeys_from_the_job_template_then_launches(self):
+        # Slot digest moves first. The live job still has the previous template,
+        # which is the only proof a config_sha256-only document has.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        self.assertNotIn('slot_template_sha256', store.state)
+        new_template = {'offline': 'rolled-template'}
+        controller.slot['template_sha256'] = digest(new_template)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'job_template_changed')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(new_template))
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(controller.policy)))
+        self.assertEqual(cloud.run_count, 0)
+        # The re-key already committed. The image update is what the next tick launches.
+        cloud.job['template'] = new_template
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(digest(cloud.job['template']), controller.slot['template_sha256'])
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_legacy_state_records_the_previous_template_before_the_digest_changes(self):
+        # Image rolled, fleet.json not yet. One tick persists the slot's current
+        # (previous) template, then refuses the job. Recording the new digest
+        # after that is a normal re-key and launches.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        previous = controller.slot['template_sha256']
+        bound = controller.config_sha
+        cloud.job['template'] = {'offline': 'rolled-template'}
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'job_template_changed')
+        self.assertEqual(store.state['slot_template_sha256'], previous)
+        self.assertEqual(store.state['config_sha256'], bound)
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(POLICY)))
+        self.assertEqual(cloud.run_count, 0)
+        controller.slot['template_sha256'] = digest(cloud.job['template'])
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_legacy_policy_change_and_unprovable_template_change_are_refused(self):
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        before = deepcopy(store.state)
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(cloud.run_count, 0)
+        # Both the image and the slot digest already moved, and nothing in the
+        # document remembers the previous template: indistinguishable from a
+        # policy edit, so it stays refused.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        before = deepcopy(store.state)
+        self.roll_template(controller, cloud)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(cloud.run_count, 0)
 
 
 class GrantStoreNameFormTests(unittest.TestCase):
