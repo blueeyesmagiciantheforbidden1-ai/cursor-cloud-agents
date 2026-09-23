@@ -33,6 +33,12 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 AGENTS = ("codex", "claude", "cursor", "copilot", "grok")
 GATE_ORDER = ("capability", "roster", "fleet", "duplicate", "load", "expiry")
 GATES = GATE_ORDER + ("all",)
+# 'all' leaves expiry out: its room is an ordinary solve room with no short
+# queue deadline, so healthy workers can finish it before it could expire
+# (Demand's review). Run `expiry` on its own; it stays advisory.
+ALL_GATES = tuple(gate for gate in GATE_ORDER if gate != "expiry")
+# Interim campaign rule: 180 s until every worker renews its lease mid-turn.
+DEFAULT_ROOM_TIMEOUT = 180
 POLL_SECONDS = 10
 DEADLINE_SECONDS = 15 * 60
 TERMINAL_STATUSES = frozenset({
@@ -883,8 +889,8 @@ def main(argv=None, *, env=None, sleep=time.sleep, clock=time.monotonic,
     parser.add_argument("--max-rooms", type=_positive_int, default=8,
                         help="Fleet gate: stop after this many rooms (default 8)")
     parser.add_argument("--ledger", required=True, help="Path of the JSON ledger to write")
-    parser.add_argument("--room-timeout", type=_positive_int, default=300,
-                        help="timeout_seconds for each room (default 300; the hub refuses "
+    parser.add_argument("--room-timeout", type=_positive_int, default=DEFAULT_ROOM_TIMEOUT,
+                        help="timeout_seconds for each room (default 180; the hub refuses "
                              "less than 120 with codex on the room). Load rooms must finish "
                              "within this many seconds.")
     parser.add_argument("--load-rooms", type=_positive_int, default=3,
@@ -909,7 +915,7 @@ def main(argv=None, *, env=None, sleep=time.sleep, clock=time.monotonic,
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    gates = GATE_ORDER if gate == "all" else (gate,)
+    gates = ALL_GATES if gate == "all" else (gate,)
     try:
         return run_gates(
             client, gates, consecutive=args.consecutive, max_rooms=args.max_rooms,

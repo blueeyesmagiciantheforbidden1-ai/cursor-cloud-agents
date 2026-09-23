@@ -21,8 +21,10 @@ Run the gates in this order:
 
 `capability -> roster -> fleet -> duplicate -> load -> expiry`
 
-`all` runs that sequence and stops on the first failing gate. A skipped expiry
-gate is not a failure. With no subcommand, the fleet gate runs, and the flags
+`all` runs that sequence without expiry and stops on the first failing gate.
+Run `expiry` on its own: it is advisory until the hub accepts a short queue
+deadline on the test room, because a healthy fleet can finish its room before
+it expires. A skipped expiry gate is not a failure. With no subcommand, the fleet gate runs, and the flags
 below keep working.
 
 ```bash
@@ -73,7 +75,7 @@ Exit 0 with the wrong token is execution ok and validation failed. The gate fail
 - `--ledger` (required): JSON ledger path. It is rewritten as gates and fleet rooms finish.
 - `--consecutive`: fleet passes in a row (default 2). Must be less than or equal to `--max-rooms`.
 - `--max-rooms`: fleet stop (default 8).
-- `--room-timeout`: each room's `timeout_seconds` (default 300, allowed 120-900). The load gate also requires every room to complete within this many seconds.
+- `--room-timeout`: each room's `timeout_seconds` (default 180, allowed 120-900). The load gate also requires every room to complete within this many seconds.
 - `--load-rooms`: rooms in the load gate (default 3, allowed 1-5).
 
 The ledger is one object: `result` (`pass`, `fail`, or `skipped`) and `gates`.
@@ -91,4 +93,4 @@ that exits 0 with the wrong token, a duplicate message, a stalled room,
 `blocked_on_provider`, and hubs that omit the new fields. They do not call
 Cloud Run, Firestore, or a live hub.
 
-`--room-timeout SECONDS` sets each room's `timeout_seconds` (default 300, allowed 120-900; the hub refuses less than 120 with codex on the room). Until the `live-20260923c` worker images are deployed, use `--room-timeout 180`: the deployed claude worker does not renew its credential lease during a turn, and a room deadline of 150-180 s ends a slow turn inside that lease instead of quarantining the credential.
+`--room-timeout SECONDS` sets each room's `timeout_seconds` (default 180, allowed 120-900; the hub refuses less than 120 with codex on the room). Until the `live-20260923c` worker images are deployed, use `--room-timeout 180`: the deployed claude worker does not renew its credential lease during a turn, and a room deadline of 150-180 s ends a slow turn inside that lease instead of quarantining the credential.

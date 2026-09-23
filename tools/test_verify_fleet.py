@@ -308,7 +308,7 @@ class VerifyFleetTests(unittest.TestCase):
         body = result["posts"][0]["body"]
         self.assertEqual(set(body), ROOM_FIELDS)
         self.assertEqual(body["agents"], list(vf.AGENTS))
-        self.assertEqual(body["timeout_seconds"], 300)
+        self.assertEqual(body["timeout_seconds"], 180)
         self.assertEqual(body["workspace"], "default")
         self.assertEqual(body["purpose"], "project")
         self.assertNotIn("queue_deadline", body)
@@ -590,8 +590,8 @@ class VerifyFleetTests(unittest.TestCase):
         gate = self._gate(result, "load")
         self.assertTrue(gate["pass"])
         self.assertEqual(gate["evidence"]["requested_rooms"], 3)
-        self.assertEqual(gate["evidence"]["room_timeout"], 300)
-        self.assertLessEqual(gate["evidence"]["elapsed_seconds"], 300)
+        self.assertEqual(gate["evidence"]["room_timeout"], 180)
+        self.assertLessEqual(gate["evidence"]["elapsed_seconds"], 180)
         self.assertTrue(gate["evidence"]["within_room_timeout"])
         self.assertEqual(len(gate["evidence"]["rooms"]), 3)
         self.assertTrue(all(room["pass"] for room in gate["evidence"]["rooms"]))
@@ -657,7 +657,8 @@ class VerifyFleetTests(unittest.TestCase):
         outcomes = [_match() for _ in range(5 + 2 + 1 + 3)]
         result = self._run(outcomes, [], gate="all", status=ready_status())
         self.assertEqual(result["code"], 0)
-        self.assertEqual([item["gate"] for item in result["ledger"]["gates"]], list(vf.GATE_ORDER))
+        self.assertEqual([item["gate"] for item in result["ledger"]["gates"]], list(vf.ALL_GATES))
+        self.assertNotIn("expiry", vf.ALL_GATES)
         self.assertEqual(result["ledger"]["result"], "pass")
         self.assertTrue(self._gate(result, "capability")["pass"])
         self.assertFalse(self._gate(result, "capability")["evidence"]["agents"]["codex"]["capability_manifest_present"])
@@ -666,8 +667,6 @@ class VerifyFleetTests(unittest.TestCase):
         self.assertEqual(self._gate(result, "fleet")["evidence"]["streak"], 2)
         self.assertTrue(self._gate(result, "duplicate")["pass"])
         self.assertTrue(self._gate(result, "load")["pass"])
-        expiry = self._gate(result, "expiry")
-        self.assertEqual(expiry["result"], "skipped")
         self.assertEqual(len(result["posts"]), 11)
         self.assertEqual(result["events"][0], "status")
 
@@ -677,16 +676,18 @@ class VerifyFleetTests(unittest.TestCase):
         self.assertEqual([item["gate"] for item in result["ledger"]["gates"]], ["capability"])
         self.assertEqual(result["posts"], [])
 
-    def test_all_includes_expiry_when_the_hub_expires_the_room(self):
-        outcomes = [_match() for _ in range(5 + 2 + 1 + 3)] + [_match("expired")]
+    def test_all_leaves_expiry_out_even_when_the_hub_supports_it(self):
+        # Review (Demand): the expiry room is an ordinary solve room, so a healthy
+        # fleet can complete it first; 'all' must not false-fail on that.
+        outcomes = [_match() for _ in range(5 + 2 + 1 + 3)] + [_match("completed")]
         status = ready_status(_root={"capabilities": {"queue_deadline": True}})
         result = self._run(outcomes, [], gate="all", status=status)
         self.assertEqual(result["code"], 0)
-        self.assertEqual(len(result["posts"]), 12)
-        expiry = self._gate(result, "expiry")
-        self.assertTrue(expiry["pass"])
-        self.assertEqual(expiry["evidence"]["support_field"], "capabilities.queue_deadline")
-        self.assertEqual(expiry["evidence"]["rooms"][0]["room_status"], "expired")
+        self.assertEqual(len(result["posts"]), 11)
+        self.assertNotIn("expiry", [item["gate"] for item in result["ledger"]["gates"]])
+
+    def test_default_room_timeout_is_the_interim_180(self):
+        self.assertEqual(vf.DEFAULT_ROOM_TIMEOUT, 180)
 
     def test_missing_token_and_non_loopback_http_do_not_call_out(self):
         stdout, stderr = StringIO(), StringIO()
