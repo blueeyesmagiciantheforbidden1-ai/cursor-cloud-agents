@@ -205,12 +205,13 @@ class LoopTests(unittest.TestCase):
                 worker, client, adapter, _ = self.setup_worker(); client.room.update(change)
                 worker.run(); self.assertNotIn('execute', adapter.calls)
 
-    def test_room_without_purpose_field_is_project_work(self):
-        # Rooms stored by a hub revision that never wrote purpose failed every
-        # worker with project_work_only; the hub's own default is 'project'.
+    def test_missing_purpose_is_refused_with_its_own_code(self):
+        # Rooms stored by hub revision 00001-clc had no purpose field; the
+        # worker refuses them (fail closed) and the record now says why.
         worker, client, adapter, _ = self.setup_worker(); del client.room['purpose']
         result = worker.run()
-        self.assertEqual(result['outcome'], 'completed'); self.assertIn('execute', adapter.calls)
+        self.assertEqual(result['error_code'], 'purpose_missing'); self.assertNotIn('execute', adapter.calls)
+        self.assertIn('(purpose_missing)', client.completions[0]['output'])
         for value in ('improvement', '', None, 'PROJECT'):
             with self.subTest(purpose=value):
                 worker, client, adapter, _ = self.setup_worker(); client.room['purpose'] = value

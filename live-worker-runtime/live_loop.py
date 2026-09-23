@@ -50,10 +50,11 @@ class Settings:
 
 def task_prompt(task, room, agent):
     require(isinstance(room, dict) and room.get('id') == task.get('room_id'), 'room_identity_changed')
-    # The hub defaults an unset purpose to 'project' (core.create); rooms
-    # written by a revision that never stored the field are project rooms.
-    # Only an explicit non-project purpose is refused.
-    require(room.get('purpose', 'project') == 'project', 'project_work_only')
+    # Fail closed: a stored room without the field is one the hub never
+    # finished asserting, not an omitted request. Distinct code so the record
+    # says which it was (hub revision 00001-clc stored no purpose at all).
+    require('purpose' in room, 'purpose_missing')
+    require(room.get('purpose') == 'project', 'project_work_only')
     require(room.get('status') == 'running' and room.get('step') == task.get('step'), 'room_step_changed')
     require(task.get('workspace') == room.get('workspace') == 'default', 'workspace_not_enabled')
     require(task.get('prompt') == room.get('prompt') and task.get('messages') == room.get('messages'),
