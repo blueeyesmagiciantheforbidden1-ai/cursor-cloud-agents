@@ -492,5 +492,260 @@ class FailureInjectionTests(unittest.TestCase):
         self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
 
 
+class RealSigtermInjection(unittest.TestCase):
+    """Cases h1–h6: production SIGTERM via Worker.on_signal (entrypoint.py:109-114).
+
+    Entrypoint stop handler: `if worker.on_signal(): raise KeyboardInterrupt`.
+    on_signal always sets stopping; returns True (interrupt) at most once and
+    never while worker.critical is non-zero. run() catches KeyboardInterrupt
+    as worker_stopping and takes the normal close-then-complete path; a stop
+    before any claim is idle_drained, exit 0.
+    """
+
+    def setUp(self):
+        self.log_records = []
+        self._logging_records = []
+
+    def _log(self, record):
+        self.log_records.append(copy.deepcopy(record))
+
+    def setup_worker(self, *, warm_seconds=60):
+        clock = Clock()
+        hub = FakeHub(clock)
+        adapter = FakeAdapter()
+        worker = Worker(
+            Settings('grok', 'grok-live', warm_seconds=warm_seconds),
+            hub, adapter, object(),
+            clock=clock, sleep=clock.sleep, log=self._log,
+        )
+        adapter._worker_ref = worker
+        return worker, hub, adapter, clock
+
+    def run_captured(self, worker):
+        """Run worker while capturing stdout, stderr, and logging module output."""
+        captured = self._logging_records
+
+        class ListHandler(logging.Handler):
+            def emit(self, record):
+                captured.append(self.format(record))
+
+        list_handler = ListHandler()
+        list_handler.setFormatter(logging.Formatter('%(levelname)s %(message)s'))
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(list_handler)
+        root.setLevel(logging.DEBUG)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                result = worker.run()
+        finally:
+            root.removeHandler(list_handler)
+            root.setLevel(old_level)
+        return result, out.getvalue(), err.getvalue()
+
+    def assert_no_secret_leak(self, *blobs):
+        combined = '\n'.join(str(b) for b in blobs)
+        for secret in (LEASE, PROMPT, ANSWER):
+            self.assertNotIn(secret, combined)
+
+    def _sigterm(self, worker):
+        """Match entrypoint.py:109-114 exactly."""
+        if worker.on_signal():
+            raise KeyboardInterrupt
+
+    # --- (h1) SIGTERM during maintain, before claim ----------------------------
+
+    def test_h1_sigterm_during_maintain_before_claim(self):
+        """h1: SIGTERM in maintain() before claim -> idle_drained, exit 0."""
+        worker, hub, adapter, _ = self.setup_worker()
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            self._sigterm(worker)
+
+        adapter.maintain = maintain
+        result, out, err = self.run_captured(worker)
+
+        self.assertEqual(result.get('outcome'), 'idle_drained')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(hub.claims, 0)
+        self.assertEqual(adapter.calls.count('execute'), 0)
+        self.assertEqual(len(hub.completions), 0)
+        self.assertEqual(len(hub.accepted_completions), 0)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertTrue(worker.cleaned)
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    # --- (h2) SIGTERM inside get_room after claim ------------------------------
+
+    def test_h2_sigterm_inside_get_room_after_claim(self):
+        """h2: SIGTERM in get_room during _prepare_task after claim.
+
+        Exactly one completion: worker_stopping, model_call_attempted False,
+        exit_code 1; execute 0; close once.
+        """
+        worker, hub, adapter, _ = self.setup_worker()
+
+        def get_room(room):
+            # Claim returned; prepare is in progress. Production SIGTERM lands here.
+            self._sigterm(worker)
+            return copy.deepcopy(hub.room)
+
+        hub.get_room = get_room
+        result, out, err = self.run_captured(worker)
+
+        self.assertEqual(hub.claims, 1)
+        self.assertTrue(hub._leased)
+        self.assertEqual(adapter.calls.count('execute'), 0)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(len(hub.completions), 1)
+        self.assertEqual(len(hub.accepted_completions), 1)
+        completion = hub.completions[0]
+        self.assertEqual(completion['error_code'], 'worker_stopping')
+        self.assertIs(completion['model_call_attempted'], False)
+        self.assertEqual(completion['exit_code'], 1)
+        self.assertEqual(result.get('error_code'), 'worker_stopping')
+        self.assertIs(result.get('model_call_attempted'), False)
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    # --- (h3) SIGTERM inside adapter.execute -----------------------------------
+
+    def test_h3_sigterm_inside_execute(self):
+        """h3: SIGTERM mid-execute -> one worker_stopping completion, model attempted."""
+        worker, hub, adapter, _ = self.setup_worker()
+
+        def execute_hook(handle, prompt, deadline, heartbeat):
+            self._sigterm(worker)
+
+        adapter.execute_hook = execute_hook
+        result, out, err = self.run_captured(worker)
+
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertTrue(worker.model_call_attempted)
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(len(hub.completions), 1)
+        self.assertEqual(len(hub.accepted_completions), 1)
+        completion = hub.completions[0]
+        self.assertEqual(completion['error_code'], 'worker_stopping')
+        self.assertIs(completion['model_call_attempted'], True)
+        self.assertEqual(completion['exit_code'], 1)
+        self.assertEqual(result.get('error_code'), 'worker_stopping')
+        self.assertTrue(result.get('model_call_attempted'))
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    # --- (h4) SIGTERM inside adapter.close after success -----------------------
+
+    def test_h4_sigterm_inside_close_after_success(self):
+        """h4: SIGTERM inside close() after success -> on_signal False (critical).
+
+        Close finishes under _critical; cleaned True; exactly one completion
+        (successful answer — stop honoured after critical sections).
+        """
+        worker, hub, adapter, _ = self.setup_worker()
+        close_interrupted = []
+
+        def close_hook(handle):
+            # Production: SIGTERM during close; critical section refuses interrupt.
+            try:
+                self._sigterm(worker)
+                close_interrupted.append(False)
+            except KeyboardInterrupt:
+                close_interrupted.append(True)
+                raise
+
+        adapter.close_hook = close_hook
+        result, out, err = self.run_captured(worker)
+
+        self.assertEqual(close_interrupted, [False])
+        self.assertTrue(worker.stopping)
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertTrue(worker.cleaned)
+        self.assertEqual(len(hub.completions), 1)
+        self.assertEqual(len(hub.accepted_completions), 1)
+        completion = hub.completions[0]
+        # Stop was deferred; success path still posts the answer.
+        self.assertEqual(completion.get('exit_code'), 0)
+        self.assertEqual(completion.get('output'), ANSWER)
+        self.assertNotIn('error_code', completion)
+        self.assertEqual(result.get('outcome'), 'completed')
+        self.assertEqual(worker.last_exit, 0)
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    # --- (h5) SIGTERM inside the completion POST -------------------------------
+
+    def test_h5_sigterm_inside_completion_post(self):
+        """h5: SIGTERM inside /complete -> on_signal False; completion once."""
+        worker, hub, adapter, _ = self.setup_worker()
+        complete_interrupted = []
+        original_post = hub.post
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                try:
+                    self._sigterm(worker)
+                    complete_interrupted.append(False)
+                except KeyboardInterrupt:
+                    complete_interrupted.append(True)
+                    raise
+            return original_post(path, value)
+
+        hub.post = post
+        result, out, err = self.run_captured(worker)
+
+        self.assertEqual(complete_interrupted, [False])
+        self.assertTrue(worker.stopping)
+        self.assertEqual(len(hub.completions), 1)
+        self.assertEqual(len(hub.accepted_completions), 1)
+        self.assertEqual(hub.completions[0].get('exit_code'), 0)
+        self.assertEqual(result.get('outcome'), 'completed')
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertTrue(worker.cleaned)
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    # --- (h6) two SIGTERMs: execute then close ---------------------------------
+
+    def test_h6_two_sigterms_execute_then_close(self):
+        """h6: SIGTERM in execute then again in close -> one interrupt, one completion."""
+        worker, hub, adapter, _ = self.setup_worker()
+        signal_results = []
+
+        def execute_hook(handle, prompt, deadline, heartbeat):
+            try:
+                self._sigterm(worker)
+                signal_results.append(('execute', False))
+            except KeyboardInterrupt:
+                signal_results.append(('execute', True))
+                raise
+
+        def close_hook(handle):
+            try:
+                self._sigterm(worker)
+                signal_results.append(('close', False))
+            except KeyboardInterrupt:
+                signal_results.append(('close', True))
+                raise
+
+        adapter.execute_hook = execute_hook
+        adapter.close_hook = close_hook
+        result, out, err = self.run_captured(worker)
+
+        self.assertEqual(signal_results, [('execute', True), ('close', False)])
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertTrue(worker.cleaned)
+        self.assertEqual(len(hub.completions), 1)
+        self.assertEqual(len(hub.accepted_completions), 1)
+        completion = hub.completions[0]
+        self.assertEqual(completion['error_code'], 'worker_stopping')
+        self.assertIs(completion['model_call_attempted'], True)
+        self.assertEqual(completion['exit_code'], 1)
+        self.assertEqual(result.get('error_code'), 'worker_stopping')
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+
 if __name__ == '__main__':
     unittest.main()
