@@ -1,7 +1,8 @@
 # Live controller image (broker + fleet controller): standard library only, no native CLI, no credential.
 # Build context is the repository root:  docker build -f live-image-controller/Dockerfile .
 # Same layout and checks as the live-image-controller-live-20260922c pack; sources come from this checkout.
-FROM python:3.12-slim-bookworm
+# Pinned to the digest the live-20260923a build resolved (revision runcrew-live-fleet-00008-2v8).
+FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
 RUN groupadd --gid 10001 worker && useradd --uid 10001 --gid worker --no-create-home --shell /usr/sbin/nologin worker && install -d -o root -g root -m 0755 /opt/runcrew/app /run/config
 # Only the agent_hub modules the broker and controller import.
 COPY --chown=0:0 agent-hub/agent_hub/__init__.py agent-hub/agent_hub/adapters.py agent-hub/agent_hub/billing_policy.py \
