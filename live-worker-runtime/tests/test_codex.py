@@ -372,14 +372,23 @@ class CodexLive(unittest.TestCase):
         handle.native.next_renew = time.monotonic() - 1
         self._broker_renew_failure(handle)
 
-    def test_short_warm_window_does_not_start_execute_setup(self):
+    def test_expired_warm_window_does_not_start_execute_setup(self):
         handle = self.prepare()
-        handle.warm_deadline = time.monotonic() + c.EXECUTE_WARM_FLOOR - 1
+        handle.warm_deadline = time.monotonic() - 1
         with self.assertRaisesRegex(c.LiveCodexError, 'warm_session_expired') as caught:
             c.execute(handle, 'Project task.', time.monotonic() + 180)
         self.assertEqual(self.prompt_count(), 0)
         self.assertFalse(caught.exception.model_call_attempted)
         self.assertEqual(handle.state, 'closed')
+
+    def test_execute_native_deadline_is_not_capped_by_the_warm_window(self):
+        handle = self.prepare()
+        started = time.monotonic()
+        handle.warm_deadline = started + 100
+        c.execute(handle, 'Project task.', started + 500)
+        self.assertEqual(self.native.deadline, started + 500 - c.FINALIZE_RESERVE)
+        self.assertGreater(self.native.deadline, handle.warm_deadline)
+        self.assertEqual(self.prompt_count(), 1)
 
     def test_execute_setup_transport_error_stays_a_fixed_code(self):
         handle = self.prepare()
