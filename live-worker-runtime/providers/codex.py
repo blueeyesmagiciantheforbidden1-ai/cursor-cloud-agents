@@ -123,7 +123,13 @@ class WarmRPC(transport.TurnRPC):
 
     def poll_idle(self):
         need(self.protocol_state == 'thread_ready' and not self.turn_submitted, 'native_idle_phase_required')
-        self.tick()
+        try:
+            self.tick()
+        except Exception as error:
+            # tick() calls renew() and only then advances next_renew. Let a lost
+            # hub heartbeat leave that renew due, and do not fail the warm process.
+            if not _idle_hub_loss(getattr(self, '_idle_handle', None), error):
+                raise
         need(self.process.poll() is None, 'native_not_running')
         # Drain only already queued frames; no request or model call is issued.
         while True:
@@ -193,6 +199,12 @@ class Handle:
 
 def _enter(handle):
     need(isinstance(handle, Handle) and handle.lock.acquire(blocking=False), 'concurrent_provider_operation')
+
+
+def _idle_hub_loss(handle, error):
+    """A missed hub heartbeat is retried only while the warm process is still idle."""
+    return (isinstance(handle, Handle) and handle.state == 'ready' and not handle.consumed
+            and provider_errors.error_code(error) == 'hub_lease_lost')
 
 
 def _renew(handle):
@@ -339,6 +351,7 @@ def prepare(session, heartbeat, deadline):
         startup_end = min(deadline, time.monotonic() + 120)
         handle.native = WarmRPC(session.home, lambda: _renew(handle),
             timeout_seconds=max(30, math.ceil(startup_end - time.monotonic())), execution_mode='read_only_review')
+        handle.native._idle_handle = handle
         handle.native.deadline = startup_end
         handle.native.request('initialize', {'clientInfo': {'name': 'runcrew_codex_live', 'version': '1'}})
         _collect(handle)
@@ -367,7 +380,9 @@ def maintain(handle):
             except Exception as error:
                 # Idle renew only reaches the hub. A dropped heartbeat is retried
                 # on the next maintain; closing the native process fails the warm run.
-                if provider_errors.error_code(error) != 'hub_lease_lost':
+                # _renew sets next_renew only after the heartbeat returns, so a
+                # miss stays due. A non-vetted broker failure still fails below.
+                if not _idle_hub_loss(handle, error):
                     raise
         return handle.readiness
     except Exception as error:
