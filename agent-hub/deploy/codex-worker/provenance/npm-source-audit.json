@@ -1,0 +1,15 @@
+{
+  "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.155.1.tgz",
+  "executed": false,
+  "integrity_verified": true,
+  "files": [
+    {
+      "name": "package/bin/codex.js",
+      "sha256": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70"
+    },
+    {
+      "name": "package/package.json",
+      "sha256": "98862962c00eef34e3946f14a4345c26efbaaa733f8c6188069654a234adeee0"
+    }
+  ]
+}

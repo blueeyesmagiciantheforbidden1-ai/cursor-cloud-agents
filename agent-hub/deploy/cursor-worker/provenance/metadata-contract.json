@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "version": "2026.09.18-9a7762b",
+  "archive_sha256": "b1308f5a2fc05458b9d8966752986bb23a971bbcc67c842c1df94c4b8132bad9",
+  "source_only": true,
+  "executed": false,
+  "observations": {
+    "cursor-agent": {
+      "sha256": "2ccc9a8e167797641448b5e5c936f006ba137a2555f117f38c5eb76a5238a233",
+      "bytes": 1096,
+      "verified_source_offsets": {
+        "vendor_entrypoint_uses_bundled_node": 298,
+        "vendor_entrypoint_executes_index": 1011,
+        "file_store_skips_system_ca_probe": 789
+      }
+    },
+    "5589.index.js": {
+      "sha256": "962e1a65f5755d93080d070f4cca7d26c006a5f249773bb55a09c7d853f949ca",
+      "bytes": 10723,
+      "verified_source_offsets": {
+        "models_calls_native_api_auth": 3140,
+        "models_fetches_account_catalog": 3427,
+        "bracket_model_overrides_supported": 2977
+      }
+    },
+    "4835.index.js": {
+      "sha256": "d301d952d3334eedcf8ae412f6d121fc7a5cdb353ba12d66873f7c34df49248e",
+      "bytes": 42557,
+      "verified_source_offsets": {
+        "native_supported_api_key_exchange": 2392,
+        "native_access_refresh_persistence": 2640
+      }
+    },
+    "3837.index.js": {
+      "sha256": "7a922fd949fabc0f056b772ecb6098d5aacd960e1cc38655d02a7974b3a1d1c3",
+      "bytes": 2463,
+      "verified_source_offsets": {
+        "status_requires_access_and_refresh": 738,
+        "status_fetches_fresh_getMe": 758,
+        "status_getMe_failure_has_no_identity": 1291
+      }
+    },
+    "1699.index.js": {
+      "sha256": "fe619d8153dce31f1231925549e74eac7f1cc04b7eeb40e884d3fcdf441415e2",
+      "bytes": 115011,
+      "verified_source_offsets": {
+        "preauthenticated_acp_supports_api_key": 58649,
+        "no_session_model_extension": 114611,
+        "catalog_uses_parameterized_mode": 37513,
+        "catalog_projects_model_and_config_options": 37290,
+        "single_value_parameters_hidden": 39356,
+        "effort_category_detected": 39497,
+        "empty_catalog_on_fetch_error": 37151,
+        "browser_authenticate_must_not_be_called": 46462
+      }
+    },
+    "9009.index.js": {
+      "sha256": "0551baf1aa2703a3e7c42cbacb7a802d3e8cd930f51f1b4906d38597cb91cbed",
+      "bytes": 11784,
+      "verified_source_offsets": {
+        "sea_reexec_is_macos_computer_use_only": 2245
+      }
+    },
+    "index.js": {
+      "sha256": "c4f1fb0ebae82b89261f6beffb9167ce03df95c7b114c2c0ce066f0271529c03",
+      "bytes": 7927473,
+      "verified_source_offsets": {
+        "mcp_loader_reads_local_home_and_workspace": 4095718,
+        "custom_config_directory_supported": 4097205,
+        "file_credential_store_supported": 2131729
+      }
+    }
+  },
+  "sea_execution_equivalence_verified": false,
+  "supported_entrypoint": "cursor-agent -> bundled node -> index.js",
+  "fixed_composer_effort_proven": false,
+  "metadata_commands": [
+    [
+      "models"
+    ],
+    [
+      "status",
+      "--format",
+      "json"
+    ],
+    [
+      "acp"
+    ]
+  ],
+  "acp_methods": [
+    "initialize",
+    "cursor/list_available_models"
+  ]
+}
