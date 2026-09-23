@@ -145,9 +145,13 @@ class ProviderErrorTests(unittest.TestCase):
                 }
                 filler[name.lower()] = value
                 self.assertTrue(live_loop.capability_valid(filler, now=now), path.name + ':' + name)
-        self.assertGreaterEqual(seen['CLI_NAME'], 1)
-        self.assertGreaterEqual(seen['CLI_VERSION'], 1)
-        self.assertGreaterEqual(seen['TOOLS_POLICY'], 1)
+        # A built image carries one provider; only the checkout carries all
+        # five, and only there must every constant appear at least once.
+        present = {path.stem for path in PROVIDERS.glob('*.py')}
+        if {'claude', 'codex', 'copilot', 'cursor', 'grok'} <= present:
+            self.assertGreaterEqual(seen['CLI_NAME'], 1)
+            self.assertGreaterEqual(seen['CLI_VERSION'], 1)
+            self.assertGreaterEqual(seen['TOOLS_POLICY'], 1)
 
 
 class Clock:
