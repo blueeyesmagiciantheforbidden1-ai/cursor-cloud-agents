@@ -23,6 +23,7 @@ import re
 import sys
 import time
 
+from agent_hub.cloud_credential_broker import BrokerError
 import provider_errors
 
 NATIVE_DIR = Path(__file__).resolve().parents[1] / 'cursor_native'
@@ -56,6 +57,13 @@ ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 MAX_PROMPT_BYTES = 200000
 MAX_ANSWER_BYTES = 15000
 HEARTBEAT_SECONDS = 8
+# The prepare() argument is only the startup budget. The live loop then waits
+# up to an hour. This cap does not slide; maintain() must not push it forward.
+WARM_SECONDS = 3600
+# MetadataError codes idle_pump can raise while reading a frame. A deadline
+# miss is not one of these: the warm cap above is what keeps the pump inside
+# its window. Renew failures are broker errors, not protocol frames.
+_IDLE_PROTOCOL = frozenset(('native_metadata_output_bound', 'native_metadata_frame_bound'))
 SEQUENCE = ('initialize', 'cursor/list_available_models', 'session/new',
             'session/set_config_option', 'session/set_config_option',
             'session/set_config_option', 'session/prompt')
@@ -327,6 +335,9 @@ def close(handle):
 def prepare(session, heartbeat, deadline):
     """Authenticate, verify the owner and model, create one configured warm session."""
     _deadline(deadline)
+    # Warm cap origin. The startup deadline passed in (from prepare start, typically
+    # 180s) is not reused after success.
+    started = time.monotonic()
     need(session.state == 'active' and session.lease.account_ref == ACCOUNT_REF, 'cursor_owner_lease_required')
     handle = Handle(session=session, heartbeat=heartbeat)
     try:
@@ -378,6 +389,10 @@ def prepare(session, heartbeat, deadline):
             'same_process_account_model_billing': False,
             'same_process_account_model_quota': False}
         need(heartbeat() is True, 'cursor_hub_heartbeat_lost')
+        # Startup budget ends here. The warm cap is WARM_SECONDS from prepare
+        # start and does not slide. It is also a full warm window after startup
+        # so idle pumping covers the live loop's wait. execute() replaces it.
+        handle.native.deadline = max(started + WARM_SECONDS, time.monotonic() + WARM_SECONDS)
         return handle
     except Exception:
         if not handle.finished and not handle.close_failed:
@@ -385,12 +400,37 @@ def prepare(session, heartbeat, deadline):
         raise
 
 
+def _idle_code(error):
+    """Vetted code for an idle_pump fault, or None when the error already is one."""
+    if isinstance(error, NativeError):
+        return None
+    if isinstance(error, BrokerError):
+        return 'cursor_idle_renew_failed'
+    if isinstance(error, metadata.MetadataError) and str(error) in _IDLE_PROTOCOL:
+        return 'cursor_idle_protocol_invalid'
+    if isinstance(error, (review.ReviewError, json.JSONDecodeError)):
+        return 'cursor_idle_protocol_invalid'
+    return None
+
+
+def _fail_idle(handle, code):
+    if not handle.finished and not handle.close_failed:
+        close(handle)
+    raise NativeError(code) from None
+
+
 def maintain(handle):
     """Call during idle polling at least every 20s; passive notifications only."""
     need(not handle.finished and not handle.attempted and not handle.close_failed and handle.native is not None,
          'cursor_handle_not_idle')
     need(handle.native.alive(), 'cursor_warm_process_ended')
-    handle.native.idle_pump()
+    try:
+        handle.native.idle_pump()
+    except Exception as error:
+        code = _idle_code(error)
+        if code is None:
+            raise
+        _fail_idle(handle, code)
     need(not handle.native.answer and not handle.native.prompt_sent, 'cursor_content_before_prompt')
     return handle.readiness
 
