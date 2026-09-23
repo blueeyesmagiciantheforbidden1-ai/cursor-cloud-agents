@@ -141,6 +141,26 @@ class Runtime:
         finally:
             self.lock.release()
 
+    def reset(self, slot):
+        """Operator unblock of one slot by provider name; serialized with tick."""
+        matches = [c for c in self.controllers if c.policy.profile.provider == slot]
+        if len(matches) != 1: return {'status': 'unknown_slot'}
+        if not self.lock.acquire(blocking=False): return {'status': 'tick_in_progress'}
+        try:
+            try:
+                result = matches[0].reset()
+            except Conflict:
+                result = {'status': 'concurrent_state_changed'}
+            except ControllerError as error:
+                # Fixed codes only; the operator needs to know why a reset was refused.
+                result = {'status': 'reset_refused', 'reason': str(error)}
+            except Exception:
+                result = {'status': 'controller_attention_required'}
+            print(json.dumps({'kind': 'runcrew_fleet_reset', 'slot': slot, 'result': result}), flush=True)
+            return result
+        finally:
+            self.lock.release()
+
 
 def main():
     base.require(os.name == 'posix' and os.geteuid() != 0 and os.environ.get('K_SERVICE')
@@ -149,12 +169,22 @@ def main():
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_): pass
         def do_POST(self):
-            if self.path != '/tick': self.send_error(404); return
-            if self.headers.get('Transfer-Encoding') or self.headers.get('Content-Length') not in (None, '0', '2'):
-                self.send_error(400); return
-            count = int(self.headers.get('Content-Length', '0'))
-            if count and self.rfile.read(count) != b'{}': self.send_error(400); return
-            body = json.dumps(runtime.tick()).encode()
+            if self.path not in ('/tick', '/reset'): self.send_error(404); return
+            if self.headers.get('Transfer-Encoding'): self.send_error(400); return
+            count = self.headers.get('Content-Length', '0')
+            if not re.fullmatch(r'[0-9]{1,3}', count): self.send_error(400); return
+            raw = self.rfile.read(int(count)) if int(count) else b''
+            if self.path == '/tick':
+                if raw not in (b'', b'{}'): self.send_error(400); return
+                body = json.dumps(runtime.tick()).encode()
+            else:
+                # Operator unblock: {"slot": "<provider>"} and nothing else.
+                try: request = json.loads(raw or b'{}')
+                except ValueError: self.send_error(400); return
+                if (not isinstance(request, dict) or set(request) != {'slot'}
+                        or not isinstance(request['slot'], str) or not re.fullmatch(r'[a-z]{1,16}', request['slot'])):
+                    self.send_error(400); return
+                body = json.dumps(runtime.reset(request['slot'])).encode()
             self.send_response(200); self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
     port = os.environ.get('PORT', '8080')

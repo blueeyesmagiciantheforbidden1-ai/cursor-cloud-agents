@@ -190,3 +190,20 @@ class Controller:
                 continue
             raise ControllerError('unknown_controller_state')
         return {'status': state['phase'], 'generation': state['generation']}
+
+    def reset(self):
+        """Operator unblock of a stopped slot; launches nothing.
+
+        A slot blocked by a failed or unverifiable execution returns to idle
+        only when the same facts a launch requires already hold: the job's
+        latest execution is terminal and its credential was cleanly released.
+        The tick that follows performs the replacement with a fresh grant.
+        """
+        state, version = self.store.read()
+        require(state is not None and state.get('config_sha256') == self.config_sha, 'controller_config_changed')
+        require(state.get('phase') == 'blocked', 'slot_not_blocked')
+        previous = self.current_terminal(self.job())
+        state_error = state.get('error')
+        cleared = {key: value for key, value in state.items() if key != 'error'}
+        state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'])
+        return {'status': 'idle', 'cleared': str(state_error), 'generation': state['generation']}
