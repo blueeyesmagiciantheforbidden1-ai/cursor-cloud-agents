@@ -123,3 +123,9 @@ Consequences to plan around: any launch, deploy or push under the human account 
 ### Controller 00009-hv4: two unattended relaunch rounds, ten of ten
 
 Between 03:18Z and ~04:17Z the controller replaced every drained worker on its own twice: ten launches, ten succeeded, no `BoundaryError`, no `credential_release_execution_mismatch`. The controller is considered proven; the worker-image rollout is deferred to a calm window with the user awake (hub timeout floor first), with the refreshed packs kept on Alpha until Retina has private `runcrew` access to build from.
+
+### Provider quota must not burn the three strikes (2026-09-23 16:05-16:26Z)
+
+The Claude account spend limit refused every call. Three relaunches failed within 20 minutes and that slot stayed `blocked` for four hours. The worker now exits 75 (`provider_errors.QUOTA_EXIT_CODE`) on any `*_quota_exhausted` code: the claimed room still fails, the process does not exit 1. The controller reads the execution's single task (`GET <execution>/tasks`, `lastAttemptResult.exitCode`). Exit 75 with a clean credential release does not increment `consecutive_failures`. The slot goes `idle` with `error=provider_quota_exhausted` and `next_launch_at` at 1h, then 2h, then 4h (capped). A tick during the park answers `provider_quota_parked` with `next_launch_at`, so status can show blocked on the provider rather than offline or queued. A clean success or `POST /reset` clears the park (`quota_parks` 0, and reset also drops `next_launch_at`).
+
+The controller runtime service account needs `run.tasks.list` and `run.tasks.get` (`roles/run.viewer` covers both). Without that permission the task read fails and the controller keeps today's strike behaviour. Any other exit code, a missing code, or more than one task also keeps the strike path.

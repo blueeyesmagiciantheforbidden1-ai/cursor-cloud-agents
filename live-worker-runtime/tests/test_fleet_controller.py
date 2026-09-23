@@ -33,13 +33,19 @@ class Store:
 class Cloud:
     def __init__(self):
         self.run_count = 0; self.on_run = lambda: None; self.lose_run_reply = False
+        self.tasks = {}; self.task_error = None
         self.job = {'name': POLICY.profile.job_name, 'uid': JOB_UID, 'etag': 'offline-etag',
                     'template': {'offline': 'fixed-template'}, 'latestCreatedExecution': {'name': PRIOR}}
         self.executions_by_name = {PRIOR: {'name': PRIOR, 'uid': PRIOR_UID, 'taskCount': 1,
             'template': {'serviceAccount': POLICY.caller_service_account, 'maxRetries': 0},
             'completionTime': '2026-09-22T00:00:00Z', 'reconciling': False,
             'runningCount': 0, 'succeededCount': 1}}
-    def get(self, name): return deepcopy(self.job if name == self.job['name'] else self.executions_by_name[name])
+    def get(self, name):
+        if name.endswith('/tasks') or '/tasks/' in name:
+            if self.task_error: raise self.task_error
+            if name not in self.tasks: raise KeyError(name)
+            return deepcopy(self.tasks[name])
+        return deepcopy(self.job if name == self.job['name'] else self.executions_by_name[name])
     def run(self, name, request):
         self.run_count += 1
         env = request['overrides']['containerOverrides'][0]['env']
@@ -645,6 +651,151 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), 'controller_config_changed')
         self.assertEqual(store.state, before)
         self.assertEqual(cloud.run_count, 0)
+
+
+    def park_quota(self, cloud, broker, code=75, tasks=None):
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        if tasks is None:
+            tasks = {'tasks': [{'name': NEXT + '/tasks/task0', 'lastAttemptResult': {'exitCode': code}}]}
+        cloud.task_error = None
+        cloud.tasks = {NEXT + '/tasks': tasks}
+
+    def test_quota_exit_parks_without_burning_strikes_and_backs_off(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        self.park_quota(cloud, broker)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'provider_quota_parked')
+        self.assertEqual(result['quota_parks'], 1)
+        self.assertEqual(result['next_launch_at'], 1000 + 3600)
+        self.assertEqual(store.state['consecutive_failures'], 2)
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertEqual(store.state['error'], 'provider_quota_exhausted')
+        self.assertEqual(cloud.run_count, 1)
+        # Still inside the park: same status, no relaunch.
+        again = controller.tick()
+        self.assertEqual(again['status'], 'provider_quota_parked')
+        self.assertEqual(again['next_launch_at'], 1000 + 3600)
+        self.assertEqual(cloud.run_count, 1)
+        # 1h, 2h, 4h, 4h. Each park waits out the previous delay, relaunches, and fails quota again.
+        delays = (7200, 14400, 14400)
+        clock = 1000 + 3600
+        for index, delay in enumerate(delays, start=2):
+            controller.clock = lambda now=clock: now
+            self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+            self.park_quota(cloud, broker)
+            result = controller.tick()
+            self.assertEqual(result['status'], 'provider_quota_parked')
+            self.assertEqual(result['quota_parks'], index)
+            self.assertEqual(result['next_launch_at'], clock + delay)
+            self.assertEqual(store.state['consecutive_failures'], 2)
+            self.assertEqual(cloud.run_count, index)
+            clock = result['next_launch_at']
+
+    def test_quota_then_success_clears_the_park(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        self.assertEqual(controller.tick()['quota_parks'], 1)
+        controller.clock = lambda: 1000 + 3600
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T02:00:00Z',
+            reconciling=False, runningCount=0, succeededCount=1, failedCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.tick()
+        self.assertEqual(store.state['quota_parks'], 0)
+        self.assertNotIn('error', store.state)
+        self.assertEqual(store.state['consecutive_failures'], 0)
+
+    def test_quota_exit_with_unreleased_credential_blocks(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        broker.state.update(phase='leased')
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(store.state.get('quota_parks', 0), 0)
+        self.assertEqual(store.state['consecutive_failures'], 1)
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_unproved_task_exit_keeps_the_strike_path(self):
+        cases = {
+            'raises': {'error': OSError('offline tasks denied')},
+            'two tasks': {'tasks': {'tasks': [
+                {'lastAttemptResult': {'exitCode': 75}}, {'lastAttemptResult': {'exitCode': 75}}]}},
+            'missing exitCode': {'tasks': {'tasks': [{'lastAttemptResult': {}}]}},
+            'exit 1': {'tasks': {'tasks': [{'lastAttemptResult': {'exitCode': 1}}]}},
+        }
+        for name, setup in cases.items():
+            with self.subTest(case=name):
+                controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+                cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+                    reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+                broker.state.update(execution_uid=NEXT_UID)
+                cloud.task_error = setup.get('error')
+                cloud.tasks = {} if 'tasks' not in setup else {NEXT + '/tasks': setup['tasks']}
+                result = controller.tick()
+                self.assertEqual(result['status'], 'replacement_after_failure')
+                self.assertEqual(result['consecutive_failures'], 1)
+                self.assertEqual(store.state['next_launch_at'], 1000 + 120)
+                self.assertNotIn('quota_parks', store.state)
+                self.assertNotIn('error', store.state)
+                self.assertEqual(cloud.run_count, 1)
+
+    def test_reset_on_a_parked_slot_clears_the_park(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        self.assertEqual(controller.tick()['status'], 'provider_quota_parked')
+        result = controller.reset()
+        self.assertEqual(result['status'], 'idle')
+        self.assertEqual(result['cleared'], 'provider_quota_exhausted')
+        self.assertEqual(store.state['quota_parks'], 0)
+        self.assertNotIn('error', store.state)
+        self.assertNotIn('next_launch_at', store.state)
+        self.assertEqual(store.state['consecutive_failures'], 0)
+        # The hour has not elapsed; the park is gone, so the next tick launches.
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+
+class CloudTaskNameTests(unittest.TestCase):
+    def test_name_pattern_allows_tasks_and_refuses_anything_wider(self):
+        from agent_hub.credential_broker_service import BoundaryError
+        from cloud_runtime import Google
+        google = Google(POLICY)
+        seen = []
+        google.request = lambda host, path, method='GET', body=None: seen.append((host, path)) or {'tasks': []}
+        execution = POLICY.profile.job_name + '/executions/' + POLICY.profile.job_id + '-abcde'
+        allowed = [
+            POLICY.profile.job_name,
+            execution,
+            execution + '/tasks',
+            execution + '/tasks/task-0',
+            'projects/496481413971/locations/us-central1/operations/offline-operation',
+            'projects/project-0c6d31fa-509e-4116-a2c/locations/us-central1/jobs/runcrew-worker-grok-blueeyes/executions/runcrew-worker-grok-blueeyes-abcde/tasks/task-0',
+        ]
+        for name in allowed:
+            with self.subTest(allowed=name):
+                seen.clear()
+                self.assertEqual(google.get(name), {'tasks': []})
+                self.assertEqual(seen, [('run.googleapis.com', '/v2/' + name)])
+        refused = [
+            execution + '/tasks/task-0/logs',
+            execution + '/tasks/task-0/extra',
+            execution + '/tasks/task-0/task-1',
+            execution + '/tasks/',
+            execution + '/containers',
+            POLICY.profile.job_name + '/tasks',
+            POLICY.profile.job_name + '/executions',
+            execution + '/tasks/task-0?pageSize=1',
+            'projects/other/locations/us-central1/jobs/job/executions/exec/tasks',
+            execution + '/tasks/../secrets',
+        ]
+        for name in refused:
+            with self.subTest(refused=name):
+                with self.assertRaises(BoundaryError) as caught:
+                    google.get(name)
+                self.assertEqual(str(caught.exception), 'cloud_resource_not_allowed')
 
 
 class GrantStoreNameFormTests(unittest.TestCase):

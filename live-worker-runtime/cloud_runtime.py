@@ -39,8 +39,13 @@ class Google:
             raise
 
     def get(self, name):
-        base.require(re.fullmatch(r'projects/(?:496481413971|project-0c6d31fa-509e-4116-a2c)/locations/us-central1/(?:jobs|operations)/[A-Za-z0-9_-]+(?:/executions/[A-Za-z0-9_-]+)?', name),
-                     'cloud_resource_not_allowed')
+        # jobs|operations, optional /executions/<id>, optional /tasks or /tasks/<id>.
+        # Nothing wider: no task logs, no extra segment, no tasks on a bare job.
+        base.require(re.fullmatch(
+            r'projects/(?:496481413971|project-0c6d31fa-509e-4116-a2c)/locations/us-central1/'
+            r'(?:jobs|operations)/[A-Za-z0-9_-]+'
+            r'(?:/executions/[A-Za-z0-9_-]+(?:/tasks(?:/[A-Za-z0-9_-]+)?)?)?', name),
+            'cloud_resource_not_allowed')
         value = self.request('run.googleapis.com', '/v2/' + name)
         base.require(value is not None, 'cloud_resource_missing')
         return value
