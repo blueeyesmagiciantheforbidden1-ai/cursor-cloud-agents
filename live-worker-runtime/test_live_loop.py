@@ -1,5 +1,6 @@
 import ast
 import copy
+import re
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
@@ -16,6 +17,18 @@ BUILTIN_EXCEPTIONS = {'BaseException', 'Exception', 'RuntimeError', 'ValueError'
 
 class CodeError(ProviderCodeError, RuntimeError):
     """Stands in for a provider adapter's fixed-code error class."""
+
+
+def module_constant(tree, name):
+    """Value of a module-level integer constant, including tuple assignments."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+            names = [t.id for t in target.elts] if isinstance(target, ast.Tuple) else [getattr(target, 'id', None)]
+            values = value.elts if isinstance(value, ast.Tuple) else [value]
+            if name in names:
+                return values[names.index(name)].value
+    raise AssertionError(name + ' not found')
 
 
 def exception_classes(path):
@@ -47,7 +60,7 @@ class ProviderErrorTests(unittest.TestCase):
                 seen += 1
                 self.assertIn('ProviderCodeError', bases,
                               path.name + ':' + name + ' must inherit provider_errors.ProviderCodeError')
-        self.assertGreaterEqual(seen, 5)
+        self.assertGreaterEqual(seen, 1)  # a built image carries one provider; the checkout carries five
 
     def test_marker_keeps_original_base_and_handlers(self):
         class Value(ProviderCodeError, ValueError): pass
@@ -217,6 +230,21 @@ class LoopTests(unittest.TestCase):
                 worker, client, adapter, _ = self.setup_worker(); client.room['purpose'] = value
                 result = worker.run()
                 self.assertEqual(result['error_code'], 'project_work_only'); self.assertNotIn('execute', adapter.calls)
+
+    def test_hub_timeout_floor_covers_the_worker_overhead(self):
+        # agent_hub.core refuses rooms below MIN_TIMEOUT_SECONDS (60) and below
+        # AGENT_MIN_TIMEOUT_SECONDS['codex'] (120). Those literals live in the hub;
+        # this pins them to the worker constants so neither drifts unnoticed.
+        hub_minimum, hub_codex_minimum = 60, 120
+        reserve = Settings('grok', 'grok-live').completion_reserve
+        overhead = 30  # claim, heartbeat, room read and prompt build round-trips
+        self.assertLessEqual(reserve + 5 + overhead, hub_minimum)
+        if not (PROVIDERS / 'codex.py').is_file():
+            self.skipTest('codex adapter not in this image')
+        source = (PROVIDERS / 'codex.py').read_text(encoding='utf-8')
+        finalize = module_constant(ast.parse(source), 'FINALIZE_RESERVE')
+        need = int(re.search(r'need\(FINALIZE_RESERVE \+ (\d+) <= remaining', source).group(1))
+        self.assertLessEqual(finalize + need + reserve, hub_codex_minimum)
 
     def test_idle_drains_and_releases_without_prompt(self):
         worker, client, adapter, clock = self.setup_worker(); client.empty = True
