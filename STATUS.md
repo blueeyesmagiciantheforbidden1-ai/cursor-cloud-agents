@@ -140,3 +140,24 @@ Between 03:18Z and ~04:17Z the controller replaced every drained worker on its o
 ### Verified 2026-09-23 15:45Z: verify_fleet 3/3
 
 `tools/verify_fleet.py` passed three consecutive five-agent rooms on controller `00010-dqd`: `b01e6fa0`, `924cab28`, `6d12d89e`. All five agents exited 0 with the exact `NAME | OK` text, and there were no resets; the controller replaced every worker between rooms. Room `be33dc83` (queued before the outage) was also served 5/5 as supporting evidence. The chained run removed `RUNCREW_RESET_ENABLED` on pass (revision `00011-625`, same image and runtime account). Per the keep-on decision above, the operator is re-enabling it until the re-key controller and the `live-20260923c` packs ship.
+
+### Incident record 2026-09-23 16:05-20:13Z: Claude account spend limit; claude slot blocked for four hours
+
+- `runcrew-worker-claude-2p6f9` (16:08:44Z, room `17b89ba3`), `59q4g` (16:16:13Z, room `71ef7d07`) and `wdbn9` (16:25:15Z, room `d84869d7`) each claimed a room and failed it 1-4 s later with `model_call_attempted=True`, recorded as `native_or_connection_failure`. Each committed and released its credential cleanly (every broker call returned 200). The third failure hit `MAX_CONSECUTIVE_FAILURES`, and the slot was `blocked` (`worker_failed_no_restart_loop`) from 16:26:00Z. It was not quarantined. (Light's diagnosis.)
+- Cause: the Claude account's monthly spend limit, hit at about 16:05Z and reset at 20:00Z (1pm America/Los_Angeles). The operators' own Claude Code sessions hit the same limit in the same window, so the fleet worker and those sessions appear to share one limit. Heavy Claude-side automation can take the fleet's claude worker offline, so bulk work goes to Cursor.
+- Why the code was generic: `ClaudeRuntimeError` (the command-lifecycle checks) is not a `ProviderCodeError`, so the loop flattened it, and the deployed `live-20260922b` image predates provider codes altogether.
+- Recovery: `/reset` from Retina at 20:10:47Z (generation 23). The first turn after it completed room `633def3e` at 20:12:58Z (execution `89qnw`). Rooms `17b89ba3`, `71ef7d07` and `d84869d7` need a manager retry or a resend.
+- Fix, worker side (`0b6463a`, `41a1dc8`, `a45e901`):
+  - claude maps definitive account-limit signals to `claude_quota_exhausted`: `billing_error`, a rejected `rate_limit_event`, and usage/spend-limit text, which is matched and never kept.
+  - A bare `rate_limit` becomes `claude_rate_limited` and stays a strike.
+  - Lifecycle errors keep their fixed `claude_command_lifecycle_*` codes.
+  - The worker exits 75 for any `*_quota_exhausted` code.
+- Fix, controller side: the section below (`b875f5e`).
+
+### Provider quota must not burn the three strikes (2026-09-23 16:05-16:26Z)
+
+The Claude account spend limit refused every call. Three relaunches failed within 20 minutes and that slot stayed `blocked` for four hours. The worker now exits 75 (`provider_errors.QUOTA_EXIT_CODE`) on any `*_quota_exhausted` code: the claimed room still fails, the process does not exit 1. The controller reads the execution's single task (`GET <execution>/tasks`, `lastAttemptResult.exitCode`). Exit 75 with a clean credential release does not increment `consecutive_failures`. The slot goes `idle` with `error=provider_quota_exhausted` and `next_launch_at` at 1h, then 2h, then 4h (capped). A tick during the park answers `provider_quota_parked` with `next_launch_at`, so status can show blocked on the provider rather than offline or queued. A clean success or `POST /reset` clears the park (`quota_parks` 0, and reset also drops `next_launch_at`).
+
+The controller runtime service account needs `run.tasks.list` and `run.tasks.get` (`roles/run.viewer` covers both). Without that permission the task read fails and the controller keeps today's strike behaviour. Any other exit code, a missing code, or more than one task also keeps the strike path.
+
+Rollout order for the re-key controller (`918f01a`, `f8826d5`): deploy it with the worker images and fleet config unchanged. Each slot then records `policy_sha256` and `slot_template_sha256` the next time it passes through idle or blocked (within about an hour, one hourly replacement). Change a worker image only after every slot has recorded them. A legacy document (only `config_sha256`) can still be re-keyed while the live job still carries the previous template; once both the job and the config have moved without a recorded template, the controller refuses (`controller_config_changed`). During an image rollout, an active slot's tick raises `controller_config_changed` until that execution ends; the idle transition that follows re-keys it.

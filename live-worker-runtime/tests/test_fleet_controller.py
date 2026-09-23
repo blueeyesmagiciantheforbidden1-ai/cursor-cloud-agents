@@ -1,5 +1,6 @@
 """Offline adversarial scheduler-delivery checks; no provider/cloud calls."""
 from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 import unittest
@@ -32,13 +33,19 @@ class Store:
 class Cloud:
     def __init__(self):
         self.run_count = 0; self.on_run = lambda: None; self.lose_run_reply = False
+        self.tasks = {}; self.task_error = None
         self.job = {'name': POLICY.profile.job_name, 'uid': JOB_UID, 'etag': 'offline-etag',
                     'template': {'offline': 'fixed-template'}, 'latestCreatedExecution': {'name': PRIOR}}
         self.executions_by_name = {PRIOR: {'name': PRIOR, 'uid': PRIOR_UID, 'taskCount': 1,
             'template': {'serviceAccount': POLICY.caller_service_account, 'maxRetries': 0},
             'completionTime': '2026-09-22T00:00:00Z', 'reconciling': False,
             'runningCount': 0, 'succeededCount': 1}}
-    def get(self, name): return deepcopy(self.job if name == self.job['name'] else self.executions_by_name[name])
+    def get(self, name):
+        if name.endswith('/tasks') or '/tasks/' in name:
+            if self.task_error: raise self.task_error
+            if name not in self.tasks: raise KeyError(name)
+            return deepcopy(self.tasks[name])
+        return deepcopy(self.job if name == self.job['name'] else self.executions_by_name[name])
     def run(self, name, request):
         self.run_count += 1
         env = request['overrides']['containerOverrides'][0]['env']
@@ -365,6 +372,430 @@ class FleetReviewTests(unittest.TestCase):
         original = cloud.get
         cloud.get = lambda name: original(name) if name in cloud.executions_by_name else deepcopy(cloud.job)
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+
+    def idled(self):
+        """One clean launch, then back to idle while the launch interval still holds."""
+        controller, store, cloud, broker, bindings, grants = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        self.assertEqual(store.state['phase'], 'idle')
+        return controller, store, cloud, broker, bindings, grants
+
+    def roll_template(self, controller, cloud, template=None):
+        template = {'offline': 'rolled-template'} if template is None else template
+        cloud.job['template'] = template
+        controller.slot['template_sha256'] = digest(template)
+        return template
+
+    def test_template_only_change_on_idle_rekeys_and_launches(self):
+        controller, store, cloud, _, _, _ = self.idled()
+        previous = store.state['slot_template_sha256']
+        self.roll_template(controller, cloud)
+        self.assertNotEqual(controller.config_sha, store.state['config_sha256'])
+        self.assertEqual(previous, digest({'offline': 'fixed-template'}))
+        controller.clock = lambda: 2000
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(controller.policy)))
+        self.assertEqual(cloud.run_count, 2)
+
+    def test_policy_or_job_uid_change_is_not_a_rekey(self):
+        cases = (
+            ('policy', lambda controller: setattr(controller, 'policy', replace(controller.policy, lease_seconds=180))),
+            ('job_uid', lambda controller: controller.slot.update(job_uid='44444444-4444-4444-4444-444444444444')),
+        )
+        for name, change in cases:
+            with self.subTest(change=name):
+                controller, store, cloud, _, _, _ = self.idled()
+                bound = store.state['config_sha256']
+                change(controller)
+                controller.clock = lambda: 2000
+                with self.assertRaises(ControllerError) as caught:
+                    controller.tick()
+                self.assertEqual(str(caught.exception), 'controller_config_changed')
+                self.assertEqual(store.state['config_sha256'], bound)
+                self.assertEqual(store.state['phase'], 'idle')
+                self.assertEqual(cloud.run_count, 1)
+
+    def test_template_change_while_active_waits_until_terminal(self):
+        controller, store, cloud, broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        bound = store.state['config_sha256']
+        self.roll_template(controller, cloud)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state['phase'], 'active')
+        self.assertEqual(store.state['config_sha256'], bound)
+        self.assertEqual(cloud.run_count, 1)
+        # Still running: a second delivery does not adopt the digest either.
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.clock = lambda: 2000
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
+        self.assertEqual(cloud.run_count, 2)
+
+    def test_template_change_mid_launch_is_refused(self):
+        controller, store, cloud, _, _, grants = self.make()
+        grants.lose_reply = True
+        with self.assertRaises(OSError):
+            controller.tick()
+        self.assertEqual(store.state['phase'], 'grant_intent')
+        bound = store.state['config_sha256']
+        self.roll_template(controller, cloud)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state['phase'], 'grant_intent')
+        self.assertEqual(store.state['config_sha256'], bound)
+        with self.assertRaises(ControllerError) as caught:
+            controller.reset()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state['config_sha256'], bound)
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_blocked_template_change_rekeys_without_launching(self):
+        controller, store, cloud, _, _, _ = self.blocked()
+        self.roll_template(controller, cloud)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['phase'], 'blocked')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(cloud.run_count, 1)
+        self.assertEqual(controller.reset()['status'], 'idle')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        controller.clock = lambda: 2000
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+    def _legacy_state(self, controller, store):
+        """State shape written before policy_sha256 and the slot fields were stored."""
+        store.state = {'schema_version': 1, 'config_sha256': controller.config_sha, 'phase': 'idle',
+                       'generation': 0, 'updated_at': 1}
+        store.version = 1
+
+    def test_legacy_state_rekeys_from_the_job_template_then_launches(self):
+        # Slot digest moves first. The live job still has the previous template,
+        # which is the only proof a config_sha256-only document has.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        self.assertNotIn('slot_template_sha256', store.state)
+        new_template = {'offline': 'rolled-template'}
+        controller.slot['template_sha256'] = digest(new_template)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'job_template_changed')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(new_template))
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(controller.policy)))
+        self.assertEqual(cloud.run_count, 0)
+        # The re-key already committed. The image update is what the next tick launches.
+        cloud.job['template'] = new_template
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(digest(cloud.job['template']), controller.slot['template_sha256'])
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_legacy_state_records_the_previous_template_before_the_digest_changes(self):
+        # Image rolled, fleet.json not yet. One tick persists the slot's current
+        # (previous) template, then refuses the job. Recording the new digest
+        # after that is a normal re-key and launches.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        previous = controller.slot['template_sha256']
+        bound = controller.config_sha
+        cloud.job['template'] = {'offline': 'rolled-template'}
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'job_template_changed')
+        self.assertEqual(store.state['slot_template_sha256'], previous)
+        self.assertEqual(store.state['config_sha256'], bound)
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(POLICY)))
+        self.assertEqual(cloud.run_count, 0)
+        controller.slot['template_sha256'] = digest(cloud.job['template'])
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['config_sha256'], controller.config_sha)
+        self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
+        self.assertEqual(cloud.run_count, 1)
+
+    def _strip_binding(self, store):
+        for key in ('policy_sha256', 'slot_job_uid', 'slot_enabled', 'slot_template_sha256'):
+            store.state.pop(key, None)
+
+    def test_legacy_policy_and_template_change_is_refused_while_job_has_previous_template(self):
+        # The live job still shows the previous template, so a template-only
+        # re-key would succeed. A policy edit in the same change must not.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        before, version = deepcopy(store.state), store.version
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        controller.slot['template_sha256'] = digest({'offline': 'rolled-template'})
+        self.assertEqual(digest(cloud.job['template']), digest({'offline': 'fixed-template'}))
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        self.assertEqual(cloud.run_count, 0)
+
+    def test_job_uid_and_template_change_is_refused_without_split_fields(self):
+        # Legacy document, and a new-format document with the split fields
+        # removed, while the job still has the previous template.
+        cases = ('legacy', 'stripped')
+        for name in cases:
+            with self.subTest(shape=name):
+                controller, store, cloud, _, _, _ = self.make()
+                if name == 'legacy':
+                    self._legacy_state(controller, store)
+                else:
+                    self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+                    cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+                        reconciling=False, runningCount=0, succeededCount=1)
+                    controller.broker.state.update(execution_uid=NEXT_UID)
+                    self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+                    self._strip_binding(store)
+                before, version = deepcopy(store.state), store.version
+                archives, runs = deepcopy(store.archives), cloud.run_count
+                controller.slot['template_sha256'] = digest({'offline': 'rolled-template'})
+                controller.slot['job_uid'] = '44444444-4444-4444-4444-444444444444'
+                self.assertEqual(digest(cloud.job['template']), digest({'offline': 'fixed-template'}))
+                with self.assertRaises(ControllerError) as caught:
+                    controller.tick()
+                self.assertEqual(str(caught.exception), 'controller_config_changed')
+                self.assertEqual(store.state, before)
+                self.assertEqual(store.version, version)
+                self.assertEqual(store.archives, archives)
+                self.assertEqual(cloud.run_count, runs)
+
+    def test_policy_change_on_terminal_active_does_not_archive_or_write(self):
+        controller, store, cloud, broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        before, version = deepcopy(store.state), store.version
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.state['phase'], 'active')
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_reset_refuses_a_policy_change(self):
+        controller, store, cloud, _, _, _ = self.blocked()
+        before, version = deepcopy(store.state), store.version
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        with self.assertRaises(ControllerError) as caught:
+            controller.reset()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_active_match_does_not_rewrite_until_the_drain(self):
+        # A legacy active document keeps its bytes while the execution runs.
+        # The drain archives that receipt, then the idle pass of the same tick
+        # records the split fields.
+        controller, store, cloud, broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self._strip_binding(store)
+        before, version = deepcopy(store.state), store.version
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(controller.policy)))
+        self.assertEqual(store.state['slot_template_sha256'], controller.slot['template_sha256'])
+        self.assertEqual(len(store.archives), 1)
+        archived, _ = store.archives[0]
+        self.assertEqual(archived['phase'], 'active')
+        self.assertNotIn('policy_sha256', archived)
+
+    def test_legacy_policy_change_and_unprovable_template_change_are_refused(self):
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        before = deepcopy(store.state)
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(cloud.run_count, 0)
+        # Both the image and the slot digest already moved, and nothing in the
+        # document remembers the previous template: indistinguishable from a
+        # policy edit, so it stays refused.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        before = deepcopy(store.state)
+        self.roll_template(controller, cloud)
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(cloud.run_count, 0)
+
+
+    def park_quota(self, cloud, broker, code=75, tasks=None):
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        if tasks is None:
+            tasks = {'tasks': [{'name': NEXT + '/tasks/task0', 'lastAttemptResult': {'exitCode': code}}]}
+        cloud.task_error = None
+        cloud.tasks = {NEXT + '/tasks': tasks}
+
+    def test_quota_exit_parks_without_burning_strikes_and_backs_off(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        self.park_quota(cloud, broker)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'provider_quota_parked')
+        self.assertEqual(result['quota_parks'], 1)
+        self.assertEqual(result['next_launch_at'], 1000 + 3600)
+        self.assertEqual(store.state['consecutive_failures'], 2)
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertEqual(store.state['error'], 'provider_quota_exhausted')
+        self.assertEqual(cloud.run_count, 1)
+        # Still inside the park: same status, no relaunch.
+        again = controller.tick()
+        self.assertEqual(again['status'], 'provider_quota_parked')
+        self.assertEqual(again['next_launch_at'], 1000 + 3600)
+        self.assertEqual(cloud.run_count, 1)
+        # 1h, 2h, 4h, 4h. Each park waits out the previous delay, relaunches, and fails quota again.
+        delays = (7200, 14400, 14400)
+        clock = 1000 + 3600
+        for index, delay in enumerate(delays, start=2):
+            controller.clock = lambda now=clock: now
+            self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+            self.park_quota(cloud, broker)
+            result = controller.tick()
+            self.assertEqual(result['status'], 'provider_quota_parked')
+            self.assertEqual(result['quota_parks'], index)
+            self.assertEqual(result['next_launch_at'], clock + delay)
+            self.assertEqual(store.state['consecutive_failures'], 2)
+            self.assertEqual(cloud.run_count, index)
+            clock = result['next_launch_at']
+
+    def test_quota_then_success_clears_the_park(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        self.assertEqual(controller.tick()['quota_parks'], 1)
+        controller.clock = lambda: 1000 + 3600
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T02:00:00Z',
+            reconciling=False, runningCount=0, succeededCount=1, failedCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.tick()
+        self.assertEqual(store.state['quota_parks'], 0)
+        self.assertNotIn('error', store.state)
+        self.assertEqual(store.state['consecutive_failures'], 0)
+
+    def test_quota_exit_with_unreleased_credential_blocks(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        broker.state.update(phase='leased')
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(store.state.get('quota_parks', 0), 0)
+        self.assertEqual(store.state['consecutive_failures'], 1)
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_unproved_task_exit_keeps_the_strike_path(self):
+        cases = {
+            'raises': {'error': OSError('offline tasks denied')},
+            'two tasks': {'tasks': {'tasks': [
+                {'lastAttemptResult': {'exitCode': 75}}, {'lastAttemptResult': {'exitCode': 75}}]}},
+            'missing exitCode': {'tasks': {'tasks': [{'lastAttemptResult': {}}]}},
+            'exit 1': {'tasks': {'tasks': [{'lastAttemptResult': {'exitCode': 1}}]}},
+        }
+        for name, setup in cases.items():
+            with self.subTest(case=name):
+                controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+                cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+                    reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+                broker.state.update(execution_uid=NEXT_UID)
+                cloud.task_error = setup.get('error')
+                cloud.tasks = {} if 'tasks' not in setup else {NEXT + '/tasks': setup['tasks']}
+                result = controller.tick()
+                self.assertEqual(result['status'], 'replacement_after_failure')
+                self.assertEqual(result['consecutive_failures'], 1)
+                self.assertEqual(store.state['next_launch_at'], 1000 + 120)
+                self.assertNotIn('quota_parks', store.state)
+                self.assertNotIn('error', store.state)
+                self.assertEqual(cloud.run_count, 1)
+
+    def test_reset_on_a_parked_slot_clears_the_park(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        self.assertEqual(controller.tick()['status'], 'provider_quota_parked')
+        result = controller.reset()
+        self.assertEqual(result['status'], 'idle')
+        self.assertEqual(result['cleared'], 'provider_quota_exhausted')
+        self.assertEqual(store.state['quota_parks'], 0)
+        self.assertNotIn('error', store.state)
+        self.assertNotIn('next_launch_at', store.state)
+        self.assertEqual(store.state['consecutive_failures'], 0)
+        # The hour has not elapsed; the park is gone, so the next tick launches.
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+
+class CloudTaskNameTests(unittest.TestCase):
+    def test_name_pattern_allows_tasks_and_refuses_anything_wider(self):
+        from agent_hub.credential_broker_service import BoundaryError
+        from cloud_runtime import Google
+        google = Google(POLICY)
+        seen = []
+        google.request = lambda host, path, method='GET', body=None: seen.append((host, path)) or {'tasks': []}
+        execution = POLICY.profile.job_name + '/executions/' + POLICY.profile.job_id + '-abcde'
+        allowed = [
+            POLICY.profile.job_name,
+            execution,
+            execution + '/tasks',
+            execution + '/tasks/task-0',
+            'projects/496481413971/locations/us-central1/operations/offline-operation',
+            'projects/project-0c6d31fa-509e-4116-a2c/locations/us-central1/jobs/runcrew-worker-grok-blueeyes/executions/runcrew-worker-grok-blueeyes-abcde/tasks/task-0',
+        ]
+        for name in allowed:
+            with self.subTest(allowed=name):
+                seen.clear()
+                self.assertEqual(google.get(name), {'tasks': []})
+                self.assertEqual(seen, [('run.googleapis.com', '/v2/' + name)])
+        refused = [
+            execution + '/tasks/task-0/logs',
+            execution + '/tasks/task-0/extra',
+            execution + '/tasks/task-0/task-1',
+            execution + '/tasks/',
+            execution + '/containers',
+            POLICY.profile.job_name + '/tasks',
+            POLICY.profile.job_name + '/executions',
+            execution + '/tasks/task-0?pageSize=1',
+            'projects/other/locations/us-central1/jobs/job/executions/exec/tasks',
+            execution + '/tasks/../secrets',
+        ]
+        for name in refused:
+            with self.subTest(refused=name):
+                with self.assertRaises(BoundaryError) as caught:
+                    google.get(name)
+                self.assertEqual(str(caught.exception), 'cloud_resource_not_allowed')
 
 
 class GrantStoreNameFormTests(unittest.TestCase):

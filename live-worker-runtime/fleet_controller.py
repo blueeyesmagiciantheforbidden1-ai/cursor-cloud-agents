@@ -32,6 +32,13 @@ class ControllerError(RuntimeError): pass
 # backoff keep a broken credential from becoming a paid restart loop.
 MAX_CONSECUTIVE_FAILURES = 3
 FAILURE_BACKOFF_SECONDS = (120, 600)
+# Process exit used by the worker for any *_quota_exhausted code
+# (provider_errors.QUOTA_EXIT_CODE). It is not a strike: the account limit
+# would otherwise burn the slot in one backoff cycle. Parks are 1h, 2h, then
+# 4h, and they stay at 4h.
+QUOTA_EXIT_CODE = 75
+QUOTA_PARK_BASE_SECONDS = 3600
+QUOTA_PARK_CAP_SECONDS = 14400
 
 
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
@@ -90,7 +97,98 @@ class Controller:
         require(set(slot) == {'job_uid', 'template_sha256', 'enabled'} and type(slot['enabled']) is bool
                 and re.fullmatch(r'[a-f0-9-]{36}', slot['job_uid'])
                 and re.fullmatch(r'[a-f0-9]{64}', slot['template_sha256']), 'slot_config_invalid')
-        self.config_sha = digest({'policy': asdict(policy), 'slot': slot})
+
+    @property
+    def config_sha(self):
+        return digest({'policy': asdict(self.policy), 'slot': self.slot})
+
+    def _policy_sha(self):
+        return digest(asdict(self.policy))
+
+    def _config_for_template(self, template_sha256):
+        slot = {'job_uid': self.slot['job_uid'], 'template_sha256': template_sha256,
+                'enabled': self.slot['enabled']}
+        return digest({'policy': asdict(self.policy), 'slot': slot})
+
+    def _binding_fields(self):
+        """Identity the state must carry so a later template rollout can be proved.
+
+        config_sha256 mixes the policy and the whole slot. Splitting policy_sha256
+        from the slot fields lets a template-only change be checked without
+        treating every image rollout as a new controller.
+        """
+        return {'policy_sha256': self._policy_sha(), 'slot_job_uid': self.slot['job_uid'],
+                'slot_enabled': self.slot['enabled'], 'slot_template_sha256': self.slot['template_sha256'],
+                'config_sha256': self.config_sha}
+
+    def _previous_template_sha256(self, state):
+        """Template digest the stored config_sha256 was computed with.
+
+        New states persist it. A document that only has config_sha256 (the
+        controller before this split) still proves a re-key when the live job
+        has not yet been updated: that template is the previous one, and
+        recomputing the digest with it must equal the stored config_sha256.
+        Once the image and the slot digest have both moved, the previous
+        template is no longer derivable; the tick that ran while they still
+        matched has to have saved it.
+        """
+        recorded = state.get('slot_template_sha256')
+        if isinstance(recorded, str) and re.fullmatch(r'[a-f0-9]{64}', recorded):
+            return recorded
+        job = self.cloud.get(self.policy.profile.job_name)
+        if (not isinstance(job, dict) or canonical_name(job.get('name')) != self.policy.profile.job_name
+                or job.get('uid') != self.slot['job_uid']):
+            return None
+        try:
+            derived = digest(job.get('template'))
+        except (TypeError, ValueError):
+            return None
+        return derived if re.fullmatch(r'[a-f0-9]{64}', derived) else None
+
+    def _template_only_change(self, state):
+        previous = self._previous_template_sha256(state)
+        if previous is None or previous == self.slot['template_sha256']:
+            return False
+        if state.get('policy_sha256') not in (None, self._policy_sha()):
+            return False
+        if state.get('slot_job_uid') not in (None, self.slot['job_uid']):
+            return False
+        if 'slot_enabled' in state and state.get('slot_enabled') != self.slot['enabled']:
+            return False
+        # Current policy + current job uid and enabled + the PREVIOUS template.
+        # Any other config edit fails this equality, including on a legacy
+        # document that stored nothing but config_sha256.
+        return self._config_for_template(previous) == state.get('config_sha256')
+
+    def _remember_binding(self, state, version):
+        fields = self._binding_fields()
+        if all(state.get(key) == value for key, value in fields.items()):
+            return state, version
+        return self.save(state, version, **fields)
+
+    def _adopt_config(self, state, version):
+        """Re-key a provable template-only change, or refuse.
+
+        Idle and blocked are the only phases that may take the new digest: the
+        next launch has not started, or the slot is already stopped. Binding,
+        launch, grant, and active keep controller_config_changed so a rollout
+        cannot retarget an attempt that is already in flight. A matching config
+        is not rewritten in those phases either. A CAS while the execution is
+        still active changes the receipt a concurrent revision will archive, and
+        the two receipts then disagree (controller_archive_uncertain). The
+        active drain saves idle and continues this loop, so the binding is
+        recorded on that later pass of the same tick. The re-key itself is one
+        CAS of the new config_sha256 plus the split fields.
+        """
+        if state.get('config_sha256') == self.config_sha:
+            if state.get('phase') not in ('idle', 'blocked'):
+                return state, version
+            return self._remember_binding(state, version)
+        if state.get('phase') not in ('idle', 'blocked'):
+            raise ControllerError('controller_config_changed')
+        if not self._template_only_change(state):
+            raise ControllerError('controller_config_changed')
+        return self.save(state, version, **self._binding_fields())
 
     def job(self):
         value = self.cloud.get(self.policy.profile.job_name)
@@ -147,6 +245,35 @@ class Controller:
         self.idle_credential(None if self.never_bound(state, value) else value)
         return value
 
+    def _task_exit_code(self, execution):
+        """Exit code of the execution's only task, or None when it cannot be proved.
+
+        Cloud Run v2 lists tasks at ``<execution>/tasks``. Permission, transport,
+        shape, a count other than one, or a missing exit code all fail closed
+        so the strike path is unchanged. An exit code other than 75 is returned
+        and is not treated as quota.
+        """
+        try:
+            listed = self.cloud.get(execution + '/tasks')
+        except Exception:
+            return None
+        if not isinstance(listed, dict):
+            return None
+        tasks = listed.get('tasks')
+        if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
+            return None
+        attempt = tasks[0].get('lastAttemptResult')
+        if not isinstance(attempt, dict) or type(attempt.get('exitCode')) is not int:
+            return None
+        return attempt['exitCode']
+
+    def _quota_park_seconds(self, parks):
+        if type(parks) is not int or parks < 0:
+            parks = 0
+        # 2**parks hits the 4h cap at parks==2. Bound the shift so a corrupt
+        # quota_parks cannot build an enormous integer.
+        return min(QUOTA_PARK_CAP_SECONDS, QUOTA_PARK_BASE_SECONDS * 2 ** min(parks, 2))
+
     def save(self, state, version, **changes):
         result = {**state, **changes, 'updated_at': int(self.clock())}
         return result, self.store.cas(result, version)
@@ -156,11 +283,19 @@ class Controller:
             return {'status': 'disabled'}
         state, version = self.store.read()
         if state is None:
-            state = {'schema_version': 1, 'config_sha256': self.config_sha, 'phase': 'idle',
-                     'generation': 0, 'updated_at': int(self.clock())}
+            state = {'schema_version': 1, 'phase': 'idle', 'generation': 0,
+                     'updated_at': int(self.clock()), **self._binding_fields()}
             version = self.store.cas(state, None)
-        require(state.get('config_sha256') == self.config_sha, 'controller_config_changed')
         for _ in range(8):
+            # Active is drained under the digest it launched with. A template-only
+            # change is refused until that execution is terminal; the idle or
+            # blocked transition that follows is what re-keys. Any other drift
+            # refuses immediately, including while the execution is still running.
+            if state['phase'] == 'active' and state.get('config_sha256') != self.config_sha:
+                if not self._template_only_change(state):
+                    raise ControllerError('controller_config_changed')
+            else:
+                state, version = self._adopt_config(state, version)
             phase = state['phase']
             if phase in ('blocked', 'launch_intent', 'binding_intent', 'grant_intent'):
                 # Another delivery may own this mutation, or its reply was lost.
@@ -168,6 +303,9 @@ class Controller:
                 return {'status': phase, 'generation': state['generation']}
             if phase == 'idle':
                 if self.clock() < state.get('next_launch_at', 0):
+                    if state.get('error') == 'provider_quota_exhausted':
+                        return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
+                                'quota_parks': state.get('quota_parks', 0), 'generation': state['generation']}
                     return {'status': 'replacement_cooldown', 'generation': state['generation']}
                 job = self.job(); previous = self.current_terminal(job, state)
                 release_uid = self.broker._read()[0].get('execution_uid')
@@ -221,6 +359,9 @@ class Controller:
                 execution = exact_execution(self.policy, self.cloud.get(state['execution']), state['intent'])
                 require(execution['uid'] == state['execution_uid'], 'execution_uid_changed')
                 if not terminal(execution):
+                    # The slot is still mid-execution. Do not adopt the new template yet.
+                    if state.get('config_sha256') != self.config_sha:
+                        raise ControllerError('controller_config_changed')
                     return {'status': 'job_running_readiness_separate', 'execution': state['execution'],
                             'worker_id': self.policy.profile.provider + '-live-' + state['execution_uid'].replace('-', ''),
                             'generation': state['generation']}
@@ -228,12 +369,25 @@ class Controller:
                          and type(execution.get('failedCount', 0)) is int and execution.get('failedCount', 0) == 0
                          and type(execution.get('runningCount', 0)) is int and execution.get('runningCount', 0) == 0)
                 if not clean:
-                    failures = state.get('consecutive_failures', 0) + 1
+                    # Quota is decided before the strike counter moves. A failed
+                    # task read or any exit code other than 75 leaves released
+                    # and failures on today's path.
+                    exit_code = self._task_exit_code(state['execution'])
                     try:
                         self.idle_credential(None if self.never_bound(state, execution) else execution)
                         released = True
                     except ControllerError:
                         released = False
+                    if exit_code == QUOTA_EXIT_CODE and released:
+                        parks = state.get('quota_parks', 0)
+                        self.store.archive(state, execution)
+                        state, version = self.save(state, version, phase='idle', error='provider_quota_exhausted',
+                            quota_parks=(parks if type(parks) is int and parks >= 0 else 0) + 1,
+                            next_launch_at=int(self.clock()) + self._quota_park_seconds(parks),
+                            last_execution=state['execution'], last_execution_uid=state['execution_uid'])
+                        return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
+                                'quota_parks': state['quota_parks'], 'generation': state['generation']}
+                    failures = state.get('consecutive_failures', 0) + 1
                     if not released or failures >= MAX_CONSECUTIVE_FAILURES:
                         state, version = self.save(state, version, phase='blocked', consecutive_failures=failures,
                             error='worker_failed_no_restart_loop' if released else 'worker_failed_credential_unreleased')
@@ -248,8 +402,10 @@ class Controller:
                 self.idle_credential(execution)
                 # Preserve this generation's receipt separately before replacing
                 # the live state. The implementation uses immutable create-only.
+                # A clean run clears a provider-quota park as well as the strikes.
                 self.store.archive(state, execution)
-                state, version = self.save(state, version, phase='idle', consecutive_failures=0,
+                cleared = {key: value for key, value in state.items() if key != 'error'}
+                state, version = self.save(cleared, version, phase='idle', consecutive_failures=0, quota_parks=0,
                     last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                 continue
             raise ControllerError('unknown_controller_state')
@@ -269,13 +425,24 @@ class Controller:
         grant and a fresh binding; a stale binding expires on its own.
         """
         state, version = self.store.read()
-        require(state is not None and state.get('config_sha256') == self.config_sha, 'controller_config_changed')
-        require(state.get('phase') in self.STOPPED, 'slot_not_stopped')
+        require(state is not None, 'controller_config_changed')
+        # A quota park is idle, not stopped. Reset clears it so the next tick
+        # can launch; any other idle slot is still slot_not_stopped.
+        parked = state.get('phase') == 'idle' and state.get('error') == 'provider_quota_exhausted'
+        require(state.get('phase') in self.STOPPED or parked, 'slot_not_stopped')
+        # Same re-key rule as tick. Intent phases are in STOPPED but are not
+        # idle or blocked, so a template change while a launch is in flight
+        # still refuses here instead of resetting onto the new digest.
+        state, version = self._adopt_config(state, version)
         phase = state['phase']
         previous = self.current_terminal(self.job(), state)
         state_error = state.get('error')
-        cleared = {key: value for key, value in state.items() if key != 'error'}
-        # An operator reset grants a fresh failure budget.
-        state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'], consecutive_failures=0)
+        # An operator reset grants a fresh failure budget and a fresh quota
+        # park count. next_launch_at is removed only for a quota park; a
+        # blocked slot keeps the launch interval.
+        drop = {'error', 'next_launch_at'} if parked else {'error'}
+        cleared = {key: value for key, value in state.items() if key not in drop}
+        state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'],
+                                    consecutive_failures=0, quota_parks=0)
         cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
         return {'status': 'idle', 'cleared': cleared_code, 'from_phase': phase, 'generation': state['generation']}
