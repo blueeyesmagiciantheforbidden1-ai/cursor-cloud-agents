@@ -22,6 +22,9 @@ from agent_hub.cloud_credential_broker import PROJECT_ID, PROJECT_NUMBER
 class ControllerError(RuntimeError): pass
 
 
+SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
+
+
 def require(value, code):
     if not value: raise ControllerError(code)
 
@@ -206,4 +209,5 @@ class Controller:
         state_error = state.get('error')
         cleared = {key: value for key, value in state.items() if key != 'error'}
         state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'])
-        return {'status': 'idle', 'cleared': str(state_error), 'generation': state['generation']}
+        cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
+        return {'status': 'idle', 'cleared': cleared_code, 'generation': state['generation']}

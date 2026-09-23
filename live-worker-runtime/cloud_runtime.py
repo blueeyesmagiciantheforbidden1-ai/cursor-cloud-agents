@@ -142,9 +142,11 @@ class Runtime:
             self.lock.release()
 
     def reset(self, slot):
-        """Operator unblock of one slot by provider name; serialized with tick."""
-        matches = [c for c in self.controllers if c.policy.profile.provider == slot]
-        if len(matches) != 1: return {'status': 'unknown_slot'}
+        """Operator unblock of one slot, "provider" or "provider/profile"; serialized with tick."""
+        provider, _, profile = slot.partition('/')
+        matches = [c for c in self.controllers if c.policy.profile.provider == provider
+                   and (not profile or c.policy.profile.profile == profile)]
+        if len(matches) != 1: return {'status': 'unknown_slot' if not matches else 'ambiguous_slot'}
         if not self.lock.acquire(blocking=False): return {'status': 'tick_in_progress'}
         try:
             try:
@@ -154,8 +156,8 @@ class Runtime:
             except ControllerError as error:
                 # Fixed codes only; the operator needs to know why a reset was refused.
                 result = {'status': 'reset_refused', 'reason': str(error)}
-            except Exception:
-                result = {'status': 'controller_attention_required'}
+            except Exception as error:
+                result = {'status': 'controller_attention_required', 'exception': type(error).__name__}
             print(json.dumps({'kind': 'runcrew_fleet_reset', 'slot': slot, 'result': result}), flush=True)
             return result
         finally:
@@ -178,11 +180,15 @@ def main():
                 if raw not in (b'', b'{}'): self.send_error(400); return
                 body = json.dumps(runtime.tick()).encode()
             else:
-                # Operator unblock: {"slot": "<provider>"} and nothing else.
+                # Operator unblock, overriding the spend-safety stop. It exists
+                # only while the operator has RUNCREW_RESET_ENABLED=1 set on the
+                # service for the maintenance window; /tick alone never unblocks.
+                if os.environ.get('RUNCREW_RESET_ENABLED') != '1': self.send_error(404); return
+                # Body is {"slot": "<provider>"} or {"slot": "<provider>/<profile>"} and nothing else.
                 try: request = json.loads(raw or b'{}')
                 except ValueError: self.send_error(400); return
-                if (not isinstance(request, dict) or set(request) != {'slot'}
-                        or not isinstance(request['slot'], str) or not re.fullmatch(r'[a-z]{1,16}', request['slot'])):
+                if (not isinstance(request, dict) or set(request) != {'slot'} or not isinstance(request['slot'], str)
+                        or not re.fullmatch(r'[a-z]{1,16}(/[a-z0-9-]{1,32})?', request['slot'])):
                     self.send_error(400); return
                 body = json.dumps(runtime.reset(request['slot'])).encode()
             self.send_response(200); self.send_header('Content-Type', 'application/json')
