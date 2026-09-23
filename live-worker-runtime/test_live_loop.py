@@ -252,6 +252,63 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result['outcome'], 'idle_drained'); self.assertEqual(clock.now, 160)
         self.assertNotIn('execute', adapter.calls); self.assertIn('close', adapter.calls)
 
+    def test_idle_warm_session_loss_drains_without_a_task_or_model_call(self):
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        seen = {'n': 0}
+        def maintain(handle):
+            adapter.calls.append('maintain'); seen['n'] += 1
+            if seen['n'] == 2: raise CodeError('copilot_warm_session_lost')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertNotIn('error_code', result)
+        self.assertFalse(result['model_call_attempted'])
+        self.assertEqual(worker.last_exit, 0)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIn('close', adapter.calls)
+        self.assertEqual(client.completions, [])
+        self.assertGreaterEqual(client.claims, 1)
+
+    def test_warm_session_loss_after_a_model_call_stays_a_failure(self):
+        worker, client, adapter, _ = self.setup_worker()
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            raise CodeError('copilot_warm_session_lost')
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['error_code'], 'copilot_warm_session_lost')
+        self.assertTrue(result['model_call_attempted'])
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertEqual(worker.last_exit, 1)
+
+    def test_idle_maintain_failure_other_than_session_loss_stays_a_failure(self):
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            raise CodeError('copilot_tools_forbidden')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['error_code'], 'copilot_tools_forbidden')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(client.completions, [])
+        self.assertNotIn('execute', adapter.calls)
+
+    def test_idle_session_loss_without_credential_release_stays_failed(self):
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            raise CodeError('copilot_warm_session_lost')
+        def close(handle):
+            adapter.calls.append('close')
+            raise ValueError('quarantined')
+        adapter.maintain, adapter.close = maintain, close
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(client.completions, [])
+        self.assertEqual(worker.last_exit, 1)
+
     def test_provider_error_is_never_retried_or_leaked(self):
         worker, client, adapter, _ = self.setup_worker(); adapter.fail_execute = True
         result = worker.run()
