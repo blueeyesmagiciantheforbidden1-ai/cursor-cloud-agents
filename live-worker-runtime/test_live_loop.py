@@ -426,6 +426,68 @@ class LoopTests(unittest.TestCase):
         worker.run()
         self.assertEqual(set(client.completions[0]), {'lease_token', 'output', 'exit_code'})
 
+    def test_sigterm_interrupt_during_execute_sends_one_worker_stopping_completion(self):
+        # Demand's review of a0fd2c3: the entrypoint's SIGTERM handler raises
+        # KeyboardInterrupt, which used to skip run()'s failure path entirely.
+        worker, client, adapter, _ = self.setup_worker()
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute'); raise KeyboardInterrupt
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'worker_stopping')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'], 'worker_stopping')
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+
+    def test_sigterm_interrupt_while_idle_is_a_clean_drain(self):
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        def maintain(handle):
+            adapter.calls.append('maintain'); raise KeyboardInterrupt
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(client.claims, 0)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertEqual(client.completions, [])
+
+    def test_signal_never_interrupts_close_or_completion(self):
+        worker, client, adapter, _ = self.setup_worker()
+        seen = []
+        def close(handle):
+            adapter.calls.append('close')
+            seen.append(('close', worker.critical, worker.on_signal()))
+        adapter.close = close
+        original = client.post
+        def post(path, value):
+            if path.endswith('/complete'):
+                seen.append(('complete', worker.critical, worker.on_signal()))
+            return original(path, value)
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(seen, [('close', 1, False), ('complete', 1, False)])
+        self.assertTrue(worker.stopping)
+        self.assertEqual(worker.critical, 0)
+        # Outside a critical section: interrupt exactly once.
+        fresh, _, _, _ = self.setup_worker()
+        self.assertTrue(fresh.on_signal())
+        self.assertFalse(fresh.on_signal())
+        self.assertTrue(fresh.stopping)
+
+    def test_revocation_seen_during_task_setup_skips_the_completion(self):
+        worker, client, adapter, _ = self.setup_worker(); client.active = False
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'task_lease_lost')
+        self.assertTrue(worker.lease_revoked)
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertEqual(client.completions, [])
+        self.assertNotIn('execute', adapter.calls)
+
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):
             self.assertTrue(provider_errors.is_quota(code))

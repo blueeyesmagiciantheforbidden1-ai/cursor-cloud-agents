@@ -107,8 +107,11 @@ def main():
         worker = Worker(settings, Client(config), adapter, session,
                         log=emit, trace_id=broker.execution_uid)
         def stop(signum, frame):
-            worker.stopping = True
-            raise KeyboardInterrupt
+            # Interrupt at most once and never inside the credential close or
+            # the completion POST (Worker.on_signal); run() turns the interrupt
+            # into one worker_stopping completion for a claimed room.
+            if worker.on_signal():
+                raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stop)
         result = worker.run()
         if result['outcome'] in ('completed', 'idle_drained'):

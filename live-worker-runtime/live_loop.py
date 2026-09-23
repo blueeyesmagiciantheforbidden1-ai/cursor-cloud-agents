@@ -5,6 +5,7 @@ claim is retried here. Completion alone is idempotent and may be redelivered.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -319,6 +320,10 @@ class Worker:
         self.task = None
         self.ready = False
         self.stopping = False
+        # SIGTERM handling (entrypoint): interrupt at most once, and never
+        # while `critical` is non-zero (credential close, completion POST).
+        self.critical = 0
+        self.interrupted = False
         self.next_report = 0.0
         self.last_exit = None
         # Set only when the hub itself answered that this task lease is no
@@ -378,10 +383,33 @@ class Worker:
         except Exception:
             pass
 
+    def on_signal(self):
+        """SIGTERM: always request a stop. True means interrupt the main thread now.
+
+        An interrupt inside adapter.close() (the broker commit and release) or
+        inside the completion POST would leave the credential or the room
+        uncertain: that is the quarantine path. Those run as critical sections
+        and are never interrupted; the stop flag is honoured afterwards.
+        """
+        self.stopping = True
+        if self.critical or self.interrupted:
+            return False
+        self.interrupted = True
+        return True
+
+    @contextmanager
+    def _critical(self):
+        self.critical += 1
+        try:
+            yield
+        finally:
+            self.critical -= 1
+
     def _close_for_span(self):
         started = self.clock()
         try:
-            self.adapter.close(self.handle)
+            with self._critical():
+                self.adapter.close(self.handle)
         except Exception as error:
             code = _span_code(error)
             self._emit_span('close', started, code, error_code=code, task=self.task, attempt_key=self._attempt_key)
@@ -392,7 +420,8 @@ class Worker:
     def _complete_for_span(self, output, exit_code, *, error_code=None):
         started = self.clock()
         try:
-            self.complete(output, exit_code, error_code=error_code)
+            with self._critical():
+                self.complete(output, exit_code, error_code=error_code)
         except Exception as error:
             code = _span_code(error)
             self._emit_span('complete', started, code, error_code=code,
@@ -443,6 +472,8 @@ class Worker:
         started = self.clock()
         receipt = self.client.post('/v1/tasks/' + task['room_id'] + '/heartbeat',
                                    {'lease_token': task['lease_token']})
+        if isinstance(receipt, dict) and receipt.get('active') is False:
+            self.lease_revoked = True
         require(receipt.get('active') is True, 'task_lease_lost')
         deadline, now = receipt.get('deadline'), receipt.get('server_time')
         require(finite(deadline) and finite(now) and deadline == task.get('deadline'), 'task_deadline_changed')
@@ -644,13 +675,18 @@ class Worker:
             outcome.update(outcome='idle_drained', model_call_attempted=False)
             self.last_exit = 0
             return outcome
-        except Exception as error:
+        except (Exception, KeyboardInterrupt) as error:
             # LiveError and provider adapters raise fixed vetted codes; the
             # boundary re-checks every one of them because the code reaches
             # the room. Any other exception is native output and stays generic.
             # A provider's own model_call_attempted attribute is not consulted:
             # the loop's flag is set before execute and is the conservative one.
-            code = provider_errors.error_code(error) or 'native_or_connection_failure'
+            # KeyboardInterrupt is the entrypoint's SIGTERM interrupt: it takes
+            # the same close-then-complete path as any failure.
+            if isinstance(error, KeyboardInterrupt):
+                code = 'worker_stopping'
+            else:
+                code = provider_errors.error_code(error) or 'native_or_connection_failure'
             # Copilot can drop a warm native session while this process is
             # idle, between maintain() calls, before a task exists. No prompt
             # was sent. A clean credential release is the same end state as
@@ -667,6 +703,9 @@ class Worker:
                                    model_call_attempted=self.model_call_attempted,
                                    claim_attempted=self.claim_attempted)
                     return outcome
+            # A stop before any claim is the same clean end as a drain.
+            idle_session_lost = idle_session_lost or (
+                code == 'worker_stopping' and self.task is None and not self.model_call_attempted)
             if idle_session_lost and self.cleaned:
                 outcome.update(outcome='idle_drained', model_call_attempted=False)
                 self.last_exit = 0
