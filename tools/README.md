@@ -7,48 +7,78 @@ environment; the script only forwards that value.
 
 The manager token is sent as `X-Hub-Token`. The identity token is sent as
 `Authorization: Bearer`. Neither value is printed, written to the ledger, or
-placed on the command line.
+placed on the command line. The same rule covers the per-room nonce and the
+per-agent expected tokens.
 
-## Run
+A room never passes because a worker says it passed. Each prompt carries a
+coordinator-chosen nonce and one token per agent, shaped `NONCE-AGENTNAME`
+(for example `0123456789abcdef-CODEX`). Validation matches only when that
+agent's reply, aside from surrounding whitespace, is exactly its token.
+
+## Gates
+
+Run the gates in this order:
+
+`capability -> roster -> fleet -> duplicate -> load -> expiry`
+
+`all` runs that sequence and stops on the first failing gate. A skipped expiry
+gate is not a failure. With no subcommand, the fleet gate runs, and the flags
+below keep working.
 
 ```bash
 export HUB_MANAGER_TOKEN=...
 export HUB_ID_TOKEN=...
-python3 tools/verify_fleet.py \
+python3 tools/verify_fleet.py all \
+  --hub https://hub.example.run.app \
+  --ledger /tmp/fleet-ledger.json
+```
+
+One gate:
+
+```bash
+python3 tools/verify_fleet.py fleet \
   --hub https://hub.example.run.app \
   --ledger /tmp/fleet-ledger.json \
-  --consecutive 3 \
+  --consecutive 2 \
   --max-rooms 8
 ```
 
-`--consecutive` defaults to 3 and `--max-rooms` defaults to 8. The process exits
-0 only after that many rooms pass in a row. Any failed, stalled, timed-out, or
-text-mismatched room resets the streak. The run stops at `--max-rooms` if the
-streak is still short.
+| Gate | What it checks |
+| --- | --- |
+| capability | `GET /v1/status`. All five agents are `ready` or `restarting`, and none are `offline`. Any capability manifest fields the hub sent (`capability_manifest`, `manifest`, `capabilities`) are copied into the ledger. Missing manifest fields stay empty. |
+| roster | One room per agent. The effective roster is exactly that agent and the room has one message from them. Hubs that only return `agents` use that list. |
+| fleet | Five-agent rooms. Exit 0 after two consecutive passing rooms by default. |
+| duplicate | A five-agent room in which no agent message appears twice. |
+| load | N five-agent rooms are created together, then polled. Default 3, allowed 1 through 5. All must finish inside `--room-timeout`. |
+| expiry | Runs only when the hub reports `queue_deadline` support (`queue_deadline_supported`, `queue_deadline`, or that name in `features` / `capabilities` / `supports`). Otherwise the ledger entry is `skipped` with a reason. When support is reported, the gate passes only if the room status becomes `expired`. |
 
-Each room is created alone with `POST /v1/rooms`:
+Room creation still posts only the existing fields: `prompt`, `agents`,
+`timeout_seconds`, `workspace`, and `purpose`. Newer response fields are
+optional. `room_status` is the hub's status string, including
+`blocked_on_provider`, `retry_scheduled`, `needs_reconciliation`, and
+`expired` when the hub sends them. Those states end the poll. A room gate
+passes only on `completed` plus a clean execution and a matched token, except
+expiry, which passes only on `expired`.
 
-- agents: `codex`, `claude`, `cursor`, `copilot`, `grok`
-- `timeout_seconds`: 300
-- `workspace`: `default`
-- `purpose`: `project`
-- prompt: each agent must reply with exactly its uppercase name followed by ` | OK`
-  (`CODEX | OK`, `CLAUDE | OK`, `CURSOR | OK`, `COPILOT | OK`, `GROK | OK`)
+For each agent the ledger records:
 
-The script then polls `GET /v1/rooms/<id>` every 10 seconds until `status` is
-`completed`, `failed`, or `stalled`, or until 15 minutes have passed. It prints
-each agent's `exit_code` and reply text. A room passes only when `status` is
-`completed`, every agent exited 0, and the reply text is exactly `NAME | OK`
-(leading and trailing whitespace is ignored).
+- `execution_status`: `exit_code`, `delivered`, and `ok` (delivered and every copy exited 0)
+- `validation_status`: `token_matched`, `wrong_token`, `missing`, or `duplicate`
 
-The ledger is rewritten after every room. Each entry has `room_id`,
-`created_at`, `exit_codes` for the five agents (`null` if that agent never
-replied), and `pass`. The top-level `result` is `pass` only when the streak
-reaches `--consecutive`.
+Exit 0 with the wrong token is execution ok and validation failed. The gate fails.
 
-Loopback `http://127.0.0.1`, `http://localhost`, and `http://[::1]` are accepted
-for local tests. Any other hub URL must be `https`, with no userinfo, query, or
-path. Redirects are not followed.
+## Flags
+
+- `--hub` (required): base URL. Loopback `http://127.0.0.1`, `http://localhost`, and `http://[::1]` are accepted for local tests. Any other hub URL must be `https`, with no userinfo, query, or path. Redirects are not followed.
+- `--ledger` (required): JSON ledger path. It is rewritten as gates and fleet rooms finish.
+- `--consecutive`: fleet passes in a row (default 2). Must be less than or equal to `--max-rooms`.
+- `--max-rooms`: fleet stop (default 8).
+- `--room-timeout`: each room's `timeout_seconds` (default 300, allowed 120-900). The load gate also requires every room to complete within this many seconds.
+- `--load-rooms`: rooms in the load gate (default 3, allowed 1-5).
+
+The ledger is one object: `result` (`pass`, `fail`, or `skipped`) and `gates`.
+Each gate entry has `gate`, `result`, `pass`, and `evidence`. Expiry's skipped
+entry has `pass` null and a `reason`.
 
 ## Tests
 
@@ -56,8 +86,9 @@ path. Redirects are not followed.
 python3 -B tools/test_verify_fleet.py
 ```
 
-The tests start a local `http.server` fake hub. They cover a five-for-five pass,
-a failed agent, a stalled room, and a failure that resets the consecutive
-counter. They do not call Cloud Run, Firestore, or a live hub.
+The tests start a local `http.server` fake hub. They cover every gate, a worker
+that exits 0 with the wrong token, a duplicate message, a stalled room,
+`blocked_on_provider`, and hubs that omit the new fields. They do not call
+Cloud Run, Firestore, or a live hub.
 
 `--room-timeout SECONDS` sets each room's `timeout_seconds` (default 300, allowed 120-900; the hub refuses less than 120 with codex on the room). Until the `live-20260923c` worker images are deployed, use `--room-timeout 180`: the deployed claude worker does not renew its credential lease during a turn, and a room deadline of 150-180 s ends a slow turn inside that lease instead of quarantining the credential.
