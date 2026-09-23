@@ -53,6 +53,13 @@ FORBIDDEN_PREFIXES = ('tool.', 'tools.', 'subagent.', 'permission.', 'userinput.
     'llminference.', 'githubtoken.', 'sessionfs.', 'mcp.')
 FORBIDDEN_EVENTS = frozenset(('assistant.tool_call_delta', 'assistant.server_tool_progress',
     'skill.invoked', 'hook.start'))
+# Mid-turn account exhaustion only: tokens are matched and dropped. A plain
+# transient 429 / rate_limit without one of these must stay a normal failure.
+_QUOTA_TOKENS = frozenset({
+    'usage_limit', 'insufficient_quota', 'quota_exceeded', 'billing', 'credit'})
+_TURN_FAILURE_EVENTS = frozenset((
+    'session.error', 'session.model_change', 'session.auto_tier_switch_failed',
+    'assistant.turn_retry', 'model.call_failure'))
 
 
 class CopilotError(provider_errors.ProviderCodeError, ValueError):
@@ -66,6 +73,38 @@ class NativeStartupStopped(CopilotError):
 def need(condition, code):
     if not condition:
         raise CopilotError(code)
+
+
+def _quota_token(text):
+    """True when allowlisted exhaustion tokens appear; never returns native text."""
+    if type(text) is not str or not text:
+        return False
+    blob = re.sub(r'[^a-z0-9]+', '_', text[:4096].lower()).strip('_')
+    if not blob:
+        return False
+    padded = f'_{blob}_'
+    return any(f'_{token}_' in padded for token in _QUOTA_TOKENS)
+
+
+def _quota_exhausted_signal(value, *, depth=0):
+    """Fixed mid-turn exhaustion signals only; 429/rate_limit alone are not enough."""
+    if depth > 8 or value is None:
+        return False
+    if type(value) is str:
+        return _quota_token(value)
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                continue
+            if key.lower() in (
+                    'code', 'type', 'name', 'error', 'message', 'msg', 'reason',
+                    'detail', 'details', 'status', 'data', 'body', 'params'):
+                if _quota_exhausted_signal(item, depth=depth + 1):
+                    return True
+        return False
+    if type(value) is list:
+        return any(_quota_exhausted_signal(item, depth=depth + 1) for item in value[:32])
+    return False
 
 
 def _deadline(value, *, maximum=None):
@@ -386,8 +425,12 @@ class Native:
             if 'method' in value:
                 self.notification(value)
                 continue
-            need(value.get('jsonrpc') == '2.0' and type(value.get('id')) is int and value['id'] == self.index
-                 and 'error' not in value and 'result' in value, 'copilot_native_request_failed')
+            need(value.get('jsonrpc') == '2.0' and type(value.get('id')) is int and value['id'] == self.index,
+                 'copilot_native_request_failed')
+            if 'error' in value:
+                need(not _quota_exhausted_signal(value.get('error')), 'copilot_quota_exhausted')
+                raise CopilotError('copilot_native_request_failed')
+            need('result' in value, 'copilot_native_request_failed')
             if method == 'runtime.shutdown':
                 self.clean_shutdown = True
             return value['result']
@@ -409,8 +452,10 @@ def _response(native):
         need(type(kind) is str and type(data) is dict, 'copilot_native_event_invalid')
         need(not kind.lower().startswith(FORBIDDEN_PREFIXES) and kind not in FORBIDDEN_EVENTS,
              'copilot_tools_forbidden')
-        need(kind not in ('session.error', 'session.model_change', 'session.auto_tier_switch_failed',
-             'assistant.turn_retry', 'model.call_failure'), 'copilot_native_turn_failed_or_changed')
+        if kind in _TURN_FAILURE_EVENTS:
+            need(not _quota_exhausted_signal(event) and not _quota_exhausted_signal(data),
+                 'copilot_quota_exhausted')
+            raise CopilotError('copilot_native_turn_failed_or_changed')
         if kind == 'assistant.turn_start':
             turns += 1
             need(turns == 1, 'copilot_multiple_turns_forbidden')

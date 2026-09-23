@@ -1,10 +1,14 @@
 """Bounded native ACP transport. No raw credential/profile/diagnostic logging."""
-import json, os, queue, signal, subprocess, threading, time
+import json, os, queue, re, signal, subprocess, threading, time
 from pathlib import Path
 import provider_errors
 
 NATIVE='/opt/runcrew/grok/grok'
 MAX_MESSAGE=2*1024*1024
+# Mid-turn account exhaustion only: tokens are matched and dropped. A plain
+# transient 429 / rate_limit without one of these must stay a normal failure.
+_QUOTA_TOKENS=frozenset({
+    'usage_limit','insufficient_quota','quota_exceeded','billing','credit'})
 class NativeError(provider_errors.ProviderCodeError, ValueError): pass
 class NativeStartupStopped(NativeError):
     """Startup failed, with no spawned process left running."""
@@ -12,6 +16,43 @@ class NativeStopUncertain(NativeError):
     """A spawned process could not be confirmed stopped; quarantine the lease."""
 def need(value, reason):
     if not value: raise NativeError(reason)
+
+def _quota_token(text):
+    """True when allowlisted exhaustion tokens appear; never returns native text."""
+    if type(text) is not str or not text:
+        return False
+    blob=re.sub(r'[^a-z0-9]+','_',text[:4096].lower()).strip('_')
+    if not blob:
+        return False
+    padded=f'_{blob}_'
+    return any(f'_{token}_' in padded for token in _QUOTA_TOKENS)
+
+def quota_exhausted_signal(value, depth=0):
+    """Fixed mid-turn exhaustion signals only; 429/rate_limit alone are not enough."""
+    if depth>8 or value is None:
+        return False
+    if type(value) is str:
+        return _quota_token(value)
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                continue
+            if key.lower() in (
+                    'code','type','name','error','message','msg','reason',
+                    'detail','details','status','data','body'):
+                if quota_exhausted_signal(item, depth+1):
+                    return True
+        return False
+    if type(value) is list:
+        return any(quota_exhausted_signal(item, depth+1) for item in value[:32])
+    return False
+
+def rpc_error_code(error):
+    """Map a JSON-RPC error object to a fixed NativeError code; never copy text."""
+    if quota_exhausted_signal(error):
+        return 'grok_quota_exhausted'
+    code=error.get('code') if type(error) is dict else None
+    return 'native_rpc_'+str(code) if type(code) is int else 'native_rpc_failed'
 
 def frame_envelope(value,expected_id):
     """Only fixed keys, scalar type names and correlation categories; no payload/IDs."""
@@ -146,8 +187,7 @@ class Native:
                         'matches'if type(item.get('id'))is str and item['id']==prompt_id else'different')
                 raise failure
             if 'error' in item:
-                code=item.get('error',{}).get('code')
-                raise NativeError('native_rpc_'+str(code) if type(code)is int else 'native_rpc_failed')
+                raise NativeError(rpc_error_code(item.get('error')))
             need('result'in item,'native_result_missing');return item['result']
     def close(self):
         if self.closed:return

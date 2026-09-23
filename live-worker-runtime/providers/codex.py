@@ -37,6 +37,13 @@ EXECUTE_WARM_FLOOR = FINALIZE_RESERVE + 30
 CONFIG_SHA = 'c584ec84021d23203d0c444cf474c3f184a0b759faf51bed0ba1fc16361af9cf'
 REQUIREMENTS_SHA = '25b86fa3671a4ee1ea904a1f5777c164347763d01dda591fcac3022b64235e10'
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
+# Mid-turn account exhaustion only: tokens are matched and dropped. A plain
+# transient 429 / rate_limit without one of these must stay a normal failure.
+_QUOTA_TOKENS = frozenset({
+    'usage_limit', 'insufficient_quota', 'quota_exceeded', 'billing', 'credit'})
+# Failed-turn notifications only. Content methods (item/completed, item deltas,
+# reasoning, agentMessage text) must never be scanned for quota tokens.
+_TURN_FAILURE_METHODS = frozenset({'turn/completed'})
 
 
 class LiveCodexError(provider_errors.ProviderCodeError, RuntimeError):
@@ -46,6 +53,57 @@ class LiveCodexError(provider_errors.ProviderCodeError, RuntimeError):
 def need(ok, code):
     if not ok:
         raise LiveCodexError(code)
+
+
+def _quota_token(text):
+    """True when allowlisted exhaustion tokens appear; never returns native text."""
+    if type(text) is not str or not text:
+        return False
+    blob = re.sub(r'[^a-z0-9]+', '_', text[:4096].lower()).strip('_')
+    if not blob:
+        return False
+    padded = f'_{blob}_'
+    return any(f'_{token}_' in padded for token in _QUOTA_TOKENS)
+
+
+def _quota_exhausted_signal(value, *, depth=0):
+    """Fixed mid-turn exhaustion signals only; 429/rate_limit alone are not enough."""
+    if depth > 8 or value is None:
+        return False
+    if type(value) is str:
+        return _quota_token(value)
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                continue
+            if key.lower() in (
+                    'code', 'type', 'name', 'error', 'message', 'msg', 'reason',
+                    'detail', 'details', 'status', 'data', 'body', 'turn', 'params'):
+                if _quota_exhausted_signal(item, depth=depth + 1):
+                    return True
+        return False
+    if type(value) is list:
+        return any(_quota_exhausted_signal(item, depth=depth + 1) for item in value[:32])
+    return False
+
+
+def _midturn_quota_exhausted(event):
+    """Classify only JSON-RPC errors or failed turn/completed frames, never content."""
+    if type(event) is not dict:
+        return False
+    # JSON-RPC response error object (no notification method).
+    if 'error' in event and event.get('method') is None:
+        return _quota_exhausted_signal(event.get('error'))
+    if event.get('method') not in _TURN_FAILURE_METHODS:
+        return False
+    params = event.get('params')
+    if type(params) is not dict:
+        return False
+    turn = params.get('turn')
+    if type(turn) is not dict or turn.get('status') != 'failed':
+        return False
+    # Scan the failed turn / its error object only — not sibling content events.
+    return _quota_exhausted_signal(turn)
 
 
 def _deadline(value):
@@ -327,9 +385,17 @@ def _fail(handle, error):
         _close(handle)
     except Exception:
         pass
-    code = str(error) if isinstance(error, (LiveCodexError, transport.TransportError,
-        metadata.MetadataError, protocol_gate.GateError)) else ''
-    failure = LiveCodexError(code if SAFE_CODE.fullmatch(code) else 'codex_live_operation_failed')
+    # Prefer an already-vetted quota code; otherwise scan any attached payload
+    # for fixed exhaustion tokens (never copy native text into the code).
+    if (provider_errors.error_code(error) == 'codex_quota_exhausted'
+            or _quota_exhausted_signal(getattr(error, 'payload', None))
+            or _quota_exhausted_signal(getattr(error, 'native_error', None))):
+        code = 'codex_quota_exhausted'
+    else:
+        code = str(error) if isinstance(error, (LiveCodexError, transport.TransportError,
+            metadata.MetadataError, protocol_gate.GateError)) else ''
+        code = code if SAFE_CODE.fullmatch(code) else 'codex_live_operation_failed'
+    failure = LiveCodexError(code)
     failure.model_call_attempted = handle.prompt_attempted
     failure.credential_writeback = handle.credential_writeback
     raise failure from None
@@ -425,8 +491,12 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         outcome = transport.TurnResult(handle.gate.thread_id, initial.get('id'), MODEL,
                                        execution_mode='read_only_review')
         while not outcome.complete:
-            outcome.consume(handle.native.next_event())
+            event = handle.native.next_event()
+            # Classify only failure/error frames before transport flattens them.
+            need(not _midturn_quota_exhausted(event), 'codex_quota_exhausted')
+            outcome.consume(event)
         for event in handle.native.finish_turn():
+            need(not _midturn_quota_exhausted(event), 'codex_quota_exhausted')
             outcome.consume(event)
         need(handle.native.clean_shutdown, 'native_clean_exit_unconfirmed')
         result = outcome.result()
