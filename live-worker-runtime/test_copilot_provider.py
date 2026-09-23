@@ -599,6 +599,54 @@ class Admission(unittest.TestCase):
                 with self.assertRaises(c.CopilotError): c._response(SimpleNamespace(next_event=lambda: events.pop(0)))
 
 
+# Emitted by the native CLI between session.create / setAllowedModels and the
+# prompt (2026-09-23: the copilot d image rejected these and every startup failed).
+SETUP_NOTICES = ('session.model_change', 'session.tools_updated', 'session.mcp_servers_loaded',
+                 'session.skills_loaded', 'session.custom_agents_updated', 'session.extensions_loaded',
+                 'session.usage_info', 'session.context_changed', 'session.managed_settings_resolved')
+
+
+class SetupNoticesNative(FakeNative):
+    """FakeNative whose setup requests deliver events through the REAL Native.notification."""
+    extra = ()
+
+    def request(self, method, params=None):
+        result = super().request(method, params)
+        if method == 'session.create':
+            self.session_id, self.send_started = self.sid, False
+            self.event_count = self.ignored_notification_count = 0
+            kinds = SETUP_NOTICES[:4] + tuple(self.extra)
+        elif method == 'session.model.setAllowedModels':
+            kinds = SETUP_NOTICES[4:]
+        else:
+            kinds = ()
+        for kind in kinds:
+            c.Native.notification(self, notification(kind, sid=self.sid))
+        return result
+
+
+class StartupSequence(unittest.TestCase):
+    """prepare() with the native setup events the live image really sees."""
+    setUp, tearDown, prepare = Lifecycle.setUp, Lifecycle.tearDown, Lifecycle.prepare
+
+    def test_prepare_survives_the_real_setup_notices(self):
+        with patch.object(c, 'NativeProcess', SetupNoticesNative):
+            handle = self.prepare()
+        native = SetupNoticesNative.instances[-1]
+        self.assertEqual(native.events, [])
+        self.assertEqual(native.event_count, len(SETUP_NOTICES))
+        self.assertIn(('session.model.setAllowedModels', {'sessionId': native.sid, 'allowedModels': [c.MODEL]}),
+                      native.calls)
+        c.close(handle)
+
+    def test_real_pre_prompt_work_during_setup_still_fails_and_is_named(self):
+        class Busy(SetupNoticesNative):
+            extra = ('assistant.message',)
+        with patch.object(c, 'NativeProcess', Busy):
+            with self.assertRaisesRegex(c.CopilotError, 'copilot_unexpected_pre_prompt_assistant_message'):
+                self.prepare()
+
+
 def bare_native():
     native = c.Native.__new__(c.Native)
     native.deadline = time.monotonic()+100
@@ -677,6 +725,19 @@ class Transport(unittest.TestCase):
             with self.assertRaisesRegex(c.CopilotError, 'pre_prompt'): native.notification(notification(kind))
         native.notification(notification('session.info'))
         self.assertEqual(native.events, [])
+
+    def test_session_setup_notices_are_not_pre_prompt_work(self):
+        native = bare_native()
+        for kind in SETUP_NOTICES:
+            native.notification(notification(kind))
+        self.assertEqual(native.events, [])
+
+    def test_unknown_pre_prompt_event_names_its_kind(self):
+        native = bare_native()
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_unexpected_pre_prompt_session_plan_changed$'):
+            native.notification(notification('session.plan_changed'))
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_unexpected_pre_prompt_activity$'):
+            native.notification(notification('Session.Weird Kind!'))
 
     def test_queued_pre_prompt_frame_blocks_send(self):
         native = bare_native()

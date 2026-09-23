@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -218,6 +219,13 @@ def files_containing(root, needle):
 
 
 class RefreshPacksTest(unittest.TestCase):
+    def setUp(self):
+        # The synthetic base packs below are not git content; the drift guard
+        # has its own tests in BaseDriftTest.
+        patcher = mock.patch.object(refresh_packs, '_in_git', return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_built_packs_keep_every_import_pin_and_tag(self):
         closures = {}
         for provider in refresh_packs.PROVIDERS:
@@ -303,5 +311,59 @@ class RefreshPacksTest(unittest.TestCase):
             self.assertEqual(snapshot(base), before_base)
 
 
+class BaseDriftTest(unittest.TestCase):
+    """A hand patch in the deployed pack that never reached git must stop the build.
+
+    2026-09-23: the copilot d image was built from git on a 22b base while the
+    live image came from the 22f pack, whose pre-prompt PASSIVE_EVENTS were
+    never committed; every startup failed.
+    """
+
+    def make_base(self, root, files):
+        base = Path(root) / 'live-image-copilot-live-20260922f-source'
+        for name, data in files.items():
+            path = base / 'live' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        (base / 'Dockerfile').write_text('FROM scratch', encoding='utf-8')
+        return base
+
+    def git_file(self, name):
+        return (refresh_packs.RUNTIME / name).read_bytes().replace(b'\r\n', b'\n')
+
+    def test_git_content_has_no_drift_even_with_crlf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            live_loop = self.git_file('live_loop.py')
+            base = self.make_base(tmp, {'live_loop.py': live_loop.replace(b'\n', b'\r\n'),
+                                        'provider_errors.py': self.git_file('provider_errors.py')})
+            self.assertEqual(refresh_packs.base_drift(base, 'owner@example.org'), [])
+
+    def test_a_hand_patch_is_named_and_refresh_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patched = self.git_file('providers/copilot.py') + b"\nPASSIVE_EVENTS = PASSIVE_EVENTS | {'x'}\n"
+            base = self.make_base(tmp, {'providers/copilot.py': patched,
+                                        'live_loop.py': self.git_file('live_loop.py')})
+            self.assertEqual(refresh_packs.base_drift(base, 'owner@example.org'), ['providers/copilot.py'])
+            with self.assertRaises(SystemExit) as caught:
+                refresh_packs.refresh('copilot', Path(tmp), 'live-20260922f', 'live-20260924a',
+                                      'owner@example.org', Path(tmp) / 'out')
+            self.assertIn('providers/copilot.py', str(caught.exception))
+            self.assertFalse((Path(tmp) / 'out').exists())
+
+    def test_owner_pinned_file_is_compared_with_the_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pinned = self.git_file('providers/grok.py').replace(
+                refresh_packs.PLACEHOLDER.encode(), b'owner@example.org')
+            base = self.make_base(tmp, {'providers/grok.py': pinned})
+            self.assertEqual(refresh_packs.base_drift(base, 'owner@example.org'), [])
+            self.assertEqual(refresh_packs.base_drift(base, 'other@example.org'), ['providers/grok.py'])
+
+    def test_per_provider_base_is_validated(self):
+        with self.assertRaises(SystemExit):
+            refresh_packs.main(['--packs', '.', '--base-version', 'live-20260922b', '--version', 'live-20260924a',
+                                '--owner-email', 'owner@example.org', '--base', 'copilot=22f'])
+
+
 if __name__ == '__main__':
     unittest.main()
+

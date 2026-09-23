@@ -53,7 +53,14 @@ METHODS = frozenset(('connect', 'auth.getStatus', 'models.list', 'account.getQuo
     'session.send', 'runtime.shutdown'))
 PASSIVE_LIFECYCLE = frozenset(('session.created', 'session.updated', 'session.foreground', 'session.background'))
 PASSIVE_EVENTS = frozenset(('session.start', 'session.resume', 'session.idle', 'session.info',
-    'session.warning', 'session.title_changed', 'session.shutdown', 'session.truncation'))
+    'session.warning', 'session.title_changed', 'session.shutdown', 'session.truncation',
+    # Empty-tool session create and the model allowlist emit these before any prompt.
+    # Restored from the deployed live-20260922f pack, where this was patched on disk
+    # and never committed; without it every startup fails (2026-09-23 copilot d).
+    'session.model_change', 'session.tools_updated', 'session.mcp_servers_loaded',
+    'session.skills_loaded', 'session.custom_agents_updated', 'session.extensions_loaded',
+    'session.usage_info', 'session.context_changed', 'session.managed_settings_resolved'))
+_EVENT_KIND = re.compile(r'[a-z][a-z0-9_.]{0,63}')
 FORBIDDEN_PREFIXES = ('tool.', 'tools.', 'subagent.', 'permission.', 'userinput.',
     'user_input.', 'elicitation.', 'exitplanmode.', 'automodeswitch.', 'hooks.',
     'llminference.', 'githubtoken.', 'sessionfs.', 'mcp.')
@@ -79,6 +86,15 @@ class NativeStartupStopped(CopilotError):
 def need(condition, code):
     if not condition:
         raise CopilotError(code)
+
+
+def pre_prompt_code(kind):
+    """Name a rejected setup event without copying its payload."""
+    if _EVENT_KIND.fullmatch(kind):
+        token = 'copilot_unexpected_pre_prompt_' + kind.replace('.', '_')
+        if re.fullmatch(r'[a-z0-9_]{1,80}', token):
+            return token
+    return 'copilot_unexpected_pre_prompt_activity'
 
 
 def _quota_token(text):
@@ -379,7 +395,7 @@ class Native:
         need(not kind.lower().startswith(FORBIDDEN_PREFIXES) and kind not in FORBIDDEN_EVENTS,
              'copilot_tools_forbidden')
         if not self.send_started:
-            need(kind in PASSIVE_EVENTS, 'copilot_unexpected_pre_prompt_activity')
+            need(kind in PASSIVE_EVENTS, pre_prompt_code(kind))
             return  # Passive setup has no answer provenance and is never queued.
         self.events.append(event)
 

@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,11 +55,46 @@ def live_files(provider):
     return files
 
 
+def _in_git(data):
+    """True when these exact bytes (as LF) are a blob anywhere in this repository."""
+    lf = data.replace(b'\r\n', b'\n')
+    blob = subprocess.run(['git', '-C', str(ROOT), 'hash-object', '--no-filters', '--stdin'],
+                          input=lf, capture_output=True, check=True).stdout.decode().strip()
+    return subprocess.run(['git', '-C', str(ROOT), 'cat-file', '-e', blob], capture_output=True).returncode == 0
+
+
+def base_drift(base, owner_email):
+    """live/ files of the base pack whose bytes are not in git.
+
+    Such a file is a hand patch made in a pack and never committed. Building
+    from git would silently drop it: 2026-09-23 the copilot d image lost the
+    22f pack's pre-prompt PASSIVE_EVENTS and failed every startup. Pinned
+    files are compared with the owner email put back to the placeholder.
+    """
+    drift = []
+    for file in sorted((base / 'live').rglob('*.py')):
+        if '__pycache__' in file.parts:
+            continue
+        name = file.relative_to(base / 'live').as_posix()
+        data = file.read_bytes()
+        if name in PINNED and owner_email:
+            data = data.replace(owner_email.encode(), PLACEHOLDER.encode())
+        if not _in_git(data):
+            drift.append(name)
+    return drift
+
+
 def refresh(provider, packs, base_version, version, owner_email, out):
     base = packs / f'live-image-{provider}-{base_version}-source'
     target = out / f'live-image-{provider}-{version}-source'
     if not (base / 'Dockerfile').is_file() or not (base / 'live').is_dir():
         raise SystemExit(f'{provider}: base pack {base} is incomplete')
+    # The base must be the pack of the image that is deployed now, and every
+    # file in it must already be in git; otherwise the new pack drops changes.
+    drift = base_drift(base, owner_email)
+    if drift:
+        raise SystemExit(f'{provider}: base pack {base.name} has live/ files that are not in git: '
+                         + ', '.join(drift) + '. Port them into live-worker-runtime first.')
     if target.exists():
         raise SystemExit(f'{provider}: {target} already exists; refusing to overwrite a pack')
     shutil.copytree(base, target, ignore=shutil.ignore_patterns('__pycache__'))
@@ -89,7 +125,11 @@ def refresh(provider, packs, base_version, version, owner_email, out):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--packs', required=True, type=Path)
-    parser.add_argument('--base-version', required=True)
+    parser.add_argument('--base-version', required=True,
+                        help='pack version of the image each provider runs now (override per provider with --base)')
+    parser.add_argument('--base', action='append', default=[], metavar='PROVIDER=VERSION',
+                        help='base pack for one provider when its live image came from another pack '
+                             '(2026-09-23: copilot ran live-20260922f and cursor live-20260922d)')
     parser.add_argument('--version', required=True)
     parser.add_argument('--owner-email', required=True)
     parser.add_argument('--out', type=Path)
@@ -99,9 +139,16 @@ def main(argv=None):
         raise SystemExit('version must look like live-YYYYMMDDx and differ from the base')
     if '@' not in args.owner_email or PLACEHOLDER == args.owner_email:
         raise SystemExit('owner-email must be the operator owner email')
+    bases = {}
+    for item in args.base:
+        provider, _, version = item.partition('=')
+        if provider not in PROVIDERS or not re.fullmatch(r'live-[0-9]{8}[a-z]', version):
+            raise SystemExit('--base must be PROVIDER=live-YYYYMMDDx')
+        bases[provider] = version
     out = args.out or args.packs
     for provider in args.providers:
-        target = refresh(provider, args.packs, args.base_version, args.version, args.owner_email, out)
+        target = refresh(provider, args.packs, bases.get(provider, args.base_version), args.version,
+                         args.owner_email, out)
         print(json.dumps({'provider': provider, 'pack': str(target), 'tag': f'{provider}-worker:{args.version}'}))
     return 0
 
