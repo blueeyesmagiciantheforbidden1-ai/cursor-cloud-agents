@@ -54,4 +54,14 @@ The local pack on Alpha is unchanged.
 3. A live worker that must match an enrolled owner needs the real owner pin from the operator's local store. The public files above contain `example.invalid` placeholders.
 4. Leave the self-improver and trading stopped. Do not create keep-nine, SessionHostUp, or a worker named 9.
 5. Director commit `768b564` is not in Alpha's hub pack. If that object is still required, get it from the director's own notes. Do not read Amber-PC to find it.
-6. Alpha has no stored GitHub credential. Push this branch from a machine that already has GitHub write access. Light has pushed other branches with its own credential. Do not copy that credential onto Alpha.
+6. Alpha now has its own stored GitHub credential (signed in 2026-09-22 as `blueeyesmagiciantheforbidden1-ai`; verified fetch and push). Light keeps its own. Credentials are still not copied between machines.
+
+## Follow-up from the five-agent crash investigation (2026-09-22, Alpha)
+
+Branch `alpha/live-loop-provider-error-codes` records provider error codes in worker outcomes; see its commits. Not deployed: `provider_errors.py` must be copied beside `live_loop.py` in each `live-image-*-source/live/` pack before the images are rebuilt, and a pack missing it fails at build time.
+
+Findings, agreed across Alpha and Light:
+
+- The failed room's real code was `project_work_only` (`live_loop.py` `task_prompt`), which fires before any provider or deadline check. The room lacked `purpose == 'project'`; the hub revision serving since then stores it. A fresh room on the current revision is the test; the old room stays failed.
+- Any non-zero exit from any agent fails the whole room with no automatic retry (`core.py` completion path). Deliberate; leave it.
+- Hardening still to do, deferred because `core.py`/`test_hub.py` already carry two unmerged patches (room engine on Retina, usage gate on Demand) that overlap: reject a room at `create()` when `timeout_seconds` is below what an agent on it needs. Only codex has a floor today (`FINALIZE_RESERVE` 45 + 30 in `providers/codex.py`, plus the loop's 25 s completion reserve, so about 100 s; use 120). Keep other agents at 30. Pair it with a test that derives the codex number from the adapter constants so it cannot go stale. A worker cannot enforce this itself because `timeout_seconds` only arrives inside the claim.
