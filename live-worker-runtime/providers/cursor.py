@@ -23,6 +23,8 @@ import re
 import sys
 import time
 
+import provider_errors
+
 NATIVE_DIR = Path(__file__).resolve().parents[1] / 'cursor_native'
 
 
@@ -65,7 +67,7 @@ if not (hasattr(metadata, 'metadata_environment') and hasattr(metadata, 'account
     raise ImportError('cursor_native_metadata_module_required')
 
 
-class NativeError(RuntimeError):
+class NativeError(provider_errors.ProviderCodeError, RuntimeError):
     """Only fixed codes; never provider output, identifiers or the key."""
 
 

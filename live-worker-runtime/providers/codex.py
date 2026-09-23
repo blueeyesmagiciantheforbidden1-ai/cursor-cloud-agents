@@ -22,6 +22,7 @@ import time
 
 import metadata
 import protocol_gate
+import provider_errors
 import transport
 
 MODEL, EFFORT = 'gpt-6-astra', 'ultra'
@@ -33,7 +34,7 @@ REQUIREMENTS_SHA = '25b86fa3671a4ee1ea904a1f5777c164347763d01dda591fcac3022b6423
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
 
 
-class LiveCodexError(RuntimeError):
+class LiveCodexError(provider_errors.ProviderCodeError, RuntimeError):
     """Only fixed codes and conservative outcome flags cross the supervisor API."""
 
 

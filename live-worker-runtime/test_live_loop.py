@@ -3,9 +3,14 @@ import unittest
 from types import SimpleNamespace
 
 from live_loop import Worker, Settings, LiveError, task_prompt
+from provider_errors import ProviderCodeError
 
 
 ROOM = 'a' * 32
+
+
+class CodeError(ProviderCodeError, RuntimeError):
+    """Stands in for a provider adapter's fixed-code error class."""
 
 
 class Clock:
@@ -156,6 +161,26 @@ class LoopTests(unittest.TestCase):
         result = worker.run()
         self.assertEqual(adapter.calls.count('execute'), 1)
         self.assertNotIn('provider detail', str(result) + str(client.completions))
+
+    def test_vetted_provider_code_is_recorded_and_delivered(self):
+        worker, client, adapter, _ = self.setup_worker()
+        def execute(handle, prompt, deadline, *, task_kind): raise CodeError('task_deadline_out_of_bounds')
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'task_deadline_out_of_bounds')
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertIn('(task_deadline_out_of_bounds)', client.completions[0]['output'])
+
+    def test_unvetted_provider_text_stays_generic(self):
+        for text in ('codex_failed\n/home/worker/.codex/auth.json', 'Bad Code', 'x' * 101, ''):
+            with self.subTest(text=text):
+                worker, client, adapter, _ = self.setup_worker()
+                def execute(handle, prompt, deadline, *, task_kind): raise CodeError(text)
+                adapter.execute = execute
+                result = worker.run()
+                self.assertEqual(result['error_code'], 'native_or_connection_failure')
+                self.assertNotIn('auth.json', str(result) + str(client.completions))
+                self.assertIn('(native_or_connection_failure)', client.completions[0]['output'])
 
     def test_all_previous_agent_text_preserved_as_context(self):
         worker, client, _, _ = self.setup_worker()

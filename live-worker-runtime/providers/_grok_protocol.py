@@ -1,10 +1,11 @@
 """Bounded native ACP transport. No raw credential/profile/diagnostic logging."""
 import json, os, queue, signal, subprocess, threading, time
 from pathlib import Path
+import provider_errors
 
 NATIVE='/opt/runcrew/grok/grok'
 MAX_MESSAGE=2*1024*1024
-class NativeError(ValueError): pass
+class NativeError(provider_errors.ProviderCodeError, ValueError): pass
 class NativeStartupStopped(NativeError):
     """Startup failed, with no spawned process left running."""
 class NativeStopUncertain(NativeError):

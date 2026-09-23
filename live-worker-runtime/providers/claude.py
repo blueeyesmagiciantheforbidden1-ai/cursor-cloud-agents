@@ -27,6 +27,7 @@ from agent_hub import claude_runtime as rt
 from agent_hub import subscription_auth as auth
 from agent_hub.adapters import Command
 from agent_hub.billing_policy import AuthEvidence, BillingPolicy, enforce_billing_policy
+import provider_errors
 
 MODEL = 'claude-fable-5-1'
 EFFORT = 'max'
@@ -41,7 +42,7 @@ BILLING_POLICY = BillingPolicy(mode='subscription_only')
 _MODEL_PATTERN = None
 
 
-class NativeError(RuntimeError):
+class NativeError(provider_errors.ProviderCodeError, RuntimeError):
     """Only fixed codes; never control frames, environment values or stderr."""
 
 

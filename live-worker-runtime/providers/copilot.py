@@ -21,6 +21,8 @@ import subprocess
 import time
 from uuid import uuid4
 
+import provider_errors
+
 MODEL, EFFORT = 'kimi-k3', 'max'
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 EXPECTED_LOGIN = 'blueeyesmagiciantheforbidden1-ai'
@@ -44,7 +46,7 @@ FORBIDDEN_EVENTS = frozenset(('assistant.tool_call_delta', 'assistant.server_too
     'skill.invoked', 'hook.start'))
 
 
-class CopilotError(ValueError):
+class CopilotError(provider_errors.ProviderCodeError, ValueError):
     """Only fixed adapter codes, never raw native errors or credential bytes."""
 
 

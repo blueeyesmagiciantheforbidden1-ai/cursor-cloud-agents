@@ -12,6 +12,8 @@ import math
 import re
 import time
 
+import provider_errors
+
 
 class LiveError(RuntimeError):
     pass
@@ -202,7 +204,12 @@ class Worker:
             return outcome
         except Exception as error:
             self.last_exit = 1
-            code = str(error) if isinstance(error, LiveError) else 'native_or_connection_failure'
+            # Provider adapters raise fixed vetted codes (provider_errors);
+            # any other exception is native output and stays generic. A
+            # provider's own model_call_attempted attribute is not consulted:
+            # the loop's flag is set before execute and is the conservative one.
+            code = (str(error) if isinstance(error, LiveError)
+                    else provider_errors.error_code(error) or 'native_or_connection_failure')
             outcome.update(error_code=code, model_call_attempted=self.model_call_attempted,
                            claim_attempted=self.claim_attempted)
             if self.handle is not None and not self.cleaned:
@@ -215,7 +222,7 @@ class Worker:
                 outcome['completion_delivery'] = 'unconfirmed'
             elif self.cleaned and self.task and isinstance(self.task, dict) and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', '')):
                 try:
-                    self.complete('The cloud worker stopped before it could deliver a verified answer. '
+                    self.complete('The cloud worker stopped before it could deliver a verified answer (' + code + '). '
                                   'It did not automatically repeat the model request.', 1)
                 except Exception:
                     outcome['completion_delivery'] = 'unconfirmed'
