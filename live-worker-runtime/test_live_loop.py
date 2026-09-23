@@ -322,6 +322,8 @@ class LoopTests(unittest.TestCase):
                 self.assertEqual(len(client.completions), 1)
                 completion = client.completions[0]
                 self.assertEqual(completion['exit_code'], 1)
+                self.assertEqual(completion['error_code'], code)
+                self.assertIs(completion['model_call_attempted'], True)
                 self.assertIn('usage limit is exhausted (' + code + ')', completion['output'])
                 self.assertIn('grok worker', completion['output'])
         # Other failures keep exit 1 and the generic room text.
@@ -330,6 +332,22 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(worker.last_exit, 1)
         self.assertNotIn('provider_quota_exhausted', result)
         self.assertIn('stopped before it could deliver', client.completions[0]['output'])
+
+    def test_failed_completion_carries_structured_facts(self):
+        # Before the model call: the hub may requeue safely.
+        worker, client, adapter, _ = self.setup_worker()
+        del client.room['purpose']
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'purpose_missing')
+        completion = client.completions[0]
+        self.assertEqual(completion['error_code'], 'purpose_missing')
+        self.assertIs(completion['model_call_attempted'], False)
+        self.assertEqual(set(completion), {'lease_token', 'output', 'exit_code', 'error_code',
+                                           'model_call_attempted'})
+        # A success keeps exactly today's payload.
+        worker, client, adapter, _ = self.setup_worker()
+        worker.run()
+        self.assertEqual(set(client.completions[0]), {'lease_token', 'output', 'exit_code'})
 
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):

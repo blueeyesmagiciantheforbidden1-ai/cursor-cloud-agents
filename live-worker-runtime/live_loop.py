@@ -197,8 +197,13 @@ class Worker:
         require(remaining >= 5, 'task_deadline_insufficient')
         return self.clock() + remaining
 
-    def complete(self, output, exit_code):
+    def complete(self, output, exit_code, *, error_code=None):
         payload = {'lease_token': self.task['lease_token'], 'output': output, 'exit_code': exit_code}
+        # Structured failure facts for the hub's recovery policy. A hub that
+        # predates them ignores unknown keys; the text keeps the code too.
+        if error_code is not None:
+            require(provider_errors.SAFE_CODE.fullmatch(error_code) is not None, 'completion_code_invalid')
+            payload.update(error_code=error_code, model_call_attempted=bool(self.model_call_attempted))
         require(self.cleaned, 'native_cleanup_required_before_completion')
         require(self.completion_payload is None or self.completion_payload == payload,
                 'completion_payload_changed')
@@ -390,7 +395,7 @@ class Worker:
                     text = ('The cloud worker stopped before it could deliver a verified answer (' + code + '). '
                             'It did not automatically repeat the model request.')
                 try:
-                    self.complete(text, 1)
+                    self.complete(text, 1, error_code=code)
                 except Exception:
                     outcome['completion_delivery'] = 'unconfirmed'
             return outcome
