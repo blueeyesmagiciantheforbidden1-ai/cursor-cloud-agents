@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ryan-frontier"
+version = "0.1.0"
+description = "Bounded program improvement with durable execution and transfer experiments"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ryan-frontier = "ryan_frontier.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ryan_frontier*"]

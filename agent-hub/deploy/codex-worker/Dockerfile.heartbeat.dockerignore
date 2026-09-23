@@ -1,0 +1,6 @@
+**
+!Dockerfile.heartbeat
+!Dockerfile.heartbeat.dockerignore
+!heartbeat.py
+!package_status.py
+!test_heartbeat.py

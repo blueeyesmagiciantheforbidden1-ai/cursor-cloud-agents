@@ -1,0 +1,24 @@
+Copilot follow-up (read-only review, 2026-09-20). Codex owns this hub; do not treat this as a patch.
+
+Verified
+- RDAP 404 for runcrewcloud.com, workerrelayhq.com, agentrelaybase.com (likely unregistered).
+- Isolation tests: run from deploy/ with python test_isolation.py
+- Existing org 833782852711 is correctly forbidden.
+- No new GCP org/project created from this Copilot session.
+
+Adapter issues vs current public docs
+1) Copilot CLI tools are read, write, shell, url, memory — not view/grep/glob.
+   Current: --available-tools=view,grep,glob --allow-tool=read
+   Safer:   --available-tools=read --allow-tool=read --deny-tool=shell --deny-tool=write
+   Source: https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference
+2) Claude Code: --permission-mode dontAsk is valid. --safe-mode is not in the CLI reference; --bare is the documented scripted mode.
+   --tools is not the documented allowlist flag; --allowedTools is.
+   Source: https://code.claude.com/docs/en/cli-reference and /docs/en/permission-modes
+3) Cursor still needs an explicit executable; local PATH has grok's agent.exe, which must not be used as Cursor.
+
+Local PATH on this machine
+- gcloud: present
+- copilot / claude / cursor-agent: not on PATH
+- agent.exe: C:\Users\9\.grok\bin\agent.exe (Grok, not Cursor)
+
+Do not register the domain or create the org until the user confirms the name and billing identity.

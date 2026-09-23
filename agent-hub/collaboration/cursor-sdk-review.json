@@ -1,0 +1,9 @@
+{
+  "status": "completed",
+  "runtime": "Cursor local SDK",
+  "model": "composer-2.5",
+  "agent_id": "agent-106fdc4c-2e6f-4f38-80a5-771e2de79fde",
+  "source_files_sent": false,
+  "tools_enabled": false,
+  "review": "**Promotion evaluator: reject**\n\n1. **Held-out win via leakage, not capability** — Gains on paired tasks because retrieval keys off evaluation artifacts (task IDs, repo fingerprints, cached trajectories in a shared index) or because “held-out” pairs share scaffolding with training traces. Ancestry looks legitimate; generalization does not.\n\n2. **Equal-budget illusions** — Better scores from reallocating hidden work (extra retrieval rounds, tool retries, speculative branches) while headline step/token caps match, or from high variance on a small pair set without consistent lift on the matched controls.\n\n**Useful diversity metric**\n\n**Behavioral retrieval divergence** on the same held-out prompts: e.g., mean pairwise Jaccard distance over retrieved document/chunk sets (or over planning subgraphs), not edit distance between candidate configs. High score lift with near-zero divergence flags clone promotions.\n\n**Engineering vs. proof of recursive improvement**\n\nFrozen candidates, paired held-out eval, fixed budgets, and archived lineage are **engineering** controls: they reduce regression risk, enable rollback, and support audit—not a theorem that each promoted generation improves future retrieval/planning under deployment shift, adversarial users, or moving benchmarks. **Proof of recursive improvement** would require stated invariants (stationary task distribution, non-gameable metrics, monotonic meta-loss) and evidence that promotions improve *expected* performance on *future* held-out draws, not just the current archive’s sibling set. Treat strong A/B on pairs as **safe iteration**, not self-improving recursion until that stronger claim is tested explicitly."
+}

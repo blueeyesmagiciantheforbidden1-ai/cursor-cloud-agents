@@ -1,0 +1,441 @@
+"""Prepared Codex subscription process; one explicit project prompt per grant.
+
+Package beside the reviewed codex-cloud-transport modules. Their pinned native
+binary, parser and final-item correlation remain authoritative. This adapter
+adds an idle/prepared phase, not a second credential acquisition or turn.
+Official protocol: https://learn.chatgpt.com/docs/app-server
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import queue
+import re
+import signal
+import threading
+import time
+
+import metadata
+import protocol_gate
+import provider_errors
+import transport
+
+MODEL, EFFORT = 'gpt-6-astra', 'ultra'
+MAX_PROMPT, MAX_ANSWER = 200000, 15000
+WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
+# execute() refuses a task deadline shorter than this. A claim also needs it
+# still left on warm_deadline, or setup (_collect, gate, poll_idle) runs into
+# the warm-window edge and dies before the model call.
+EXECUTE_WARM_FLOOR = FINALIZE_RESERVE + 30
+# Recorded by the successful pinned Linux build in two independent empty homes.
+CONFIG_SHA = 'c584ec84021d23203d0c444cf474c3f184a0b759faf51bed0ba1fc16361af9cf'
+REQUIREMENTS_SHA = '25b86fa3671a4ee1ea904a1f5777c164347763d01dda591fcac3022b64235e10'
+SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
+
+
+class LiveCodexError(provider_errors.ProviderCodeError, RuntimeError):
+    """Only fixed codes and conservative outcome flags cross the supervisor API."""
+
+
+def need(ok, code):
+    if not ok:
+        raise LiveCodexError(code)
+
+
+def _deadline(value):
+    need(type(value) in (int, float) and math.isfinite(value), 'deadline_invalid')
+    return float(value)
+
+
+class WarmRPC(transport.TurnRPC):
+    """Original strict transport with serialized metadata on an idle thread."""
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            if getattr(self, 'process', None) is not None:
+                self.stop_group()
+            raise
+
+    def request(self, method, params):
+        idle_metadata = method in transport.META_METHODS and self.protocol_state == 'thread_ready'
+        self._idle_metadata = idle_metadata
+        if idle_metadata:
+            self.protocol_state = 'metadata'
+        try:
+            result = super().request(method, params)
+        except BaseException:
+            self.protocol_state = 'denied'
+            raise
+        if idle_metadata:
+            self.protocol_state = 'thread_ready'
+        self._idle_metadata = False
+        return result
+
+    def _notification(self, value):
+        if getattr(self, '_idle_metadata', False):
+            previous = self.protocol_state
+            self.protocol_state = 'thread_ready'
+            try:
+                super()._notification(value)
+            finally:
+                self.protocol_state = previous
+        else:
+            super()._notification(value)
+
+    def _send(self, value=None, *, close=False):
+        raw = b'' if value is None else (json.dumps(value, separators=(',', ':'), ensure_ascii=False, allow_nan=False) + '\n').encode()
+        need(len(raw) <= MAX_PROMPT + 8192, 'native_request_limit')
+        done, failed = threading.Event(), threading.Event()
+
+        def write():
+            try:
+                remaining = memoryview(raw)
+                while remaining:
+                    need(time.monotonic() < self.deadline, 'native_write_deadline')
+                    try:
+                        count = self.process.stdin.write(remaining)
+                    except InterruptedError:
+                        continue
+                    need(type(count) is int and 0 < count <= len(remaining), 'native_short_write_invalid')
+                    remaining = remaining[count:]
+                if raw:
+                    self.process.stdin.flush()
+                if close:
+                    self.process.stdin.close()
+            except Exception:
+                failed.set()
+            finally:
+                done.set()
+
+        writer = threading.Thread(target=write, daemon=True)
+        self.writers.append(writer)
+        writer.start()
+        while not done.wait(.02):
+            self.tick()
+        self.tick()
+        need(not failed.is_set(), 'native_input_failed')
+
+    def poll_idle(self):
+        need(self.protocol_state == 'thread_ready' and not self.turn_submitted, 'native_idle_phase_required')
+        self.tick()
+        need(self.process.poll() is None, 'native_not_running')
+        # Drain only already queued frames; no request or model call is issued.
+        while True:
+            try:
+                raw = self.frames.get_nowait()
+            except queue.Empty:
+                break
+            need(raw is not metadata.EOF, 'native_exited_while_idle')
+            value = metadata.json_value(raw)
+            need('method' in value, 'unsolicited_native_response')
+            self._notification(value)
+        for event in self.pending_events:
+            need(event['method'] in ('thread/started', 'thread/status/changed'), 'native_work_before_prompt')
+            params = event['params']
+            observed = params.get('thread', {}).get('id') if event['method'] == 'thread/started' else params.get('threadId')
+            need(observed == getattr(self, 'expected_thread_id', None), 'native_idle_thread_mismatch')
+
+    def stop_group(self):
+        # Kill the group even if its leader already exited: descendants must not
+        # refresh credentials after the supervisor commits the file.
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.process.wait(timeout=5)
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
+        for worker in self.readers + self.writers:
+            if worker.ident is not None:
+                worker.join(timeout=.5)
+            need(not worker.is_alive(), 'native_io_stop_uncertain')
+
+
+@dataclass
+class Handle:
+    session: object = field(repr=False)
+    heartbeat: object = field(repr=False)
+    warm_deadline: float
+    native: object = field(default=None, repr=False)
+    gate: object = field(default=None, repr=False)
+    thread_response: dict | None = field(default=None, repr=False)
+    state: str = 'preparing'
+    model: str = MODEL
+    effort: str = EFFORT
+    usage: dict | None = None
+    preflight: dict = field(default_factory=dict)
+    owner_verified: bool = False
+    prompt_attempted: bool = False
+    consumed: bool = False
+    native_stopped: bool = False
+    credential_writeback: str = 'pending'
+    credential_version_ref: str | None = None
+    next_renew: float = 0
+    lock: object = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def readiness(self):
+        ready = self.state == 'ready' and not self.consumed and time.monotonic() < self.warm_deadline
+        return {'provider': 'codex', 'authenticated': self.owner_verified,
+                'ready_for_project_prompt': ready, 'model': self.model, 'effort': self.effort,
+                'preflight': self.preflight, 'tools_enabled': False, 'full_coding_ready': False,
+                'automatic_improvement_ready': False, 'credential_writeback': self.credential_writeback}
+
+
+def _enter(handle):
+    need(isinstance(handle, Handle) and handle.lock.acquire(blocking=False), 'concurrent_provider_operation')
+
+
+def _renew(handle):
+    handle.session.broker.renew(handle.session.lease)
+    need(handle.heartbeat() is True, 'hub_lease_lost')
+    handle.next_renew = time.monotonic() + 20
+
+
+def _quota(value, canonical):
+    need(isinstance(value, dict) and metadata.canonical_account_ref(value.get('accountId')) == canonical,
+         'native_quota_account_mismatch')
+    need(value.get('ordinaryUsageAllowed') is True, 'included_usage_unavailable')
+    buckets = value.get('rateLimitsByLimitId')
+    if buckets is None:
+        legacy = value.get('rateLimits')
+        buckets = {legacy.get('limitId') or 'codex': legacy} if isinstance(legacy, dict) else None
+    need(type(buckets) is dict and 'codex' in buckets and 1 <= len(buckets) <= 64, 'native_quota_unavailable')
+    windows = []
+    for key, bucket in buckets.items():
+        need(isinstance(key, str) and isinstance(bucket, dict) and bucket.get('limitId') in (None, key),
+             'native_quota_schema')
+        credits = bucket.get('credits')
+        need(type(credits) is dict and credits.get('hasCredits') is False and credits.get('unlimited') is False,
+             'native_extra_credit_route_not_disabled')
+        balance = credits.get('balance')
+        try:
+            zero = type(balance) is str and Decimal(balance).is_finite() and Decimal(balance) == 0
+        except InvalidOperation:
+            zero = False
+        need(zero and bucket.get('spendControlReached') is False, 'native_zero_extra_spending_unverified')
+        for name in ('primary', 'secondary'):
+            window = bucket.get(name)
+            if window is None:
+                continue
+            need(type(window) is dict, 'native_quota_window_invalid')
+            used = window.get('usedPercent')
+            need(used is None or type(used) in (int, float) and math.isfinite(used) and 0 <= used <= 10000,
+                 'native_quota_percentage_invalid')
+            need(used is None or used < 100, 'included_quota_exhausted')
+            reset = window.get('resetsAt')
+            need(reset is None or type(reset) is int and reset > time.time(), 'native_quota_reset_stale')
+            windows.append({'limit_id': key, 'window': name, 'used_percent': used, 'resets_at': reset})
+    known = [row['used_percent'] for row in windows if row['used_percent'] is not None]
+    return {'ordinary_usage_allowed': True, 'included_used_percent': max(known) if known else None,
+            'windows': windows, 'source': 'same_process_native', 'extra_spending_enabled': False,
+            'api_fallback_enabled': False, 'automatic_improvement_ready': False}
+
+
+def _collect(handle):
+    session, native = handle.session, handle.native
+    captured = {}
+    handle.owner_verified = False
+
+    def rpc(method, params):
+        result = native.request(method, params)
+        if method in ('account/read', 'account/rateLimits/read'):
+            captured[method] = result
+        if method == 'account/read':
+            identity = metadata.account_metadata(result, session.lease.profile, session.lease.account_ref)
+            need(identity['plan_type'] != 'unknown', 'native_plan_unknown')
+        if method == 'account/rateLimits/read':
+            need(metadata.canonical_account_ref(result.get('accountId')) == session.lease.canonical_account_ref,
+                 'native_quota_account_mismatch')
+            # Set only after this recheck verified both owner and canonical pool.
+            handle.owner_verified = True
+        return result
+
+    selection = {'account_ref': session.lease.account_ref, 'cli_model_id': MODEL,
+                 'effort': EFFORT, 'billing': 'subscription_included'}
+    gate = protocol_gate.PrePromptGate(rpc, selection, config_sha256=CONFIG_SHA,
+        provider_account_ref=session.lease.canonical_account_ref, execution_mode='read_only_review')
+    preflight = gate.collect()
+    need(preflight['requirements_sha256'] == REQUIREMENTS_SHA, 'managed_requirements_changed')
+    quota = _quota(captured['account/rateLimits/read'], session.lease.canonical_account_ref)
+    handle.usage = quota
+    handle.preflight = {**preflight, 'quota': quota, 'native_sha256': metadata.NATIVE_SHA256,
+                        'canonical_account_ref': session.lease.canonical_account_ref,
+                        'selection_basis': 'exact_reviewed_diverse_model_and_native_maximum_effort',
+                        'universal_best_claimed': False}
+    handle.gate = gate
+
+
+def _prepare_home(session):
+    for name in ('work', 'tmp'):
+        (session.home / name).mkdir(mode=0o700)
+    with (session.home / 'config.toml').open('x', encoding='utf-8', newline='\n') as stream:
+        stream.write(metadata.CONFIG)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _close(handle):
+    if handle.state == 'closed':
+        return
+    if handle.state == 'quarantined':
+        raise LiveCodexError('credential_reconciliation_required')
+    handle.state = 'closing'
+    try:
+        if handle.native is not None:
+            handle.native.stop_group()
+            handle.native_stopped = True
+        need(handle.native_stopped and handle.owner_verified, 'verified_native_owner_and_stop_required')
+        version = handle.session.finish(native_stopped=True)
+        handle.credential_version_ref = hashlib.sha256(version.encode()).hexdigest()
+        handle.credential_writeback = 'committed'
+        handle.state = 'closed'
+    except Exception:
+        handle.state = 'quarantined'
+        handle.credential_writeback = 'uncertain'
+        try:
+            handle.session.broker.quarantine(handle.session.lease, 'provider_refresh_uncertain')
+        except Exception:
+            pass
+        raise LiveCodexError('credential_reconciliation_required') from None
+
+
+def _fail(handle, error):
+    try:
+        _close(handle)
+    except Exception:
+        pass
+    code = str(error) if isinstance(error, (LiveCodexError, transport.TransportError,
+        metadata.MetadataError, protocol_gate.GateError)) else ''
+    failure = LiveCodexError(code if SAFE_CODE.fullmatch(code) else 'codex_live_operation_failed')
+    failure.model_call_attempted = handle.prompt_attempted
+    failure.credential_writeback = handle.credential_writeback
+    raise failure from None
+
+
+def prepare(session, heartbeat, deadline):
+    deadline = _deadline(deadline)
+    need(session.state == 'active' and callable(heartbeat) and time.monotonic() < deadline, 'active_session_required')
+    lease, broker = session.lease, session.broker
+    need(lease.profile in metadata.OWNER_REFS and lease.account_ref == metadata.OWNER_REFS[lease.profile]
+         and isinstance(lease.canonical_account_ref, str) and re.fullmatch('[a-f0-9]{64}', lease.canonical_account_ref)
+         and lease.execution == broker.execution and lease.execution_uid == broker.execution_uid,
+         'exact_broker_profile_execution_required')
+    need(not getattr(session, '_codex_live_prepared', False), 'native_session_already_prepared')
+    session._codex_live_prepared = True
+    handle = Handle(session, heartbeat, time.monotonic() + WARM_SECONDS)
+    try:
+        broker.assert_current(lease)
+        _prepare_home(session)
+        startup_end = min(deadline, time.monotonic() + 120)
+        handle.native = WarmRPC(session.home, lambda: _renew(handle),
+            timeout_seconds=max(30, math.ceil(startup_end - time.monotonic())), execution_mode='read_only_review')
+        handle.native.deadline = startup_end
+        handle.native.request('initialize', {'clientInfo': {'name': 'runcrew_codex_live', 'version': '1'}})
+        _collect(handle)
+        response = handle.native.request('thread/start', handle.gate.thread_request())
+        handle.gate.accept_thread(response)
+        handle.thread_response = response
+        handle.native.expected_thread_id = handle.gate.thread_id
+        handle.native.poll_idle()
+        _renew(handle)
+        handle.state = 'ready'
+        return handle
+    except Exception as error:
+        _fail(handle, error)
+
+
+def maintain(handle):
+    _enter(handle)
+    try:
+        need(handle.state == 'ready' and not handle.consumed, 'prepared_handle_required')
+        need(time.monotonic() < handle.warm_deadline, 'warm_session_expired')
+        handle.native.deadline = min(handle.warm_deadline, time.monotonic() + 30)
+        handle.native.poll_idle()
+        if time.monotonic() >= handle.next_renew:
+            try:
+                _renew(handle)
+            except Exception as error:
+                # Idle renew only reaches the hub. A dropped heartbeat is retried
+                # on the next maintain; closing the native process fails the warm run.
+                if provider_errors.error_code(error) != 'hub_lease_lost':
+                    raise
+        return handle.readiness
+    except Exception as error:
+        _fail(handle, error)
+    finally:
+        handle.lock.release()
+
+
+def execute(handle, prompt, task_deadline, *, task_kind='project'):
+    _enter(handle)
+    try:
+        need(task_kind == 'project', 'automatic_improvement_not_enabled')
+        need(handle.state == 'ready' and not handle.consumed, 'single_project_prompt_required')
+        task_deadline = _deadline(task_deadline)
+        remaining = task_deadline - time.monotonic()
+        need(EXECUTE_WARM_FLOOR <= remaining <= 900, 'task_deadline_out_of_bounds')
+        # Same floor against the warm session. A claim in the last seconds of
+        # WARM_SECONDS otherwise reaches _collect/poll_idle and fails there.
+        need(handle.warm_deadline - time.monotonic() >= EXECUTE_WARM_FLOOR, 'warm_session_expired')
+        need(isinstance(prompt, str) and 0 < len(prompt.encode()) <= MAX_PROMPT, 'bounded_prompt_required')
+        handle.consumed = True
+        handle.state = 'executing'
+        handle.native.deadline = min(task_deadline - FINALIZE_RESERVE, handle.warm_deadline,
+                                      time.monotonic() + NATIVE_SECONDS)
+        handle.session.broker.assert_current(handle.session.lease)
+        _renew(handle)
+        _collect(handle)
+        handle.gate.accept_thread(handle.thread_response)
+        handle.gate._fresh()
+        handle.native.poll_idle()
+        payload = {'threadId': handle.gate.thread_id, 'input': [{'type': 'text', 'text': prompt}],
+                   'model': MODEL, 'effort': EFFORT, 'sandboxPolicy': dict(handle.gate.sandbox)}
+        # The controller's durable task intent precedes this API. An exclusive
+        # local marker additionally forbids a duplicate attempt in this execution.
+        prompt_sha = hashlib.sha256(prompt.encode()).hexdigest()
+        with (handle.session.home / 'live-prompt-intent.json').open('x', encoding='utf-8') as stream:
+            json.dump({'prompt_sha256': prompt_sha, 'model': MODEL, 'effort': EFFORT}, stream)
+            stream.flush(); os.fsync(stream.fileno())
+        handle.prompt_attempted = True
+        initial = handle.native.request('turn/start', payload).get('turn')
+        need(isinstance(initial, dict) and initial.get('status') == 'inProgress', 'native_turn_ack_invalid')
+        outcome = transport.TurnResult(handle.gate.thread_id, initial.get('id'), MODEL,
+                                       execution_mode='read_only_review')
+        while not outcome.complete:
+            outcome.consume(handle.native.next_event())
+        for event in handle.native.finish_turn():
+            outcome.consume(event)
+        need(handle.native.clean_shutdown, 'native_clean_exit_unconfirmed')
+        result = outcome.result()
+        need(0 < len(result['output'].encode()) <= MAX_ANSWER, 'answer_exceeds_hub_limit')
+        _close(handle)
+        return {'provider': 'codex', 'text': result['output'], 'model': MODEL, 'effort': EFFORT,
+                'usage': result['usage'], 'preflight': handle.preflight,
+                'review_sha256': hashlib.sha256(result['output'].encode()).hexdigest(),
+                'prompt_sha256': prompt_sha, 'prompt_sent_once_by_wrapper': True,
+                'prompt_correlation': 'matching_thread_turn_and_completed_final_item',
+                'native_stopped': True, 'credential_writeback': 'committed',
+                'credential_version_ref': handle.credential_version_ref, 'automatic_retry': False,
+                'model_execution_attested': False, 'tools_enabled': False, 'full_coding_ready': False}
+    except Exception as error:
+        _fail(handle, error)
+    finally:
+        handle.lock.release()
+
+
+def close(handle):
+    _enter(handle)
+    try:
+        _close(handle)
+    finally:
+        handle.lock.release()
