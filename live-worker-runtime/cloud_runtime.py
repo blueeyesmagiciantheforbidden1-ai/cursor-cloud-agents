@@ -13,7 +13,7 @@ from agent_hub import credential_broker_service as base
 from agent_hub.cloud_credential_broker import (DATABASE, GoogleREST, CloudCredentialBroker,
                                               MutationUncertain, Conflict, BrokerError)
 from dynamic_broker import parse_config
-from fleet_controller import Controller, ControllerError, digest
+from fleet_controller import Controller, ControllerError, SAFE_CODE, digest
 
 
 class Google:
@@ -132,10 +132,16 @@ class Runtime:
                     result[name] = controller.tick()
                 except Conflict:
                     result[name] = {'status': 'concurrent_state_changed'}
-                except Exception:
+                except ControllerError as error:
+                    # The controller's own fixed codes say which pre-launch
+                    # check refused; without them an operator has to guess.
+                    code = str(error)
+                    result[name] = {'status': 'controller_attention_required',
+                                    'reason': code if SAFE_CODE.fullmatch(code) else 'unrecorded'}
+                except Exception as error:
                     # No raw exception, execution environment, grant, token or
                     # provider credential is ever returned or logged.
-                    result[name] = {'status': 'controller_attention_required'}
+                    result[name] = {'status': 'controller_attention_required', 'exception': type(error).__name__}
             print(json.dumps({'kind': 'runcrew_fleet_tick', 'workers': result}), flush=True)
             return result
         finally:
