@@ -1,0 +1,2101 @@
+{
+  "schema_version": 1,
+  "source_sha256": "e7614f3ddd7ef94b0b80b3d4f654224746b419c959b60272d497f8d5aa500fdb",
+  "source_bytes": 497764,
+  "source_lines": 9348,
+  "ported_sha256": "0d6e610133ba14d4c24404f4980dd8fea4150ca69b3648094da41331620ad2c5",
+  "ported_bytes": 492899,
+  "ported_lines": 9036,
+  "original_function_count": 143,
+  "ported_function_count": 145,
+  "translation_map": {
+    "neuroevolution_engine": "code_evolution_engine",
+    "codex_tool_lab": "development_tool_lab",
+    "codex_lab_os": "development_lab_os",
+    "neuro_surgery_supervisor": "code_repair_supervisor",
+    "neuro_runner_guard": "code_runner_guard",
+    "neuro_engine": "code_engine",
+    "research_governance_v10": "development_governance_v10",
+    "btc_alpha_mechanism": "repository_repair_mechanism",
+    "btc_alpha": "repository_repair",
+    "alpha_preproof": "repair_precheck",
+    "alpha_nursery": "repair_nursery",
+    "alpha_factory": "repair_factory",
+    "BTC-only": "repository-scoped",
+    "BTC controls": "repository baseline controls",
+    "BTC": "REPOSITORY",
+    "btc": "repository",
+    "PnL": "QualityGain",
+    "pnl": "quality_gain",
+    "trading-goal": "production-impact",
+    "trading_goal": "production_impact",
+    "trading": "production execution",
+    "market": "workload",
+    "multipair": "cross-repository",
+    "cross-symbol": "cross-repository",
+    "non-BTC": "unrelated-repository",
+    "fees": "provider costs",
+    "slippage": "runtime overhead",
+    "hold_bars": "evaluation_steps",
+    "broker order code": "production release controller",
+    "broker code": "production release controller",
+    "live execution": "production execution",
+    "parent pool": "candidate parent pool",
+    "main_ga": "main_search",
+    "MainGA": "MainSearch",
+    "main-GA": "main-search",
+    "main GA": "main search",
+    "Stage-C": "Integration-stage",
+    "StageC": "IntegrationStage",
+    "stagec": "integration_stage",
+    "stage_c": "integration_stage",
+    "RankPreview": "RegressionPreview",
+    "rankpreview": "regressionpreview",
+    "CPass": "VerificationPass",
+    "cpass": "verificationpass",
+    "ocean": "evidence",
+    "Ocean": "Evidence",
+    "OCEAN": "EVIDENCE",
+    "sacred": "protected",
+    "SACRED": "PROTECTED",
+    "NEURO_": "CODE_LAB_",
+    "NEUROEVOLUTION_ENGINE": "CODE_EVOLUTION_ENGINE",
+    "CODEX_TOOL_LAB": "DEVELOPMENT_TOOL_LAB",
+    "CODEX_LAB_OS": "DEVELOPMENT_LAB_OS",
+    "NEURO_SURGERY_SUPERVISOR": "CODE_REPAIR_SUPERVISOR",
+    "NEURO_RUNNER_GUARD": "CODE_RUNNER_GUARD",
+    "NEURO_ENGINE": "CODE_ENGINE",
+    "RESEARCH_GOVERNANCE_V10": "DEVELOPMENT_GOVERNANCE_V10",
+    "BTC_ALPHA_MECHANISM": "REPOSITORY_REPAIR_MECHANISM",
+    "BTC_ALPHA": "REPOSITORY_REPAIR",
+    "ALPHA_PREPROOF": "REPAIR_PRECHECK",
+    "ALPHA_NURSERY": "REPAIR_NURSERY",
+    "ALPHA_FACTORY": "REPAIR_FACTORY",
+    "TRADING_GOAL": "PRODUCTION_IMPACT",
+    "HOLD_BARS": "EVALUATION_STEPS",
+    "MAIN_GA": "MAIN_SEARCH",
+    "STAGE_C": "INTEGRATION_STAGE"
+  },
+  "bounded_defaults": {
+    "TOOL_LAB_DEFAULT_MAX_GB": "0.25",
+    "TOOL_LAB_DEFAULT_TICKETS_MAX_GB": "0.05",
+    "TOOL_ATOM_FLOW_GA_COMPUTE_MULTIPLIER": "1",
+    "TOOL_ATOM_FLOW_GA_MAX_SPEC_BUDGET": "32",
+    "TOOL_ATOM_FLOW_GA_MAX_JUDGE_CANDIDATES": "128",
+    "TOOL_ATOM_FLOW_GA_MATERIALIZED_JUDGE_QUEUE_LIMIT": "128",
+    "EVIDENCE_TOOL_GA_COMPUTE_MULTIPLIER": "1",
+    "EVIDENCE_TOOL_GA_MATERIALIZED_CANDIDATE_LIMIT": "32",
+    "EVIDENCE_TOOL_GA_MAX_LOCAL_GENERATIONS": "3",
+    "EVIDENCE_TOOL_GA_MIN_LOCAL_GENERATIONS": "1",
+    "EVIDENCE_TOOL_GA_PROOF_WORK_LIMIT": "128",
+    "COMPONENT_ATOM_PROMOTION_PROOF_WORK_MAX_ITEMS": "128",
+    "COMPONENT_ATOM_PROMOTION_GA_REFINED_SIGNAL_BATCH": "128"
+  },
+  "coverage": [
+    {
+      "original": "now_stamp",
+      "original_lines": [
+        408,
+        409
+      ],
+      "ported": "now_stamp",
+      "ported_lines": [
+        445,
+        446
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "resolve_root",
+      "original_lines": [
+        412,
+        413
+      ],
+      "ported": "resolve_root",
+      "ported_lines": [
+        449,
+        450
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "tool_lab_root",
+      "original_lines": [
+        416,
+        417
+      ],
+      "ported": "tool_lab_root",
+      "ported_lines": [
+        453,
+        454
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "runner_logs",
+      "original_lines": [
+        420,
+        423
+      ],
+      "ported": "runner_logs",
+      "ported_lines": [
+        457,
+        460
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "write_json",
+      "original_lines": [
+        426,
+        432
+      ],
+      "ported": "write_json",
+      "ported_lines": [
+        463,
+        469
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "write_json_archive",
+      "original_lines": [
+        435,
+        457
+      ],
+      "ported": "write_json_archive",
+      "ported_lines": [
+        472,
+        494
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_json",
+      "original_lines": [
+        460,
+        464
+      ],
+      "ported": "read_json",
+      "ported_lines": [
+        497,
+        501
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_jsonl",
+      "original_lines": [
+        467,
+        472
+      ],
+      "ported": "append_jsonl",
+      "ported_lines": [
+        504,
+        509
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_tail_lines",
+      "original_lines": [
+        475,
+        487
+      ],
+      "ported": "read_tail_lines",
+      "ported_lines": [
+        512,
+        524
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "parse_jsonl_tail",
+      "original_lines": [
+        490,
+        497
+      ],
+      "ported": "parse_jsonl_tail",
+      "ported_lines": [
+        527,
+        534
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_tool_index",
+      "original_lines": [
+        500,
+        581
+      ],
+      "ported": "summarize_tool_index",
+      "ported_lines": [
+        537,
+        618
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_recent_tool_events",
+      "original_lines": [
+        584,
+        658
+      ],
+      "ported": "summarize_recent_tool_events",
+      "ported_lines": [
+        621,
+        695
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_latest_matched_lift",
+      "original_lines": [
+        661,
+        720
+      ],
+      "ported": "summarize_latest_matched_lift",
+      "ported_lines": [
+        698,
+        757
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_ocean_progress",
+      "original_lines": [
+        723,
+        818
+      ],
+      "ported": "summarize_evidence_progress",
+      "ported_lines": [
+        760,
+        855
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_runner_and_research_state",
+      "original_lines": [
+        821,
+        839
+      ],
+      "ported": "summarize_runner_and_research_state",
+      "ported_lines": [
+        858,
+        876
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_search_power_spread",
+      "original_lines": [
+        842,
+        1122
+      ],
+      "ported": "summarize_search_power_spread",
+      "ported_lines": [
+        879,
+        1159
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_tool_atom_flow_ga_plan",
+      "original_lines": [
+        1125,
+        1557
+      ],
+      "ported": "build_tool_atom_flow_ga_plan",
+      "ported_lines": [
+        1162,
+        1594
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_tool_atom_flow_ga_log",
+      "original_lines": [
+        1560,
+        1630
+      ],
+      "ported": "append_tool_atom_flow_ga_log",
+      "ported_lines": [
+        1597,
+        1667
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "summarize_main_ga_candidate_flow",
+      "original_lines": [
+        1633,
+        1761
+      ],
+      "ported": "summarize_main_search_candidate_flow",
+      "ported_lines": [
+        1670,
+        1798
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_component_atom_promotion_ga_log",
+      "original_lines": [
+        1764,
+        1899
+      ],
+      "ported": "append_component_atom_promotion_ga_log",
+      "ported_lines": [
+        1801,
+        1936
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_component_atom_promotion_work_id",
+      "original_lines": [
+        1902,
+        1915
+      ],
+      "ported": "_component_atom_promotion_work_id",
+      "ported_lines": [
+        1939,
+        1952
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_component_atom_promotion_proof_work",
+      "original_lines": [
+        1918,
+        2118
+      ],
+      "ported": "build_component_atom_promotion_proof_work",
+      "ported_lines": [
+        1955,
+        2155
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_component_atom_promotion_proof_work_log",
+      "original_lines": [
+        2121,
+        2128
+      ],
+      "ported": "append_component_atom_promotion_proof_work_log",
+      "ported_lines": [
+        2158,
+        2165
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_atom_texts",
+      "original_lines": [
+        2131,
+        2166
+      ],
+      "ported": "_atom_texts",
+      "ported_lines": [
+        2168,
+        2203
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "ocean_tool_specialization_context",
+      "original_lines": [
+        2169,
+        2321
+      ],
+      "ported": "evidence_tool_specialization_context",
+      "ported_lines": [
+        2206,
+        2358
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_component_candidate_id",
+      "original_lines": [
+        2324,
+        2330
+      ],
+      "ported": "_component_candidate_id",
+      "ported_lines": [
+        2361,
+        2367
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_component_fast_local_loop_plan",
+      "original_lines": [
+        2333,
+        2372
+      ],
+      "ported": "_component_fast_local_loop_plan",
+      "ported_lines": [
+        2370,
+        2409
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_ocean_tool_ga_amplification",
+      "original_lines": [
+        2375,
+        2397
+      ],
+      "ported": "_evidence_tool_ga_amplification",
+      "ported_lines": [
+        2412,
+        2434
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_component_lane_quality",
+      "original_lines": [
+        2400,
+        2441
+      ],
+      "ported": "_component_lane_quality",
+      "ported_lines": [
+        2437,
+        2478
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_next_component_ga_local_loop",
+      "original_lines": [
+        2444,
+        2460
+      ],
+      "ported": "_next_component_ga_local_loop",
+      "ported_lines": [
+        2481,
+        2497
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_component_atom_promotion_gas",
+      "original_lines": [
+        2463,
+        2938
+      ],
+      "ported": "build_component_atom_promotion_gas",
+      "ported_lines": [
+        2500,
+        2975
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_continuous_section_shadow_lane_mixer",
+      "original_lines": [
+        2941,
+        3151
+      ],
+      "ported": "build_continuous_section_shadow_lane_mixer",
+      "ported_lines": [
+        2978,
+        3188
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_section_shadow_lane_mixer_log",
+      "original_lines": [
+        3154,
+        3216
+      ],
+      "ported": "append_section_shadow_lane_mixer_log",
+      "ported_lines": [
+        3191,
+        3253
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_tool_ticket",
+      "original_lines": [
+        3219,
+        3382
+      ],
+      "ported": "build_tool_ticket",
+      "ported_lines": [
+        3256,
+        3419
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "render_tool_prompt",
+      "original_lines": [
+        3385,
+        3439
+      ],
+      "ported": "render_tool_prompt",
+      "ported_lines": [
+        3422,
+        3476
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "copy_optional",
+      "original_lines": [
+        3442,
+        3453
+      ],
+      "ported": "copy_optional",
+      "ported_lines": [
+        3479,
+        3490
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "run_subprocess",
+      "original_lines": [
+        3456,
+        3487
+      ],
+      "ported": "run_subprocess",
+      "ported_lines": [
+        3493,
+        3494
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "sha256_file",
+      "original_lines": [
+        3490,
+        3500
+      ],
+      "ported": "sha256_file",
+      "ported_lines": [
+        3497,
+        3507
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "changed_promotable_files",
+      "original_lines": [
+        3503,
+        3512
+      ],
+      "ported": "changed_promotable_files",
+      "ported_lines": [
+        3510,
+        3519
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "compile_changed_files",
+      "original_lines": [
+        3515,
+        3522
+      ],
+      "ported": "compile_changed_files",
+      "ported_lines": [
+        3522,
+        3529
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_summary_ok",
+      "original_lines": [
+        3525,
+        3540
+      ],
+      "ported": "patch_summary_ok",
+      "ported_lines": [
+        3532,
+        3547
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "ensure_blocked_patch_summary",
+      "original_lines": [
+        3543,
+        3599
+      ],
+      "ported": "ensure_blocked_patch_summary",
+      "ported_lines": [
+        3550,
+        3606
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "progress_contract_prompt_hint",
+      "original_lines": [
+        3649,
+        3663
+      ],
+      "ported": "progress_contract_prompt_hint",
+      "ported_lines": [
+        3656,
+        3670
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_contract_mapping",
+      "original_lines": [
+        3666,
+        3667
+      ],
+      "ported": "_contract_mapping",
+      "ported_lines": [
+        3673,
+        3674
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_contract_strings",
+      "original_lines": [
+        3670,
+        3675
+      ],
+      "ported": "_contract_strings",
+      "ported_lines": [
+        3677,
+        3682
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_contract_float",
+      "original_lines": [
+        3678,
+        3682
+      ],
+      "ported": "_contract_float",
+      "ported_lines": [
+        3685,
+        3689
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_tool_progress_fragment",
+      "original_lines": [
+        3685,
+        3761
+      ],
+      "ported": "build_patch_garden_tool_progress_fragment",
+      "ported_lines": [
+        3692,
+        3768
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_contract_before_after_evidence",
+      "original_lines": [
+        3764,
+        3812
+      ],
+      "ported": "_contract_before_after_evidence",
+      "ported_lines": [
+        3771,
+        3819
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_ocean_tool_progress_contract",
+      "original_lines": [
+        3815,
+        3928
+      ],
+      "ported": "build_evidence_tool_progress_contract",
+      "ported_lines": [
+        3822,
+        3935
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_tool_matched_control_retry_contract",
+      "original_lines": [
+        3931,
+        3941
+      ],
+      "ported": "build_patch_garden_tool_matched_control_retry_contract",
+      "ported_lines": [
+        3938,
+        3948
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u163986_tool_matched_control_retry_contract",
+      "original_lines": [
+        3944,
+        3949
+      ],
+      "ported": "build_u163986_tool_matched_control_retry_contract",
+      "ported_lines": [
+        3951,
+        3956
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u19c81a_tool_matched_control_retry_contract",
+      "original_lines": [
+        3952,
+        3957
+      ],
+      "ported": "build_u19c81a_tool_matched_control_retry_contract",
+      "ported_lines": [
+        3959,
+        3964
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u45a8a6_tool_matched_control_retry_contract",
+      "original_lines": [
+        3960,
+        3965
+      ],
+      "ported": "build_u45a8a6_tool_matched_control_retry_contract",
+      "ported_lines": [
+        3967,
+        3972
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u9c41ac_tool_matched_control_retry_contract",
+      "original_lines": [
+        3968,
+        3973
+      ],
+      "ported": "build_u9c41ac_tool_matched_control_retry_contract",
+      "ported_lines": [
+        3975,
+        3980
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u591f7c_tool_matched_control_retry_contract",
+      "original_lines": [
+        3976,
+        3981
+      ],
+      "ported": "build_u591f7c_tool_matched_control_retry_contract",
+      "ported_lines": [
+        3983,
+        3988
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_bd6802_search_power_spread_retry_contract",
+      "original_lines": [
+        3984,
+        4004
+      ],
+      "ported": "build_bd6802_search_power_spread_retry_contract",
+      "ported_lines": [
+        3991,
+        4011
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u141053_search_power_spread_retry_contract",
+      "original_lines": [
+        4007,
+        4027
+      ],
+      "ported": "build_u141053_search_power_spread_retry_contract",
+      "ported_lines": [
+        4014,
+        4034
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_b758c1_search_power_spread_retry_contract",
+      "original_lines": [
+        4030,
+        4050
+      ],
+      "ported": "build_b758c1_search_power_spread_retry_contract",
+      "ported_lines": [
+        4037,
+        4057
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_btc_alpha_mechanism_retry_contract",
+      "original_lines": [
+        4053,
+        4073
+      ],
+      "ported": "build_patch_garden_repository_repair_mechanism_retry_contract",
+      "ported_lines": [
+        4060,
+        4080
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_b55003_btc_alpha_mechanism_retry_contract",
+      "original_lines": [
+        4076,
+        4081
+      ],
+      "ported": "build_b55003_repository_repair_mechanism_retry_contract",
+      "ported_lines": [
+        4083,
+        4088
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_d0eb2f_btc_alpha_mechanism_retry_contract",
+      "original_lines": [
+        4084,
+        4089
+      ],
+      "ported": "build_d0eb2f_repository_repair_mechanism_retry_contract",
+      "ported_lines": [
+        4091,
+        4096
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_f45089_btc_alpha_mechanism_retry_contract",
+      "original_lines": [
+        4092,
+        4097
+      ],
+      "ported": "build_f45089_repository_repair_mechanism_retry_contract",
+      "ported_lines": [
+        4099,
+        4104
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u1ffe8c_btc_alpha_mechanism_retry_contract",
+      "original_lines": [
+        4100,
+        4105
+      ],
+      "ported": "build_u1ffe8c_repository_repair_mechanism_retry_contract",
+      "ported_lines": [
+        4107,
+        4112
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_e912ae_retry_contract",
+      "original_lines": [
+        4108,
+        4113
+      ],
+      "ported": "build_patch_garden_e912ae_retry_contract",
+      "ported_lines": [
+        4115,
+        4120
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_u30ffa5_patch_garden_retry_contract",
+      "original_lines": [
+        4116,
+        4121
+      ],
+      "ported": "build_u30ffa5_patch_garden_retry_contract",
+      "ported_lines": [
+        4123,
+        4128
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_b5221c_ocean_tool_progress_retry_contract",
+      "original_lines": [
+        4124,
+        4144
+      ],
+      "ported": "build_b5221c_evidence_tool_progress_retry_contract",
+      "ported_lines": [
+        4131,
+        4151
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_c3d7f8_ocean_tool_progress_retry_contract",
+      "original_lines": [
+        4147,
+        4167
+      ],
+      "ported": "build_c3d7f8_evidence_tool_progress_retry_contract",
+      "ported_lines": [
+        4154,
+        4174
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "approval_axis_file_coverage",
+      "original_lines": [
+        4170,
+        4187
+      ],
+      "ported": "approval_axis_file_coverage",
+      "ported_lines": [
+        4177,
+        4194
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "ocean_tool_progress_contract_ok",
+      "original_lines": [
+        4190,
+        4241
+      ],
+      "ported": "evidence_tool_progress_contract_ok",
+      "ported_lines": [
+        4197,
+        4248
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_contract_repair_hook",
+      "original_lines": [
+        4244,
+        4271
+      ],
+      "ported": "patch_garden_contract_repair_hook",
+      "ported_lines": [
+        4251,
+        4278
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_retry_readiness",
+      "original_lines": [
+        4274,
+        4349
+      ],
+      "ported": "patch_garden_retry_readiness",
+      "ported_lines": [
+        4281,
+        4356
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_nursery_preservation_ok",
+      "original_lines": [
+        4352,
+        4372
+      ],
+      "ported": "hidden_replay_nursery_preservation_ok",
+      "ported_lines": [
+        4359,
+        4379
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "tool_brain_gate",
+      "original_lines": [
+        4375,
+        4428
+      ],
+      "ported": "tool_brain_gate",
+      "ported_lines": [
+        4382,
+        4435
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "v10_tool_lab_promotion_gate",
+      "original_lines": [
+        4431,
+        4451
+      ],
+      "ported": "v10_tool_lab_promotion_gate",
+      "ported_lines": [
+        4438,
+        4439
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "promote_tool_brain_winner",
+      "original_lines": [
+        4454,
+        4493
+      ],
+      "ported": "promote_tool_brain_winner",
+      "ported_lines": [
+        4442,
+        4443
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "patch_garden_dir",
+      "original_lines": [
+        4496,
+        4499
+      ],
+      "ported": "patch_garden_dir",
+      "ported_lines": [
+        4446,
+        4449
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_patch_garden",
+      "original_lines": [
+        4502,
+        4511
+      ],
+      "ported": "read_patch_garden",
+      "ported_lines": [
+        4452,
+        4461
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_card_id",
+      "original_lines": [
+        4514,
+        4526
+      ],
+      "ported": "patch_garden_card_id",
+      "ported_lines": [
+        4464,
+        4476
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_request_id",
+      "original_lines": [
+        4529,
+        4540
+      ],
+      "ported": "hidden_replay_request_id",
+      "ported_lines": [
+        4479,
+        4490
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "reasons_require_hidden_replay",
+      "original_lines": [
+        4543,
+        4550
+      ],
+      "ported": "reasons_require_hidden_replay",
+      "ported_lines": [
+        4493,
+        4500
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "card_requires_hidden_replay",
+      "original_lines": [
+        4553,
+        4555
+      ],
+      "ported": "card_requires_hidden_replay",
+      "ported_lines": [
+        4503,
+        4505
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_card_has_missing_retry_summary",
+      "original_lines": [
+        4558,
+        4572
+      ],
+      "ported": "patch_garden_card_has_missing_retry_summary",
+      "ported_lines": [
+        4508,
+        4522
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_card_repair_triage",
+      "original_lines": [
+        4575,
+        4622
+      ],
+      "ported": "patch_garden_card_repair_triage",
+      "ported_lines": [
+        4525,
+        4572
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_hidden_replay_requests",
+      "original_lines": [
+        4625,
+        4635
+      ],
+      "ported": "read_hidden_replay_requests",
+      "ported_lines": [
+        4575,
+        4585
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_hidden_replay_results",
+      "original_lines": [
+        4638,
+        4662
+      ],
+      "ported": "read_hidden_replay_results",
+      "ported_lines": [
+        4588,
+        4612
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_hidden_replay_attempts",
+      "original_lines": [
+        4665,
+        4675
+      ],
+      "ported": "read_hidden_replay_attempts",
+      "ported_lines": [
+        4615,
+        4625
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "latest_hidden_replay_attempt_for_patch",
+      "original_lines": [
+        4678,
+        4694
+      ],
+      "ported": "latest_hidden_replay_attempt_for_patch",
+      "ported_lines": [
+        4628,
+        4644
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "write_hidden_replay_nursery_status",
+      "original_lines": [
+        4697,
+        4715
+      ],
+      "ported": "write_hidden_replay_nursery_status",
+      "ported_lines": [
+        4647,
+        4665
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_context_clean",
+      "original_lines": [
+        4718,
+        4729
+      ],
+      "ported": "hidden_replay_context_clean",
+      "ported_lines": [
+        4668,
+        4679
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_artifact_bundle_dir",
+      "original_lines": [
+        4732,
+        4737
+      ],
+      "ported": "hidden_replay_artifact_bundle_dir",
+      "ported_lines": [
+        4682,
+        4687
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_variant_candidates",
+      "original_lines": [
+        4740,
+        4770
+      ],
+      "ported": "hidden_replay_variant_candidates",
+      "ported_lines": [
+        4690,
+        4720
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_variant_dir",
+      "original_lines": [
+        4773,
+        4788
+      ],
+      "ported": "hidden_replay_variant_dir",
+      "ported_lines": [
+        4723,
+        4738
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "preserve_hidden_replay_variant_artifact",
+      "original_lines": [
+        4791,
+        4857
+      ],
+      "ported": "preserve_hidden_replay_variant_artifact",
+      "ported_lines": [
+        4741,
+        4807
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_median",
+      "original_lines": [
+        4860,
+        4867
+      ],
+      "ported": "hidden_replay_median",
+      "ported_lines": [
+        4810,
+        4817
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "write_hidden_replay_result",
+      "original_lines": [
+        4870,
+        4889
+      ],
+      "ported": "write_hidden_replay_result",
+      "ported_lines": [
+        4820,
+        4839
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "is_surgery_hidden_replay_request",
+      "original_lines": [
+        4892,
+        4897
+      ],
+      "ported": "is_surgery_hidden_replay_request",
+      "ported_lines": [
+        4842,
+        4847
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "surgery_hidden_replay_gate",
+      "original_lines": [
+        4900,
+        4943
+      ],
+      "ported": "surgery_hidden_replay_gate",
+      "ported_lines": [
+        4850,
+        4893
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "run_hidden_replay_request",
+      "original_lines": [
+        4946,
+        5069
+      ],
+      "ported": "run_hidden_replay_request",
+      "ported_lines": [
+        4896,
+        4897
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "pending_hidden_replay_requests",
+      "original_lines": [
+        5072,
+        5122
+      ],
+      "ported": "pending_hidden_replay_requests",
+      "ported_lines": [
+        4900,
+        4950
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "process_hidden_replay_requests",
+      "original_lines": [
+        5125,
+        5144
+      ],
+      "ported": "process_hidden_replay_requests",
+      "ported_lines": [
+        4953,
+        4972
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "hidden_replay_result_for_patch",
+      "original_lines": [
+        5147,
+        5172
+      ],
+      "ported": "hidden_replay_result_for_patch",
+      "ported_lines": [
+        4975,
+        5000
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "write_hidden_replay_request",
+      "original_lines": [
+        5175,
+        5226
+      ],
+      "ported": "write_hidden_replay_request",
+      "ported_lines": [
+        5003,
+        5054
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "ensure_hidden_replay_requests_for_pending_attempts",
+      "original_lines": [
+        5229,
+        5251
+      ],
+      "ported": "ensure_hidden_replay_requests_for_pending_attempts",
+      "ported_lines": [
+        5057,
+        5079
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_patch_garden_attempts",
+      "original_lines": [
+        5254,
+        5264
+      ],
+      "ported": "read_patch_garden_attempts",
+      "ported_lines": [
+        5082,
+        5092
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_attempt_summary",
+      "original_lines": [
+        5267,
+        5291
+      ],
+      "ported": "patch_garden_attempt_summary",
+      "ported_lines": [
+        5095,
+        5119
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "active_patch_garden_cards",
+      "original_lines": [
+        5294,
+        5358
+      ],
+      "ported": "active_patch_garden_cards",
+      "ported_lines": [
+        5122,
+        5186
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_repair_theory",
+      "original_lines": [
+        5361,
+        5377
+      ],
+      "ported": "build_patch_garden_repair_theory",
+      "ported_lines": [
+        5189,
+        5205
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_nurse_plan",
+      "original_lines": [
+        5380,
+        5469
+      ],
+      "ported": "build_patch_garden_nurse_plan",
+      "ported_lines": [
+        5208,
+        5297
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_patch_garden_attempt",
+      "original_lines": [
+        5472,
+        5517
+      ],
+      "ported": "append_patch_garden_attempt",
+      "ported_lines": [
+        5300,
+        5345
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "process_hidden_replay_ready_promotions",
+      "original_lines": [
+        5520,
+        5588
+      ],
+      "ported": "process_hidden_replay_ready_promotions",
+      "ported_lines": [
+        5348,
+        5416
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_next_actions",
+      "original_lines": [
+        5591,
+        5620
+      ],
+      "ported": "patch_garden_next_actions",
+      "ported_lines": [
+        5419,
+        5448
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_patch_garden_card",
+      "original_lines": [
+        5623,
+        5672
+      ],
+      "ported": "build_patch_garden_card",
+      "ported_lines": [
+        5451,
+        5500
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "should_keep_patch_garden_card",
+      "original_lines": [
+        5675,
+        5691
+      ],
+      "ported": "should_keep_patch_garden_card",
+      "ported_lines": [
+        5503,
+        5519
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "should_write_new_patch_garden_card",
+      "original_lines": [
+        5694,
+        5697
+      ],
+      "ported": "should_write_new_patch_garden_card",
+      "ported_lines": [
+        5522,
+        5525
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "append_patch_garden_card",
+      "original_lines": [
+        5700,
+        5711
+      ],
+      "ported": "append_patch_garden_card",
+      "ported_lines": [
+        5528,
+        5539
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_tool_memory",
+      "original_lines": [
+        5714,
+        5722
+      ],
+      "ported": "read_tool_memory",
+      "ported_lines": [
+        5542,
+        5550
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "count_tool_memory",
+      "original_lines": [
+        5725,
+        5733
+      ],
+      "ported": "count_tool_memory",
+      "ported_lines": [
+        5553,
+        5561
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "_theory_by_id",
+      "original_lines": [
+        5736,
+        5737
+      ],
+      "ported": "_theory_by_id",
+      "ported_lines": [
+        5564,
+        5565
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "forced_progress_theories",
+      "original_lines": [
+        5740,
+        5792
+      ],
+      "ported": "forced_progress_theories",
+      "ported_lines": [
+        5568,
+        5620
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "select_theories",
+      "original_lines": [
+        5795,
+        5817
+      ],
+      "ported": "select_theories",
+      "ported_lines": [
+        5623,
+        5645
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "select_cycle_theories",
+      "original_lines": [
+        5820,
+        5832
+      ],
+      "ported": "select_cycle_theories",
+      "ported_lines": [
+        5648,
+        5660
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "lab_team_worker_count",
+      "original_lines": [
+        5835,
+        5849
+      ],
+      "ported": "lab_team_worker_count",
+      "ported_lines": [
+        5663,
+        5677
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "build_lane_failure",
+      "original_lines": [
+        5852,
+        5874
+      ],
+      "ported": "build_lane_failure",
+      "ported_lines": [
+        5680,
+        5702
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "run_lab_team_lane",
+      "original_lines": [
+        5877,
+        5944
+      ],
+      "ported": "run_lab_team_lane",
+      "ported_lines": [
+        5705,
+        5772
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "run_lab_team_variants",
+      "original_lines": [
+        5947,
+        5973
+      ],
+      "ported": "run_lab_team_variants",
+      "ported_lines": [
+        5775,
+        5801
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "run_disk_guard",
+      "original_lines": [
+        5976,
+        5984
+      ],
+      "ported": "run_disk_guard",
+      "ported_lines": [
+        5804,
+        5805
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "ensure_dirs",
+      "original_lines": [
+        5987,
+        5991
+      ],
+      "ported": "ensure_dirs",
+      "ported_lines": [
+        5808,
+        5812
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "dir_size_bytes",
+      "original_lines": [
+        5994,
+        6005
+      ],
+      "ported": "dir_size_bytes",
+      "ported_lines": [
+        5815,
+        5826
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "is_safe_child",
+      "original_lines": [
+        6008,
+        6014
+      ],
+      "ported": "is_safe_child",
+      "ported_lines": [
+        5829,
+        5835
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "prune_old_tool_lab_runs",
+      "original_lines": [
+        6017,
+        6053
+      ],
+      "ported": "prune_old_tool_lab_runs",
+      "ported_lines": [
+        5838,
+        5839
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "prune_old_tool_lab_tickets",
+      "original_lines": [
+        6056,
+        6107
+      ],
+      "ported": "prune_old_tool_lab_tickets",
+      "ported_lines": [
+        5842,
+        5843
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "run_codex_exec",
+      "original_lines": [
+        6110,
+        6129
+      ],
+      "ported": "run_codex_exec",
+      "ported_lines": [
+        5846,
+        5847
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "judge_with_lab_os",
+      "original_lines": [
+        6132,
+        6148
+      ],
+      "ported": "judge_with_lab_os",
+      "ported_lines": [
+        5850,
+        5851
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "create_variant",
+      "original_lines": [
+        6151,
+        6172
+      ],
+      "ported": "create_variant",
+      "ported_lines": [
+        5854,
+        5855
+      ],
+      "treatment": "hub_host_adapter",
+      "status": "requires_commissioned_adapter"
+    },
+    {
+      "original": "run_cycle",
+      "original_lines": [
+        6175,
+        6352
+      ],
+      "ported": "run_cycle",
+      "ported_lines": [
+        5858,
+        6038
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "status_path",
+      "original_lines": [
+        6355,
+        6356
+      ],
+      "ported": "status_path",
+      "ported_lines": [
+        6041,
+        6042
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "write_status",
+      "original_lines": [
+        6359,
+        6369
+      ],
+      "ported": "write_status",
+      "ported_lines": [
+        6045,
+        6055
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "read_status",
+      "original_lines": [
+        6372,
+        6373
+      ],
+      "ported": "read_status",
+      "ported_lines": [
+        6058,
+        6059
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "stop_requested",
+      "original_lines": [
+        6376,
+        6378
+      ],
+      "ported": "stop_requested",
+      "ported_lines": [
+        6062,
+        6064
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "patch_garden_sleep_interval",
+      "original_lines": [
+        6381,
+        6390
+      ],
+      "ported": "patch_garden_sleep_interval",
+      "ported_lines": [
+        6067,
+        6076
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "loop_forever",
+      "original_lines": [
+        6393,
+        6423
+      ],
+      "ported": "loop_forever",
+      "ported_lines": [
+        6079,
+        6111
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "run_self_check",
+      "original_lines": [
+        6426,
+        9313
+      ],
+      "ported": "run_self_check",
+      "ported_lines": [
+        6114,
+        9001
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    },
+    {
+      "original": "main",
+      "original_lines": [
+        9316,
+        9344
+      ],
+      "ported": "main",
+      "ported_lines": [
+        9004,
+        9032
+      ],
+      "treatment": "translated_implementation",
+      "status": "source_ported_runtime_verification_partial"
+    }
+  ],
+  "source_executed": false,
+  "full_legacy_self_check_passed": false,
+  "cloud_deployed": false
+}

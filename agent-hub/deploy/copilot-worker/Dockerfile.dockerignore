@@ -1,0 +1,8 @@
+**
+!agent_hub/
+!agent_hub/*.py
+!deploy/
+!deploy/copilot-worker/
+!deploy/copilot-worker/build_native.py
+!deploy/copilot-worker/entrypoint.py
+!deploy/copilot-worker/requirements.toml
