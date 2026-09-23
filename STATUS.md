@@ -72,6 +72,7 @@ Findings, agreed across Alpha and Light:
 | --- | --- | --- | --- |
 | Alpha | WIN-R7K3M9X2P6N | git with GitHub credential (fetch and push verified on both repos), this checkout, `C:\API_KEYS` pack, Python 3.12 at `AppData\Local\Programs\Python\Python312` | gcloud, hub manager token (lookup blocked as credential exploration) |
 | Light | WIN-L8Q2M6V9R4K | gcloud (project visible; `run jobs executions list` works), GitHub read on both repos | `logging read` (user denied), Firestore document read (classifier denied), runcrew checkout, verified push |
-| Demand / Retina | WIN-4RR6E8E6DGC (one box) | Cursor worker directories only | gcloud, any checkout, hub URL or token, GitHub credential |
+| Retina | (separate session; host not reported) | gcloud 580 signed in with the hub project active; read Firestore `agent_hub_rooms` (database `runcrew-hub`) and Cloud Logging `runcrew_live_result` records | any checkout, room creation (its user declined) |
+| Demand | WIN-4RR6E8E6DGC | Cursor worker directories only | gcloud, any checkout, hub URL or token, GitHub credential |
 
-No machine can create a hub room; that requires the manager token, so a live five-agent test has to start from the operator's ChatGPT connector. Cursor's split that assigned Firestore reads to Retina does not match that box.
+No machine created a hub room (Alpha cannot look up the manager token; Retina's user declined), so a live five-agent test has to start from the operator's ChatGPT connector. Retina then re-reads the new document for `purpose` and Light lists the five job executions.
