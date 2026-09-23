@@ -295,21 +295,36 @@ class Worker:
             self.last_exit = 0
             return outcome
         except Exception as error:
-            self.last_exit = 1
             # LiveError and provider adapters raise fixed vetted codes; the
             # boundary re-checks every one of them because the code reaches
             # the room. Any other exception is native output and stays generic.
             # A provider's own model_call_attempted attribute is not consulted:
             # the loop's flag is set before execute and is the conservative one.
             code = provider_errors.error_code(error) or 'native_or_connection_failure'
-            outcome.update(error_code=code, model_call_attempted=self.model_call_attempted,
-                           claim_attempted=self.claim_attempted)
+            # Copilot can drop a warm native session while this process is
+            # idle, between maintain() calls, before a task exists. No prompt
+            # was sent. A clean credential release is the same end state as
+            # the warm window elapsing. A claimed task, a model call, or a
+            # failed release stays a failure.
+            idle_session_lost = (code == 'copilot_warm_session_lost'
+                                 and self.task is None and not self.model_call_attempted)
             if self.handle is not None and not self.cleaned:
                 try:
                     self.adapter.close(self.handle)
                     self.cleaned = True
                 except Exception:
-                    outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed')
+                    self.last_exit = 1
+                    outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed',
+                                   model_call_attempted=self.model_call_attempted,
+                                   claim_attempted=self.claim_attempted)
+                    return outcome
+            if idle_session_lost and self.cleaned:
+                outcome.update(outcome='idle_drained', model_call_attempted=False)
+                self.last_exit = 0
+                return outcome
+            self.last_exit = 1
+            outcome.update(error_code=code, model_call_attempted=self.model_call_attempted,
+                           claim_attempted=self.claim_attempted)
             if self.completion_payload is not None:
                 outcome['completion_delivery'] = 'unconfirmed'
             elif self.cleaned and self.task and isinstance(self.task, dict) and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', '')):

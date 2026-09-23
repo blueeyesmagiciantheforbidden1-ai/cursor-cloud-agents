@@ -24,6 +24,13 @@ from uuid import uuid4
 import provider_errors
 
 MODEL, EFFORT = 'kimi-k3', 'max'
+# The prepare() argument is only the startup budget. The live loop then waits
+# up to an hour. This cap does not slide; maintain() must not push it forward.
+WARM_SECONDS = 3600
+# Idle maintain() failures that are not "the warm session is gone". These keep
+# their own codes so a clean idle drain cannot hide them.
+IDLE_MAINTAIN_FAILURES = frozenset((
+    'copilot_tools_forbidden', 'copilot_unexpected_pre_prompt_activity', 'copilot_hub_heartbeat_lost'))
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 EXPECTED_LOGIN = 'blueeyesmagiciantheforbidden1-ai'
 NATIVE = '/opt/runcrew/copilot/copilot'
@@ -547,6 +554,10 @@ def prepare(session, heartbeat, deadline):
         need(not handle.native.events, 'copilot_unexpected_pre_prompt_activity')
         handle.sid = sid
         need(heartbeat() is True, 'copilot_hub_heartbeat_lost')
+        # Startup budget ends here. An idle session is allowed to live until
+        # the fixed warm cap; the CLI, not this deadline, is what drops it.
+        handle.idle_deadline = time.monotonic() + WARM_SECONDS
+        handle.native.deadline = handle.idle_deadline
         return handle
     except Exception as error:
         try:
@@ -559,14 +570,25 @@ def prepare(session, heartbeat, deadline):
 
 
 def maintain(handle):
+    """Renew an idle session. Loss of that session is copilot_warm_session_lost.
+
+    The live loop sleeps between calls. The Copilot CLI can destroy a native
+    session that has never received a prompt during that gap (its stale-session
+    cleanup fires after about 35 minutes of idle). The next maintain() sees the
+    process gone. Tool use, pre-prompt model output, and a lost hub heartbeat
+    keep their own codes.
+    """
     need(not handle.finished and not handle.attempted and not handle.close_failed and handle.native is not None,
          'copilot_handle_not_idle')
     try:
         need(time.monotonic() < handle.idle_deadline, 'copilot_idle_deadline_expired')
         handle.native.maintain()
         return handle.readiness
-    except Exception:
+    except Exception as error:
+        code = provider_errors.error_code(error)
         close(handle)
+        if code in IDLE_MAINTAIN_FAILURES:
+            raise
         raise CopilotError('copilot_warm_session_lost') from None
 
 

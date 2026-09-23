@@ -43,6 +43,7 @@ class FakeNative:
         self.catalog = catalog()
         self.answer = answer_events()
         self.fail_send = self.fail_stop = self.fail_maintain = False
+        self.fail_maintain_code = None
         self.late = []
         self.instances.append(self)
 
@@ -69,6 +70,7 @@ class FakeNative:
 
     def maintain(self):
         if self.fail_maintain: raise c.CopilotError('copilot_native_deadline_expired')
+        if self.fail_maintain_code: raise c.CopilotError(self.fail_maintain_code)
         if self.process.poll() is not None: raise c.CopilotError('copilot_warm_process_ended')
 
     def next_event(self): return self.events.pop(0)
@@ -201,6 +203,43 @@ class Lifecycle(unittest.TestCase):
         with self.assertRaisesRegex(c.CopilotError, 'warm_session_lost'): c.maintain(handle)
         self.assertTrue(handle.finished)
         self.assertNotIn('session.send', [x[0] for x in native.calls])
+
+    def test_startup_budget_is_not_the_idle_cap(self):
+        before = time.monotonic()
+        handle = c.prepare(self.session, self.heartbeat, before + 45)
+        self.assertGreaterEqual(handle.idle_deadline, before + c.WARM_SECONDS)
+        self.assertLess(handle.idle_deadline, before + c.WARM_SECONDS + 30)
+        self.assertEqual(handle.native.deadline, handle.idle_deadline)
+        c.maintain(handle)
+        self.assertEqual(handle.native.deadline, handle.idle_deadline)
+        c.close(handle)
+
+    def test_idle_process_exit_is_warm_session_lost_without_a_prompt(self):
+        handle = self.prepare(); native = handle.native
+        native.native_stopped = True
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_warm_session_lost$'): c.maintain(handle)
+        self.assertTrue(handle.finished)
+        self.assertNotIn('session.send', [x[0] for x in native.calls])
+        self.assertEqual(self.session.finish.call_count, 1)
+
+    def test_idle_safety_failures_are_not_relabeled_as_session_loss(self):
+        for code in sorted(c.IDLE_MAINTAIN_FAILURES):
+            with self.subTest(code=code):
+                self.session.state = 'active'
+                handle = self.prepare(); native = handle.native
+                native.fail_maintain_code = code
+                with self.assertRaisesRegex(c.CopilotError, '^' + code + '$'): c.maintain(handle)
+                self.assertTrue(handle.finished)
+                self.assertNotIn('session.send', [x[0] for x in native.calls])
+
+    def test_opaque_idle_failure_stays_a_fixed_session_lost_code(self):
+        handle = self.prepare(); native = handle.native
+        def boom(): raise RuntimeError('private native path must not escape')
+        native.maintain = boom
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_warm_session_lost$') as caught:
+            c.maintain(handle)
+        self.assertNotIn('private', str(caught.exception))
+        self.assertTrue(handle.finished)
 
     def test_idle_deadline_does_not_slide(self):
         handle = self.prepare(); original = handle.idle_deadline
