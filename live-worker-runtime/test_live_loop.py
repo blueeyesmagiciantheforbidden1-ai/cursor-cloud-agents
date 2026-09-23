@@ -1,16 +1,71 @@
+import ast
 import copy
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
 from live_loop import Worker, Settings, LiveError, task_prompt
-from provider_errors import ProviderCodeError
+from provider_errors import ProviderCodeError, error_code
 
 
 ROOM = 'a' * 32
+PROVIDERS = Path(__file__).resolve().parent / 'providers'
+BUILTIN_EXCEPTIONS = {'BaseException', 'Exception', 'RuntimeError', 'ValueError', 'OSError',
+                      'KeyError', 'TypeError', 'LookupError', 'ArithmeticError'}
 
 
 class CodeError(ProviderCodeError, RuntimeError):
     """Stands in for a provider adapter's fixed-code error class."""
+
+
+def exception_classes(path):
+    """{class name: base names} for every exception class defined at module level."""
+    found = {}
+    for node in ast.parse(path.read_text(encoding='utf-8')).body:
+        if isinstance(node, ast.ClassDef):
+            bases = [b.attr if isinstance(b, ast.Attribute) else getattr(b, 'id', None) for b in node.bases]
+            if any(base in BUILTIN_EXCEPTIONS or base in found for base in bases):
+                found[node.name] = bases
+    return found
+
+
+class ProviderErrorTests(unittest.TestCase):
+    """Guards the invariant behind provider_errors, not just today's providers.
+
+    Lives here because the image builds run this file. Provider modules need
+    image-only dependencies, so the enumeration is static.
+    """
+    def test_every_provider_exception_opts_into_the_marker(self):
+        # A new provider that forgets the marker would have its codes flattened
+        # to native_or_connection_failure again; this names the class instead.
+        seen = 0
+        for path in sorted(PROVIDERS.glob('*.py')):
+            classes = exception_classes(path)
+            for name, bases in classes.items():
+                if any(base in classes for base in bases):
+                    continue  # inherits from a checked class in the same module
+                seen += 1
+                self.assertIn('ProviderCodeError', bases,
+                              path.name + ':' + name + ' must inherit provider_errors.ProviderCodeError')
+        self.assertGreaterEqual(seen, 5)
+
+    def test_marker_keeps_original_base_and_handlers(self):
+        class Value(ProviderCodeError, ValueError): pass
+        self.assertIsInstance(CodeError('code'), RuntimeError)
+        self.assertIsInstance(Value('code'), ValueError)
+        self.assertNotIsInstance(CodeError('code'), ValueError)
+        self.assertIsInstance(LiveError('code'), RuntimeError)
+        self.assertEqual(error_code(CodeError('grok_period_shape')), 'grok_period_shape')
+        self.assertEqual(error_code(LiveError('task_lease_lost')), 'task_lease_lost')
+
+    def test_only_fixed_codes_cross_the_boundary(self):
+        for text in ('codex_failed\n/home/worker/.codex/auth.json', 'Bad', 'x' * 101, '', '1abc', 'a-b'):
+            with self.subTest(text=text):
+                self.assertIsNone(error_code(CodeError(text)))
+                self.assertIsNone(error_code(LiveError(text)))
+        self.assertEqual(error_code(CodeError('a' * 100)), 'a' * 100)
+        self.assertIsNone(error_code(RuntimeError('task_deadline_out_of_bounds')))
+        self.assertIsNone(error_code(ValueError('native_not_running')))
 
 
 class Clock:

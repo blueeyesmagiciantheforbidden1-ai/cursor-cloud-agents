@@ -15,8 +15,8 @@ import time
 import provider_errors
 
 
-class LiveError(RuntimeError):
-    pass
+class LiveError(provider_errors.ProviderCodeError, RuntimeError):
+    """Fixed codes only; the text reaches the room's failure message."""
 
 
 def require(value, code):
@@ -204,12 +204,12 @@ class Worker:
             return outcome
         except Exception as error:
             self.last_exit = 1
-            # Provider adapters raise fixed vetted codes (provider_errors);
-            # any other exception is native output and stays generic. A
-            # provider's own model_call_attempted attribute is not consulted:
+            # LiveError and provider adapters raise fixed vetted codes; the
+            # boundary re-checks every one of them because the code reaches
+            # the room. Any other exception is native output and stays generic.
+            # A provider's own model_call_attempted attribute is not consulted:
             # the loop's flag is set before execute and is the conservative one.
-            code = (str(error) if isinstance(error, LiveError)
-                    else provider_errors.error_code(error) or 'native_or_connection_failure')
+            code = provider_errors.error_code(error) or 'native_or_connection_failure'
             outcome.update(error_code=code, model_call_attempted=self.model_call_attempted,
                            claim_attempted=self.claim_attempted)
             if self.handle is not None and not self.cleaned:
