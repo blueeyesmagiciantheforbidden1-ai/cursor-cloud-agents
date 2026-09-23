@@ -1,0 +1,15 @@
+# Package-only context. Reuse the exact successfully built native image; no
+# native download, --version, schema generation, login or inference runs here.
+ARG CODEX_BASE
+FROM ${CODEX_BASE}
+ARG CODEX_BASE
+USER root
+WORKDIR /opt/runcrew/codex-package
+COPY heartbeat.py package_status.py test_heartbeat.py ./
+RUN python -c "import re,sys; assert re.fullmatch(r'[a-zA-Z0-9./:_-]+@sha256:010a8a97cf7771f132b694bf04aaaa67ee3df1ab6b5718e1b07748292581b26e',sys.argv[1]), 'reviewed prior Codex image required'" "${CODEX_BASE}"
+RUN python -m unittest discover -s . -p test_heartbeat.py -v
+RUN chmod 0555 heartbeat.py package_status.py && chmod 0444 test_heartbeat.py && install -d -o 10001 -g 10001 -m 0700 /home/worker
+ENV HOME=/home/worker PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+USER 10001:10001
+WORKDIR /workspace/default
+ENTRYPOINT ["python", "/opt/runcrew/codex-package/package_status.py"]

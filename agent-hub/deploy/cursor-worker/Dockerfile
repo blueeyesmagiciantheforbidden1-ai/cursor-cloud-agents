@@ -1,0 +1,23 @@
+# Source-root build context. This recipe has not yet been built or deployed.
+FROM python:3.12-slim-bookworm AS release
+COPY deploy/cursor-worker/prepare_release.py deploy/cursor-worker/build_native.py /build/
+COPY deploy/cursor-worker/provenance/release.json /build/release.json
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    && python -B /build/build_native.py --release /build/release.json --output /verified
+
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 bash git \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 worker \
+    && useradd --uid 10001 --gid worker --no-create-home --shell /usr/sbin/nologin worker \
+    && install -d -o worker -g worker -m 0700 /home/worker /home/worker/.cursor /workspace/default \
+    && install -d -o root -g root -m 0755 /opt/runcrew/app/agent_hub /run/config
+COPY --from=release --chown=root:root /verified/ /opt/runcrew/cursor/
+COPY --chown=root:root agent_hub/*.py /opt/runcrew/app/agent_hub/
+COPY --chown=root:root deploy/cursor-worker/entrypoint.py deploy/cursor-worker/metadata.py /opt/runcrew/
+RUN chmod -R go-w /opt/runcrew
+ENV HOME=/home/worker PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 TMPDIR=/tmp
+WORKDIR /workspace/default
+USER 10001:10001
+RUN python -I -B /opt/runcrew/entrypoint.py --check
+ENTRYPOINT ["python", "-I", "-B", "/opt/runcrew/entrypoint.py"]

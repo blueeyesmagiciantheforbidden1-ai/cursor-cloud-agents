@@ -1,0 +1,8 @@
+**
+!agent_hub/
+!agent_hub/*.py
+!deploy/
+!deploy/grok-worker/
+!deploy/grok-worker/build_native.py
+!deploy/grok-worker/entrypoint.py
+!deploy/grok-worker/requirements.toml
