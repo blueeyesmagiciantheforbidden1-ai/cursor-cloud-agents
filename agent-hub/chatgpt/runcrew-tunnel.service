@@ -1,0 +1,26 @@
+[Unit]
+# Optional reference for an explicitly configured cloud tunnel host.
+# This package does not install or enable an always-running service.
+Description=RunCrew private ChatGPT MCP tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=runcrew
+Group=runcrew
+WorkingDirectory=/opt/runcrew-hub
+Environment=HOME=/var/lib/runcrew
+EnvironmentFile=/etc/runcrew/tunnel.env
+ExecStart=/usr/local/bin/tunnel-client run --profile runcrew-hub
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/runcrew
+
+[Install]
+WantedBy=multi-user.target
