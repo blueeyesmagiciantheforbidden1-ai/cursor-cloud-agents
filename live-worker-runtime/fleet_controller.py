@@ -194,20 +194,26 @@ class Controller:
             raise ControllerError('unknown_controller_state')
         return {'status': state['phase'], 'generation': state['generation']}
 
-    def reset(self):
-        """Operator unblock of a stopped slot; launches nothing.
+    STOPPED = ('blocked', 'binding_intent', 'binding_ready', 'launch_intent', 'launch_submitted', 'grant_intent')
 
-        A slot blocked by a failed or unverifiable execution returns to idle
-        only when the same facts a launch requires already hold: the job's
-        latest execution is terminal and its credential was cleanly released.
-        The tick that follows performs the replacement with a fresh grant.
+    def reset(self):
+        """Operator reconciliation of a stopped slot; launches nothing.
+
+        A slot blocked by a failed or unverifiable execution, or left in an
+        intent phase by a mutation whose reply was lost or refused (tick never
+        replays an intent), returns to idle only when the same facts a launch
+        requires already hold: the job's latest execution is terminal and its
+        credential was cleanly released. A slot with a live execution is
+        refused. The tick that follows performs the replacement with a fresh
+        grant and a fresh binding; a stale binding expires on its own.
         """
         state, version = self.store.read()
         require(state is not None and state.get('config_sha256') == self.config_sha, 'controller_config_changed')
-        require(state.get('phase') == 'blocked', 'slot_not_blocked')
+        require(state.get('phase') in self.STOPPED, 'slot_not_stopped')
+        phase = state['phase']
         previous = self.current_terminal(self.job())
         state_error = state.get('error')
         cleared = {key: value for key, value in state.items() if key != 'error'}
         state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'])
         cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
-        return {'status': 'idle', 'cleared': cleared_code, 'generation': state['generation']}
+        return {'status': 'idle', 'cleared': cleared_code, 'from_phase': phase, 'generation': state['generation']}

@@ -138,6 +138,11 @@ class Runtime:
                     code = str(error)
                     result[name] = {'status': 'controller_attention_required',
                                     'reason': code if SAFE_CODE.fullmatch(code) else 'unrecorded'}
+                except base.BrokerError as error:
+                    # Broker and grant-store refusals carry fixed codes too.
+                    code = str(error)
+                    result[name] = {'status': 'controller_attention_required', 'exception': type(error).__name__,
+                                    'reason': code if SAFE_CODE.fullmatch(code) else 'unrecorded'}
                 except Exception as error:
                     # No raw exception, execution environment, grant, token or
                     # provider credential is ever returned or logged.
@@ -162,6 +167,10 @@ class Runtime:
             except ControllerError as error:
                 # Fixed codes only; the operator needs to know why a reset was refused.
                 result = {'status': 'reset_refused', 'reason': str(error)}
+            except base.BrokerError as error:
+                code = str(error)
+                result = {'status': 'reset_refused', 'exception': type(error).__name__,
+                          'reason': code if SAFE_CODE.fullmatch(code) else 'unrecorded'}
             except Exception as error:
                 result = {'status': 'controller_attention_required', 'exception': type(error).__name__}
             print(json.dumps({'kind': 'runcrew_fleet_reset', 'slot': slot, 'result': result}), flush=True)

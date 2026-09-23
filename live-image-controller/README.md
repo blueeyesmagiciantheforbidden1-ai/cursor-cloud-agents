@@ -17,4 +17,4 @@ Deploy as a new revision of the service `runcrew-live-fleet`, keeping every exis
 
 Do not set `RUNCREW_RESET_ENABLED` unless an operator is about to call `POST /reset`; remove it afterwards. Never print the service's environment values.
 
-What this revision adds over `live-20260922c`: `runcrew_fleet_tick` records carry the controller's refusal code (`reason`) instead of a bare `controller_attention_required`; `POST /reset` exists behind the flag. See `STATUS.md`.
+What this revision adds over `live-20260922c`: `runcrew_fleet_tick` records carry the controller's refusal code (`reason`) instead of a bare `controller_attention_required`; `POST /reset` exists behind the flag and reconciles a slot that is `blocked` or stuck in any intent phase (a lost or refused grant publication leaves `grant_intent` forever), provided its latest execution is terminal and the credential was released. See `STATUS.md`.

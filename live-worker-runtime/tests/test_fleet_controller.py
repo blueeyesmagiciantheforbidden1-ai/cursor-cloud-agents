@@ -124,7 +124,7 @@ class FleetReviewTests(unittest.TestCase):
     def test_reset_returns_blocked_slot_to_idle_and_next_tick_replaces(self):
         controller, store, cloud, _, _, _ = self.blocked()
         result = controller.reset()
-        self.assertEqual(result, {'status': 'idle', 'cleared': 'worker_failed_no_restart_loop', 'generation': 1})
+        self.assertEqual(result, {'status': 'idle', 'cleared': 'worker_failed_no_restart_loop', 'from_phase': 'blocked', 'generation': 1})
         self.assertEqual(store.state['phase'], 'idle'); self.assertNotIn('error', store.state)
         self.assertEqual(store.state['previous_uid'], NEXT_UID)
         self.assertEqual(cloud.run_count, 1)  # reset itself launches nothing
@@ -133,6 +133,23 @@ class FleetReviewTests(unittest.TestCase):
         controller.clock = lambda: 1100
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
         self.assertEqual(cloud.run_count, 2); self.assertEqual(store.state['generation'], 2)
+
+    def test_reset_reconciles_slot_stuck_in_grant_intent(self):
+        # A refused or lost grant publication leaves the slot at grant_intent
+        # forever and the worker dies at bootstrap without a grant.
+        controller, store, cloud, broker, _, grants = self.make(); grants.lose_reply = True
+        with self.assertRaises(OSError): controller.tick()
+        self.assertEqual(store.state['phase'], 'grant_intent')
+        with self.assertRaises(ControllerError): controller.reset()  # execution still running
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        result = controller.reset()
+        self.assertEqual(result['status'], 'idle'); self.assertEqual(result['from_phase'], 'grant_intent')
+        self.assertEqual(store.state['phase'], 'idle'); self.assertEqual(cloud.run_count, 1)
+        grants.lose_reply = False; controller.clock = lambda: 1100
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
 
     def test_reset_refuses_unless_credential_cleanly_released(self):
         for change in ({'phase': 'quarantined'}, {'quarantine_reason': 'provider_refresh_uncertain'},
@@ -145,7 +162,7 @@ class FleetReviewTests(unittest.TestCase):
     def test_reset_refuses_running_or_unblocked_slots(self):
         controller, store, cloud, _, _, _ = self.make(); controller.tick()
         with self.assertRaises(ControllerError) as caught: controller.reset()
-        self.assertEqual(str(caught.exception), 'slot_not_blocked'); self.assertEqual(store.state['phase'], 'active')
+        self.assertEqual(str(caught.exception), 'slot_not_stopped'); self.assertEqual(store.state['phase'], 'active')
         controller, store, cloud, _, _, _ = self.blocked()
         cloud.executions_by_name[NEXT].update(runningCount=1, completionTime='')
         with self.assertRaises(ControllerError): controller.reset()
