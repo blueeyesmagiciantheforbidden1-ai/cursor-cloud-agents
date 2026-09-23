@@ -5,5 +5,19 @@ coverage/
 *.log
 .DS_Store
 .env
-.env.local
+.env.*
 .vite/
+
+# Hub pack secrets stay on the machine.
+*.pem
+*.p12
+*.key
+*credentials*.json
+*service-account*.json
+*service_account*.json
+hub-tokens.json
+hub/messages.jsonl
+hub/read_state.json
+imported/
+**/__pycache__/
+*.pyc
