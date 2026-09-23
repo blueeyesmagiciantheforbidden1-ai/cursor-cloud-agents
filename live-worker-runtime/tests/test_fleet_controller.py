@@ -117,6 +117,47 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(controller.tick()['status'], 'blocked')
         self.assertEqual(cloud.run_count, 1)
 
+    def fail_current(self, cloud, broker, uid=NEXT_UID):
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        broker.state.update(execution_uid=uid)  # the failed worker released cleanly
+
+    def test_failure_after_clean_release_is_replaced_with_backoff(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.fail_current(cloud, broker)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'replacement_after_failure')
+        self.assertEqual(result['consecutive_failures'], 1)
+        self.assertEqual(store.state['phase'], 'idle'); self.assertEqual(store.state['next_launch_at'], 1000 + 120)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown'); self.assertEqual(cloud.run_count, 1)
+        controller.clock = lambda: 1200
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+    def test_third_consecutive_failure_stops_the_slot(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        self.fail_current(cloud, broker)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_no_restart_loop')
+        self.assertEqual(store.state['consecutive_failures'], 3); self.assertEqual(cloud.run_count, 1)
+
+    def test_success_resets_the_failure_count(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.tick()
+        self.assertEqual(store.state['consecutive_failures'], 0)
+
+    def test_failure_without_clean_release_stops_the_slot(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.fail_current(cloud, broker, uid=PRIOR_UID)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(cloud.run_count, 1)
+
     def blocked(self):
         """A slot stopped by a failed terminal execution whose credential was released."""
         controller, store, cloud, broker, bindings, grants = self.make(); controller.tick()
@@ -129,7 +170,7 @@ class FleetReviewTests(unittest.TestCase):
     def test_reset_returns_blocked_slot_to_idle_and_next_tick_replaces(self):
         controller, store, cloud, _, _, _ = self.blocked()
         result = controller.reset()
-        self.assertEqual(result, {'status': 'idle', 'cleared': 'worker_failed_no_restart_loop', 'from_phase': 'blocked', 'generation': 1})
+        self.assertEqual(result, {'status': 'idle', 'cleared': 'worker_failed_credential_unreleased', 'from_phase': 'blocked', 'generation': 1})
         self.assertEqual(store.state['phase'], 'idle'); self.assertNotIn('error', store.state)
         self.assertEqual(store.state['previous_uid'], NEXT_UID)
         self.assertEqual(cloud.run_count, 1)  # reset itself launches nothing

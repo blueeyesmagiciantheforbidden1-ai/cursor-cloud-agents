@@ -22,6 +22,16 @@ from agent_hub.cloud_credential_broker import PROJECT_ID, PROJECT_NUMBER
 class ControllerError(RuntimeError): pass
 
 
+# A worker that fails after cleanly releasing its credential is replaced after
+# a growing delay; the third consecutive failure stops the slot. Before this,
+# the first failure stopped it: one transient provider error (a lost warm
+# session, a dropped connection) killed codex, claude and copilot for good on
+# 2026-09-23 after hours of clean hourly replacements. The bound and the
+# backoff keep a broken credential from becoming a paid restart loop.
+MAX_CONSECUTIVE_FAILURES = 3
+FAILURE_BACKOFF_SECONDS = (120, 600)
+
+
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
 
 
@@ -205,13 +215,28 @@ class Controller:
                          and type(execution.get('failedCount', 0)) is int and execution.get('failedCount', 0) == 0
                          and type(execution.get('runningCount', 0)) is int and execution.get('runningCount', 0) == 0)
                 if not clean:
-                    state, version = self.save(state, version, phase='blocked', error='worker_failed_no_restart_loop')
-                    return {'status': 'blocked', 'generation': state['generation']}
+                    failures = state.get('consecutive_failures', 0) + 1
+                    try:
+                        self.idle_credential(execution)
+                        released = True
+                    except ControllerError:
+                        released = False
+                    if not released or failures >= MAX_CONSECUTIVE_FAILURES:
+                        state, version = self.save(state, version, phase='blocked', consecutive_failures=failures,
+                            error='worker_failed_no_restart_loop' if released else 'worker_failed_credential_unreleased')
+                        return {'status': 'blocked', 'generation': state['generation']}
+                    first, cap = FAILURE_BACKOFF_SECONDS
+                    self.store.archive(state, execution)
+                    state, version = self.save(state, version, phase='idle', consecutive_failures=failures,
+                        next_launch_at=int(self.clock()) + min(cap, first * 2 ** (failures - 1)),
+                        last_execution=state['execution'], last_execution_uid=state['execution_uid'])
+                    return {'status': 'replacement_after_failure', 'consecutive_failures': failures,
+                            'next_launch_at': state['next_launch_at'], 'generation': state['generation']}
                 self.idle_credential(execution)
                 # Preserve this generation's receipt separately before replacing
                 # the live state. The implementation uses immutable create-only.
                 self.store.archive(state, execution)
-                state, version = self.save(state, version, phase='idle',
+                state, version = self.save(state, version, phase='idle', consecutive_failures=0,
                     last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                 continue
             raise ControllerError('unknown_controller_state')
