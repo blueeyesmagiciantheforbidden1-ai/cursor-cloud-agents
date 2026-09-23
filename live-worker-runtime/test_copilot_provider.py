@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from agent_hub.cloud_credential_broker import BrokerError, MutationUncertain
 from providers import copilot as c
 
 
@@ -44,6 +45,10 @@ class FakeNative:
         self.answer = answer_events()
         self.fail_send = self.fail_stop = self.fail_maintain = False
         self.fail_maintain_code = None
+        self.maintain_error = None
+        # Matches Native.__init__: the first renew is not due immediately.
+        # maintain() advances this only after renew() returns, same as _tick.
+        self.next_renew = time.monotonic() + 3600
         self.late = []
         self.instances.append(self)
 
@@ -69,6 +74,11 @@ class FakeNative:
         raise AssertionError('unexpected method')
 
     def maintain(self):
+        # Same order as Native._tick: a raising renew leaves next_renew due.
+        if time.monotonic() >= self.next_renew:
+            self.renew()
+            self.next_renew = time.monotonic() + 20
+        if self.maintain_error is not None: raise self.maintain_error
         if self.fail_maintain: raise c.CopilotError('copilot_native_deadline_expired')
         if self.fail_maintain_code: raise c.CopilotError(self.fail_maintain_code)
         if self.process.poll() is not None: raise c.CopilotError('copilot_warm_process_ended')
@@ -197,11 +207,12 @@ class Lifecycle(unittest.TestCase):
         with self.assertRaises(c.CopilotError): c.close(handle)
         self.assertEqual(self.session.finish.call_count, 1)
 
-    def test_heartbeat_or_idle_failure_closes_without_prompt(self):
+    def test_native_deadline_during_idle_keeps_its_code_and_closes(self):
         handle = self.prepare(); native = handle.native
         native.fail_maintain = True
-        with self.assertRaisesRegex(c.CopilotError, 'warm_session_lost'): c.maintain(handle)
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_native_deadline_expired$'): c.maintain(handle)
         self.assertTrue(handle.finished)
+        self.assertIsNone(handle.native)
         self.assertNotIn('session.send', [x[0] for x in native.calls])
 
     def test_startup_budget_is_not_the_idle_cap(self):
@@ -222,30 +233,92 @@ class Lifecycle(unittest.TestCase):
         self.assertNotIn('session.send', [x[0] for x in native.calls])
         self.assertEqual(self.session.finish.call_count, 1)
 
-    def test_idle_safety_failures_are_not_relabeled_as_session_loss(self):
-        for code in sorted(c.IDLE_MAINTAIN_FAILURES):
+    def test_other_vetted_idle_codes_close_and_pass_through(self):
+        codes = (
+            'copilot_unexpected_native_frame', 'copilot_native_session_mismatch',
+            'copilot_native_json_invalid', 'copilot_native_event_limit',
+            'copilot_native_frame_limit', 'copilot_native_output_limit',
+            'copilot_tools_forbidden', 'copilot_unexpected_pre_prompt_activity',
+            'copilot_native_deadline_expired')
+        for code in codes:
             with self.subTest(code=code):
                 self.session.state = 'active'
                 handle = self.prepare(); native = handle.native
                 native.fail_maintain_code = code
-                with self.assertRaisesRegex(c.CopilotError, '^' + code + '$'): c.maintain(handle)
+                with self.assertRaisesRegex(c.CopilotError, '^' + code + '$') as caught:
+                    c.maintain(handle)
+                self.assertIsInstance(caught.exception, c.CopilotError)
                 self.assertTrue(handle.finished)
+                self.assertIsNone(handle.native)
                 self.assertNotIn('session.send', [x[0] for x in native.calls])
 
-    def test_opaque_idle_failure_stays_a_fixed_session_lost_code(self):
+    def test_hub_heartbeat_lost_keeps_native_session_and_retries_renew(self):
         handle = self.prepare(); native = handle.native
-        def boom(): raise RuntimeError('private native path must not escape')
-        native.maintain = boom
+        due = native.next_renew = time.monotonic() - 1
+        self.heartbeat.return_value = False
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_hub_heartbeat_lost$'):
+            c.maintain(handle)
+        self.assertFalse(handle.finished)
+        self.assertFalse(handle.close_failed)
+        self.assertIs(handle.native, native)
+        self.assertFalse(native.native_stopped)
+        self.assertIsNone(native.process.poll())
+        self.assertEqual(native.next_renew, due)
+        self.assertEqual(self.broker.renew.call_count, 1)
+        self.session.finish.assert_not_called()
+        self.broker.quarantine.assert_not_called()
+        self.heartbeat.return_value = True
+        readiness = c.maintain(handle)
+        self.assertTrue(readiness['ready_for_project_prompt'])
+        self.assertEqual(self.broker.renew.call_count, 2)
+        self.assertGreater(native.next_renew, due)
+        self.assertFalse(handle.finished)
+        self.assertIs(handle.native, native)
+
+    def test_broker_renew_errors_close_as_idle_renew_failed(self):
+        for error in (BrokerError('private broker detail'), MutationUncertain('private mutation detail')):
+            with self.subTest(error=type(error).__name__):
+                self.session.state = 'active'
+                self.broker.renew.side_effect = error
+                handle = self.prepare(); native = handle.native
+                native.next_renew = time.monotonic() - 1
+                with self.assertRaisesRegex(c.CopilotError, '^copilot_idle_renew_failed$') as caught:
+                    c.maintain(handle)
+                self.assertNotIn('private', str(caught.exception))
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(handle.finished)
+                self.assertIsNone(handle.native)
+                self.assertTrue(native.native_stopped)
+                self.assertNotIn('session.send', [x[0] for x in native.calls])
+                self.broker.renew.side_effect = None
+
+    def test_dead_pipe_is_warm_session_lost(self):
+        handle = self.prepare(); native = handle.native
+        native.maintain_error = OSError(32, 'private dead pipe')
         with self.assertRaisesRegex(c.CopilotError, '^copilot_warm_session_lost$') as caught:
             c.maintain(handle)
         self.assertNotIn('private', str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(handle.finished)
+        self.assertTrue(native.native_stopped)
+        self.assertNotIn('session.send', [x[0] for x in native.calls])
+
+    def test_opaque_idle_failure_is_idle_renew_failed_not_session_loss(self):
+        handle = self.prepare(); native = handle.native
+        def boom(): raise RuntimeError('private native path must not escape')
+        native.maintain = boom
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_idle_renew_failed$') as caught:
+            c.maintain(handle)
+        self.assertNotIn('private', str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
         self.assertTrue(handle.finished)
 
     def test_idle_deadline_does_not_slide(self):
         handle = self.prepare(); original = handle.idle_deadline
         c.maintain(handle); self.assertEqual(handle.idle_deadline, original)
         handle.idle_deadline = time.monotonic()-1
-        with self.assertRaises(c.CopilotError): c.maintain(handle)
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_warm_session_lost$'): c.maintain(handle)
+        self.assertTrue(handle.finished)
 
     def test_task_timeout_cannot_exceed_900_seconds(self):
         handle = self.prepare(); native = handle.native
@@ -345,6 +418,28 @@ class Transport(unittest.TestCase):
             count = min(3, len(value)); chunks.append(bytes(value[:count])); return count
         with patch.object(c.os, 'write', side_effect=write): native.write_frame(b'abcdefghij')
         self.assertEqual(b''.join(chunks), b'abcdefghij')
+
+    def test_native_maintain_leaves_renew_due_when_renew_raises(self):
+        native = bare_native()
+        native.next_renew = due = time.monotonic() - 1
+        native.renew.side_effect = c.CopilotError('copilot_hub_heartbeat_lost')
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_hub_heartbeat_lost$'):
+            native.maintain()
+        self.assertEqual(native.next_renew, due)
+        self.assertEqual(native.renew.call_count, 1)
+        native.renew.side_effect = None
+        native.maintain()
+        self.assertEqual(native.renew.call_count, 2)
+        self.assertGreater(native.next_renew, due)
+
+    def test_dead_pipe_oserror_escapes_native_maintain(self):
+        native = bare_native()
+        native.selector.select = lambda timeout: [(SimpleNamespace(fd=7, data='out', fileobj=object()), 1)]
+        with patch.object(c.os, 'read', side_effect=OSError(32, 'private broken pipe')):
+            with self.assertRaises(OSError) as caught:
+                native.maintain()
+        self.assertEqual(caught.exception.errno, 32)
+        self.assertIn('private', str(caught.exception))
 
     def test_blocked_write_preserves_deadline_and_renews(self):
         native = bare_native(); native.next_renew = time.monotonic()-1
