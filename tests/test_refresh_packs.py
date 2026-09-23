@@ -350,6 +350,12 @@ class BaseDriftTest(unittest.TestCase):
             self.assertIn('providers/copilot.py', str(caught.exception))
             self.assertFalse((Path(tmp) / 'out').exists())
 
+    def test_a_pack_only_non_python_file_is_drift_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self.make_base(tmp, {'live_loop.py': self.git_file('live_loop.py'),
+                                        'providers/extra_events.json': b'["session.usage_info"]'})
+            self.assertEqual(refresh_packs.base_drift(base, 'owner@example.org'), ['providers/extra_events.json'])
+
     def test_owner_pinned_file_is_compared_with_the_placeholder(self):
         with tempfile.TemporaryDirectory() as tmp:
             pinned = self.git_file('providers/grok.py').replace(

@@ -72,8 +72,10 @@ def base_drift(base, owner_email):
     files are compared with the owner email put back to the placeholder.
     """
     drift = []
-    for file in sorted((base / 'live').rglob('*.py')):
-        if '__pycache__' in file.parts:
+    for file in sorted((base / 'live').rglob('*')):
+        # Every file, not only Python: a pack-only data or config file is a
+        # hand change too.
+        if not file.is_file() or '__pycache__' in file.parts or file.suffix == '.pyc':
             continue
         name = file.relative_to(base / 'live').as_posix()
         data = file.read_bytes()
