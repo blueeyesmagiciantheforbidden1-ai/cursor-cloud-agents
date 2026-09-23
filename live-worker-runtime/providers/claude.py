@@ -180,8 +180,27 @@ class Native:
             stream.close()
 
     def tick(self):
+        """Check the deadline and protocol, then renew both leases on the 20s cadence.
+
+        Used while idle (maintain) and while a prompt is in flight (send/receive).
+        next_renew advances only after renew returns, so a failed renewal stays due.
+        Anything renew raises that is not already a vetted provider code becomes one.
+        """
         need(time.monotonic() < self.deadline, 'claude_deadline')
         need(not self.frames.failed.is_set(), 'claude_protocol_output_invalid')
+        if time.monotonic() < self.next_renew:
+            return
+        try:
+            self.renew()
+        except Exception as error:
+            code = provider_errors.error_code(error)
+            if code:
+                raise
+            text = str(error)
+            if not provider_errors.SAFE_CODE.fullmatch(text):
+                text = 'claude_lease_renew_failed'
+            raise NativeError(text) from None
+        self.next_renew = time.monotonic() + 20
 
     def send(self, value, *, close=False):
         payload = (json.dumps(value, ensure_ascii=False, allow_nan=False) + '\n').encode('utf-8')
@@ -421,9 +440,10 @@ def maintain(handle):
     need(not handle.native.frames.failed.is_set(), 'claude_protocol_output_invalid')
     for event in handle.native.idle_events():
         need(event == {'type': 'keep_alive'}, 'claude_unexpected_idle_message')
-    if time.monotonic() >= handle.native.next_renew:
-        _renew(handle)
-        handle.native.next_renew = time.monotonic() + 20
+    # The startup deadline is not the warm window. tick() renews the hub task
+    # lease and the broker credential lease on the same schedule as a prompt.
+    handle.native.deadline = max(handle.native.deadline, time.monotonic() + 30)
+    handle.native.tick()
     return handle.readiness
 
 

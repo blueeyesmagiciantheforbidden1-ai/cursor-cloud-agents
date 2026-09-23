@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import queue
 import sys
 import tempfile
 import threading
@@ -19,6 +20,60 @@ for entry in (str(HERE), str(SOURCE)):
 from providers import claude as c  # noqa: E402
 
 TOKEN = 'PRIVATE_OFFLINE_SUBSCRIPTION_TOKEN'
+
+
+class _SlowStdin:
+    def __init__(self):
+        self.chunks = []
+        self.closed = False
+
+    def write(self, payload):
+        self.chunks.append(bytes(payload))
+        return len(payload)
+
+    def flush(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class _SlowFrames:
+    """Withhold the answer for one renew interval per 'wait' item."""
+
+    def __init__(self, clock, items):
+        self.failed = threading.Event()
+        self.clock = clock
+        self.items = list(items)
+
+    def get(self, timeout=None):
+        if not self.items:
+            raise queue.Empty
+        item = self.items.pop(0)
+        if item == 'wait':
+            self.clock['now'] += 21
+            raise queue.Empty
+        return item
+
+    def empty(self):
+        return not self.items
+
+
+class _SlowProcess:
+    def __init__(self, frames, stdin):
+        self.frames = frames
+        self.stdin = stdin
+        self.returncode = 0
+        self.pid = 1
+
+    def poll(self):
+        return None if self.frames.items else 0
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 def result_event(**changes):
@@ -70,6 +125,9 @@ class Fixture:
             def idle_events(self):
                 events, owner.idle = owner.idle, []
                 return events
+
+            def tick(self):
+                c.Native.tick(self)
 
             def prompt(self, text):
                 owner.prompts.append(text)
@@ -290,7 +348,137 @@ class ClaudeAdapter(unittest.TestCase):
             fixture.native.next_renew = time.monotonic() - 1
             c.maintain(handle)
             session.broker.renew.assert_called_once_with(session.lease)
+            self.assertGreater(fixture.native.next_renew, time.monotonic())
+            c.maintain(handle)
+            session.broker.renew.assert_called_once_with(session.lease)
             c.close(handle)
+
+    def test_maintain_renew_failure_stays_due_with_a_vetted_code(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            fixture.native.next_renew = time.monotonic() - 1
+            due = fixture.native.next_renew
+            session.broker.renew.side_effect = RuntimeError('connection reset by peer')
+            with self.assertRaises(c.NativeError) as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'claude_lease_renew_failed')
+            self.assertNotIn('peer', str(caught.exception))
+            self.assertEqual(fixture.native.next_renew, due)
+            session.broker.renew.side_effect = RuntimeError('credential_lease_not_active')
+            with self.assertRaises(c.NativeError) as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'credential_lease_not_active')
+            self.assertEqual(fixture.native.next_renew, due)
+            handle.heartbeat = lambda: False
+            session.broker.renew.side_effect = None
+            with self.assertRaises(c.NativeError) as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'claude_hub_heartbeat_lost')
+            self.assertEqual(fixture.native.next_renew, due)
+            c.close(handle)
+
+    def _slow_prompt(self, *, prepare_execute=None, heartbeat=None):
+        """execute() -> prompt(); the answer is withheld across three renew intervals."""
+        fixture = Fixture()
+        clock = {'now': 10_000.0}
+        command = '11111111-1111-4111-8111-111111111111'
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            if heartbeat is not None:
+                handle.heartbeat = heartbeat
+            lifecycle = {'type': 'command_lifecycle', 'command_uuid': command, 'state': 'completed',
+                         'uuid': '33333333-3333-4333-8333-333333333333',
+                         'session_id': '22222222-2222-4222-8222-222222222222'}
+            script = _SlowFrames(clock, ['wait', 'wait', 'wait', lifecycle, result_event(), c.rt._EOF])
+            stdin = _SlowStdin()
+            native = c.Native.__new__(c.Native)
+            native.deadline = clock['now'] + 500
+            native.renew = lambda: c._renew(handle)
+            native.next_renew = clock['now'] + 20
+            native.writers = []
+            native.frames = SimpleNamespace(failed=threading.Event(), queue=script)
+            native.process = _SlowProcess(script, stdin)
+            native.closed = False
+
+            def close():
+                native.closed = True
+                fixture.events.append('stop')
+
+            native.close = close
+            handle.native = native
+            fixture.native = native
+            if prepare_execute is not None:
+                prepare_execute(native, clock, session)
+            outcome = SimpleNamespace(session=session, handle=handle, native=native, stdin=stdin,
+                                      clock=clock, events=fixture.events, result=None, error=None)
+            with patch.object(c.time, 'monotonic', lambda: clock['now']), \
+                    patch.object(c, 'uuid4', return_value=command):
+                try:
+                    outcome.result = c.execute(handle, 'Project prompt', clock['now'] + 500)
+                except c.NativeError as error:
+                    outcome.error = error
+            return outcome
+
+    def test_slow_prompt_renews_lease_across_intervals(self):
+        when = []
+
+        def prepare(native, clock, session):
+            def renew(lease):
+                self.assertLessEqual(native.next_renew, clock['now'])
+                when.append(clock['now'])
+            session.broker.renew.side_effect = renew
+
+        outcome = self._slow_prompt(prepare_execute=prepare)
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.result['text'], 'Verified project answer.')
+        self.assertEqual(when, [10_021.0, 10_042.0, 10_063.0])
+        self.assertEqual(outcome.native.next_renew, when[-1] + 20)
+        self.assertEqual(outcome.session.broker.renew.call_count, 3)
+        self.assertEqual(len(outcome.stdin.chunks), 1)
+        self.assertIn(b'Project prompt', outcome.stdin.chunks[0])
+        self.assertEqual(outcome.events, ['stop', 'commit-release'])
+        self.assertEqual(outcome.session.state, 'committed')
+
+    def test_slow_prompt_renew_failure_keeps_schedule_and_vetted_code(self):
+        calls = {'n': 0, 'due': None}
+
+        def prepare(native, clock, session):
+            def renew(lease):
+                calls['n'] += 1
+                calls['due'] = native.next_renew
+                if calls['n'] >= 2:
+                    raise RuntimeError('raw diagnostics /tmp/secret')
+            session.broker.renew.side_effect = renew
+
+        outcome = self._slow_prompt(prepare_execute=prepare)
+        self.assertIsInstance(outcome.error, c.NativeError)
+        self.assertEqual(str(outcome.error), 'claude_lease_renew_failed')
+        self.assertNotIn('secret', str(outcome.error))
+        self.assertEqual(calls['n'], 2)
+        self.assertEqual(outcome.native.next_renew, calls['due'])
+        self.assertEqual(outcome.events, ['stop', 'commit-release'])
+        self.assertEqual(outcome.session.state, 'committed')
+        self.assertTrue(outcome.handle.attempted)
+
+        beats = {'n': 0}
+
+        def beat():
+            beats['n'] += 1
+            return beats['n'] == 1
+
+        heart = self._slow_prompt(heartbeat=beat)
+        self.assertEqual(str(heart.error), 'claude_hub_heartbeat_lost')
+        self.assertEqual(heart.native.next_renew, 10_020.0)
+        self.assertEqual(heart.session.broker.renew.call_count, 1)
+        self.assertEqual(heart.session.state, 'committed')
+
+        def install_safe_code(native, clock, session):
+            session.broker.renew.side_effect = RuntimeError('credential_lease_not_active')
+
+        safe = self._slow_prompt(prepare_execute=install_safe_code)
+        self.assertEqual(str(safe.error), 'credential_lease_not_active')
+        self.assertEqual(safe.native.next_renew, 10_020.0)
 
     def test_command_matches_the_audited_subscription_profile(self):
         argv = c.command().argv
