@@ -310,7 +310,11 @@ class Controller:
                 job = self.job(); previous = self.current_terminal(job, state)
                 release_uid = self.broker._read()[0].get('execution_uid')
                 grant = secrets.token_urlsafe(48)
-                state, version = self.save(state, version, phase='binding_intent',
+                # A launch ends any park: an error left from it would make a
+                # later strike backoff report provider_quota_parked and let
+                # reset() treat that backoff as a park (Light's review).
+                launch = {key: value for key, value in state.items() if key != 'error'}
+                state, version = self.save(launch, version, phase='binding_intent',
                     generation=state['generation'] + 1, intent=uuid.uuid4().hex,
                     grant=grant, grant_sha256=hashlib.sha256(grant.encode()).hexdigest(),
                     expires_at=int(self.clock()) + 7200, previous_uid=previous['uid'], release_uid=release_uid)

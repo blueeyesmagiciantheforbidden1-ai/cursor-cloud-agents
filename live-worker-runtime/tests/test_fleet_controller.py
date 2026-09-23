@@ -708,6 +708,26 @@ class FleetReviewTests(unittest.TestCase):
         self.assertNotIn('error', store.state)
         self.assertEqual(store.state['consecutive_failures'], 0)
 
+    def test_park_then_ordinary_failure_is_a_strike_not_a_park(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker)
+        self.assertEqual(controller.tick()['status'], 'provider_quota_parked')
+        controller.clock = lambda: 1000 + 3600
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertNotIn('error', store.state)
+        self.park_quota(cloud, broker, code=1)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'replacement_after_failure')
+        self.assertEqual(result['consecutive_failures'], 1)
+        self.assertNotIn('error', store.state)
+        # Inside the strike backoff: cooldown, not parked, and reset refuses.
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        with self.assertRaises(ControllerError) as caught:
+            controller.reset()
+        self.assertEqual(str(caught.exception), 'slot_not_stopped')
+        self.assertEqual(store.state['consecutive_failures'], 1)
+        self.assertEqual(store.state['next_launch_at'], 1000 + 3600 + 120)
+
     def test_quota_exit_with_unreleased_credential_blocks(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
         self.park_quota(cloud, broker)
