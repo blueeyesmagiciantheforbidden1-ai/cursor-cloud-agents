@@ -24,6 +24,27 @@ from agent_hub.credential_broker_service import BoundaryError
 from providers import codex as c
 
 EMAIL = 'cursor-owner@example.invalid'
+
+
+class StepClock:
+    """Monotonic stand-in. It moves only when a test calls advance()."""
+
+    def __init__(self, now=1_000_000.0):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds=1.0):
+        self.now += seconds
+        return self.now
+
+
+def bind_lease_clock(handle, clock):
+    """for_lease captured time.monotonic at import, so rebind before the scenario."""
+    handle.lease_clock.clock = clock
+    handle.lease_clock.renewed_at = clock()
+    return clock()
 BACKEND = 'synthetic-account-id'
 CONFIG = {'forced_login_method': 'chatgpt', 'cli_auth_credentials_store': 'file',
           'model_provider': 'openai', 'approval_policy': 'never', 'sandbox_mode': 'read-only'}
@@ -139,23 +160,10 @@ class CodexLive(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name) / 'home'
         self.home.mkdir()
+        self._grant = 0
         self.native = None
         self.mutate = lambda native: None
-        lease = SimpleNamespace(profile='blueeyes', account_ref=c.metadata.OWNER_REFS['blueeyes'],
-            canonical_account_ref=c.metadata.canonical_account_ref(BACKEND),
-            execution='synthetic-job/executions/exact', execution_uid='synthetic-uid')
-        broker = SimpleNamespace(execution=lease.execution, execution_uid=lease.execution_uid,
-            assert_current=Mock(), renew=Mock(), quarantine=Mock())
-        self.session = SimpleNamespace(state='active', home=self.home, lease=lease, broker=broker)
-
-        def finish(**kwargs):
-            self.assertEqual(kwargs, {'native_stopped': True})
-            self.assertIsNotNone(self.native.process.poll())
-            self.native.order.append('commit-release')
-            self.session.state = 'committed'
-            return 'synthetic-version'
-
-        self.session.finish = Mock(side_effect=finish)
+        self._install_session(self.home)
 
         def factory(*args, **kwargs):
             self.native = FixtureRPC(*args, **kwargs)
@@ -166,6 +174,33 @@ class CodexLive(unittest.TestCase):
         patch.object(c, 'WarmRPC', side_effect=factory).start()
         patch.object(c, 'CONFIG_SHA', c.protocol_gate.digest(CONFIG)).start()
         self.heartbeat = Mock(return_value=True)
+
+    def _install_session(self, home):
+        """One broker grant. A second prepare on the same session is rejected."""
+        lease = SimpleNamespace(profile='blueeyes', account_ref=c.metadata.OWNER_REFS['blueeyes'],
+            canonical_account_ref=c.metadata.canonical_account_ref(BACKEND),
+            execution='synthetic-job/executions/exact', execution_uid='synthetic-uid')
+        broker = SimpleNamespace(execution=lease.execution, execution_uid=lease.execution_uid,
+            assert_current=Mock(), renew=Mock(), quarantine=Mock())
+        session = SimpleNamespace(state='active', home=home, lease=lease, broker=broker)
+
+        def finish(**kwargs):
+            self.assertEqual(kwargs, {'native_stopped': True})
+            self.assertIsNotNone(self.native.process.poll())
+            self.native.order.append('commit-release')
+            session.state = 'committed'
+            return 'synthetic-version'
+
+        session.finish = Mock(side_effect=finish)
+        self.session = session
+        self.heartbeat = Mock(return_value=True)
+        self.native = None
+
+    def _fresh_session(self):
+        self._grant += 1
+        home = Path(self.temporary.name) / f'home-{self._grant}'
+        home.mkdir()
+        self._install_session(home)
 
     def prepare(self):
         return c.prepare(self.session, self.heartbeat, time.monotonic() + 120)
@@ -522,25 +557,30 @@ class CodexLive(unittest.TestCase):
                   BoundaryError('metadata_identity_unavailable')]
         for error in errors:
             with self.subTest(error=str(error)):
-                handle = self.prepare()
-                anchor = handle.lease_clock.renewed_at
-                self.session.broker.renew.reset_mock(side_effect=True)
-                self.heartbeat.reset_mock()
-                handle.next_renew = 0
-                handle.native.next_renew = time.monotonic() + 1000
-                self.session.broker.renew.side_effect = error
-                readiness = c.maintain(handle)
-                self.assertEqual(handle.state, 'ready')
-                self.assertTrue(readiness['ready_for_project_prompt'])
-                self.session.finish.assert_not_called()
-                self.assertEqual(handle.lease_clock.renewed_at, anchor)
-                self.assertLessEqual(handle.next_renew, time.monotonic() + broker_renew.RETRY_SECONDS)
-                self.heartbeat.assert_called()
-                self.session.broker.renew.side_effect = None
-                handle.next_renew = 0
-                c.maintain(handle)
-                self.assertGreater(handle.lease_clock.renewed_at, anchor)
-                c.close(handle)
+                self._fresh_session()
+                clock = StepClock()
+                with patch('time.monotonic', clock):
+                    handle = self.prepare()
+                    anchor = bind_lease_clock(handle, clock)
+                    self.session.broker.renew.reset_mock()
+                    self.heartbeat.reset_mock()
+                    handle.next_renew = 0
+                    handle.native.next_renew = clock() + 1000
+                    self.session.broker.renew.side_effect = error
+                    readiness = c.maintain(handle)
+                    self.assertEqual(handle.state, 'ready')
+                    self.assertTrue(readiness['ready_for_project_prompt'])
+                    self.session.finish.assert_not_called()
+                    self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                    self.assertEqual(handle.next_renew, clock() + broker_renew.RETRY_SECONDS)
+                    self.heartbeat.assert_called()
+                    clock.advance()
+                    self.session.broker.renew.side_effect = None
+                    handle.next_renew = 0
+                    c.maintain(handle)
+                    self.assertGreaterEqual(handle.lease_clock.renewed_at, anchor)
+                    self.assertEqual(handle.lease_clock.renewed_at, clock())
+                    c.close(handle)
 
     def test_tick_path_transient_renew_failure_is_rearmed_for_retry(self):
         handle = self.prepare()
@@ -572,6 +612,7 @@ class CodexLive(unittest.TestCase):
     def test_renew_tolerance_is_bounded(self):
         for tick in (False, True):
             with self.subTest(tick=tick):
+                self._fresh_session()
                 handle = self.prepare()
                 handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
                 self.session.broker.renew.side_effect = MutationUncertain('x')
@@ -591,6 +632,7 @@ class CodexLive(unittest.TestCase):
                   BoundaryError('credential_fence_lost')]
         for error in errors:
             with self.subTest(error=str(error)):
+                self._fresh_session()
                 handle = self.prepare()
                 anchor = handle.lease_clock.renewed_at
                 handle.next_renew = 0

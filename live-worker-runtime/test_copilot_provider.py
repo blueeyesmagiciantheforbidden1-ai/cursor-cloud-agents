@@ -13,6 +13,27 @@ from agent_hub.credential_broker_service import BoundaryError
 from providers import copilot as c
 
 
+class StepClock:
+    """Monotonic stand-in. It moves only when a test calls advance()."""
+
+    def __init__(self, now=1_000_000.0):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds=1.0):
+        self.now += seconds
+        return self.now
+
+
+def bind_lease_clock(handle, clock):
+    """for_lease captured time.monotonic at import, so rebind before the scenario."""
+    handle.lease_clock.clock = clock
+    handle.lease_clock.renewed_at = clock()
+    return clock()
+
+
 def quota():
     return {'quotaSnapshots': {'premium_interactions': {
         'isUnlimitedEntitlement': False, 'entitlementRequests': 20000, 'usedRequests': 180,
@@ -122,6 +143,23 @@ class Lifecycle(unittest.TestCase):
 
     def prepare(self):
         return c.prepare(self.session, self.heartbeat, time.monotonic()+3500)
+
+    def _new_grant(self):
+        """Fresh broker and session state so one subtest cannot leak into the next."""
+        self.broker = SimpleNamespace(assert_current=Mock(), renew=Mock(), quarantine=Mock())
+        self.session.broker = self.broker
+        self.session.state = 'active'
+        self.finished_after_stop = []
+
+        def finish(*, native_stopped):
+            self.assertTrue(native_stopped)
+            self.assertTrue(FakeNative.instances[-1].native_stopped)
+            self.finished_after_stop.append(True)
+            self.session.state = 'committed'
+            return 'version/42'
+
+        self.session.finish = Mock(side_effect=finish)
+        self.heartbeat = Mock(return_value=True)
 
     def test_ready_is_warm_with_no_prompt_and_no_tools(self):
         handle = self.prepare()
@@ -283,34 +321,36 @@ class Lifecycle(unittest.TestCase):
                   BoundaryError('metadata_identity_unavailable'))
         for error in errors:
             with self.subTest(error=type(error).__name__ + ':' + str(error)):
-                self.session.state = 'active'
-                self.broker.renew.side_effect = error
-                self.heartbeat.reset_mock()
-                handle = self.prepare(); native = handle.native
-                anchor = handle.lease_clock.renewed_at
-                native.next_renew = time.monotonic() - 1
-                readiness = c.maintain(handle)
-                self.assertTrue(readiness['ready_for_project_prompt'])
-                self.assertFalse(handle.finished)
-                self.assertFalse(handle.close_failed)
-                self.assertIs(handle.native, native)
-                self.assertIsNone(native.process.poll())
-                self.assertEqual(self.broker.renew.call_count, 1)
-                self.heartbeat.assert_called()
-                self.session.finish.assert_not_called()
-                self.broker.quarantine.assert_not_called()
-                self.assertEqual(handle.lease_clock.renewed_at, anchor)
-                now = time.monotonic()
-                self.assertGreater(native.next_renew, now)
-                self.assertLessEqual(native.next_renew, now + broker_renew.RETRY_SECONDS)
-                self.broker.renew.side_effect = None
-                native.next_renew = time.monotonic() - 1
-                c.maintain(handle)
-                self.assertEqual(self.broker.renew.call_count, 2)
-                self.assertGreater(handle.lease_clock.renewed_at, anchor)
-                self.assertFalse(handle.lease_clock.degraded)
-                self.assertAlmostEqual(native.next_renew, time.monotonic() + 20, delta=1)
-                self.broker.renew.reset_mock()
+                self._new_grant()
+                clock = StepClock()
+                with patch('time.monotonic', clock):
+                    handle = self.prepare(); native = handle.native
+                    anchor = bind_lease_clock(handle, clock)
+                    self.broker.renew.reset_mock()
+                    self.heartbeat.reset_mock()
+                    self.broker.renew.side_effect = error
+                    native.next_renew = clock() - 1
+                    readiness = c.maintain(handle)
+                    self.assertTrue(readiness['ready_for_project_prompt'])
+                    self.assertFalse(handle.finished)
+                    self.assertFalse(handle.close_failed)
+                    self.assertIs(handle.native, native)
+                    self.assertIsNone(native.process.poll())
+                    self.assertEqual(self.broker.renew.call_count, 1)
+                    self.heartbeat.assert_called()
+                    self.session.finish.assert_not_called()
+                    self.broker.quarantine.assert_not_called()
+                    self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                    self.assertEqual(native.next_renew, clock() + broker_renew.RETRY_SECONDS)
+                    clock.advance()
+                    self.broker.renew.side_effect = None
+                    native.next_renew = clock() - 1
+                    c.maintain(handle)
+                    self.assertEqual(self.broker.renew.call_count, 2)
+                    self.assertGreaterEqual(handle.lease_clock.renewed_at, anchor)
+                    self.assertEqual(handle.lease_clock.renewed_at, clock())
+                    self.assertFalse(handle.lease_clock.degraded)
+                    self.assertEqual(native.next_renew, clock() + 20)
 
     def test_renew_tolerance_exhausted_fails_with_vetted_code(self):
         handle = self.prepare(); native = handle.native

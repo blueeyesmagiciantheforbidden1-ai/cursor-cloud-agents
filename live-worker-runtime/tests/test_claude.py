@@ -27,6 +27,27 @@ from providers import claude as c  # noqa: E402
 TOKEN = 'PRIVATE_OFFLINE_SUBSCRIPTION_TOKEN'
 
 
+class StepClock:
+    """Monotonic stand-in. It moves only when a test calls advance()."""
+
+    def __init__(self, now=1_000_000.0):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds=1.0):
+        self.now += seconds
+        return self.now
+
+
+def bind_lease_clock(handle, clock):
+    """for_lease captured time.monotonic at import, so rebind before the scenario."""
+    handle.lease_clock.clock = clock
+    handle.lease_clock.renewed_at = clock()
+    return clock()
+
+
 class _SlowStdin:
     def __init__(self):
         self.chunks = []
@@ -586,31 +607,36 @@ class ClaudeAdapter(unittest.TestCase):
         errors = [MutationUncertain('broker_http_outcome_uncertain'), BoundaryError('transport_failed'),
                   BoundaryError('metadata_identity_unavailable')]
         for error in errors:
-            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as root:
-                fixture = Fixture()
-                session, handle = self.prepare(fixture, root)
-                beats = []
-                handle.heartbeat = lambda: beats.append(True) or True
-                session.broker.renew.side_effect = error
-                anchor = handle.lease_clock.renewed_at
-                fixture.native.next_renew = time.monotonic() - 1
-                ready = c.maintain(handle)
-                self.assertTrue(ready['ready_for_project_prompt'])
-                self.assertEqual(fixture.events, [])
-                session.finish.assert_not_called()
-                session.broker.quarantine.assert_not_called()
-                self.assertEqual(beats, [True])
-                self.assertEqual(handle.lease_clock.renewed_at, anchor)
-                now = time.monotonic()
-                self.assertGreater(fixture.native.next_renew, now)
-                self.assertLessEqual(fixture.native.next_renew, now + broker_renew.RETRY_SECONDS)
-                session.broker.renew.side_effect = None
-                fixture.native.next_renew = time.monotonic() - 1
-                c.maintain(handle)
-                self.assertFalse(handle.lease_clock.degraded)
-                self.assertGreater(handle.lease_clock.renewed_at, anchor)
-                self.assertAlmostEqual(fixture.native.next_renew, time.monotonic() + 20, delta=1)
-                c.close(handle)
+            with self.subTest(error=str(error)):
+                clock = StepClock()
+                with patch('time.monotonic', clock), tempfile.TemporaryDirectory() as root:
+                    fixture = Fixture()
+                    session, handle = self.prepare(fixture, root)
+                    beats = []
+                    handle.heartbeat = lambda: beats.append(True) or True
+                    anchor = bind_lease_clock(handle, clock)
+                    session.broker.renew.reset_mock()
+                    session.broker.renew.side_effect = error
+                    fixture.native.next_renew = clock() - 1
+                    ready = c.maintain(handle)
+                    self.assertTrue(ready['ready_for_project_prompt'])
+                    self.assertEqual(fixture.events, [])
+                    session.finish.assert_not_called()
+                    session.broker.quarantine.assert_not_called()
+                    self.assertEqual(beats, [True])
+                    self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                    self.assertEqual(fixture.native.next_renew, clock() + broker_renew.RETRY_SECONDS)
+                    clock.advance()
+                    session.broker.renew.side_effect = None
+                    fixture.native.next_renew = clock() - 1
+                    c.maintain(handle)
+                    self.assertFalse(handle.lease_clock.degraded)
+                    # A confirmed renew stamps the clock at the start of the attempt.
+                    # That reading can equal the previous anchor when the clock did not move.
+                    self.assertGreaterEqual(handle.lease_clock.renewed_at, anchor)
+                    self.assertEqual(handle.lease_clock.renewed_at, clock())
+                    self.assertEqual(fixture.native.next_renew, clock() + 20)
+                    c.close(handle)
 
     def test_renew_failure_past_window_raises_claude_broker_renew_failed(self):
         fixture = Fixture()
