@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from live_loop import Worker, Settings, LiveError, task_prompt, handle_released
+import provider_errors
 from provider_errors import ProviderCodeError, error_code
 
 
@@ -301,6 +302,41 @@ class LoopTests(unittest.TestCase):
                 self.assertEqual(result['error_code'], 'native_or_connection_failure')
                 self.assertEqual(worker.last_exit, 1)
                 self.assertIn('close', adapter.calls)
+
+    def test_quota_exhaustion_fails_the_room_with_its_own_exit_code(self):
+        # 2026-09-23: an account spend limit refused every claude call; three
+        # relaunches failed three rooms as native_or_connection_failure and
+        # spent the slot's three strikes in 20 minutes.
+        for code in ('claude_quota_exhausted', 'included_quota_exhausted'):
+            with self.subTest(code=code):
+                worker, client, adapter, _ = self.setup_worker()
+                def execute(handle, prompt, deadline, *, task_kind, code=code):
+                    adapter.calls.append('execute'); raise CodeError(code)
+                adapter.execute = execute
+                result = worker.run()
+                self.assertEqual(result['outcome'], 'failed')
+                self.assertEqual(result['error_code'], code)
+                self.assertIs(result['provider_quota_exhausted'], True)
+                self.assertEqual(worker.last_exit, provider_errors.QUOTA_EXIT_CODE)
+                self.assertEqual(adapter.calls.count('execute'), 1)
+                self.assertEqual(len(client.completions), 1)
+                completion = client.completions[0]
+                self.assertEqual(completion['exit_code'], 1)
+                self.assertIn('usage limit is exhausted (' + code + ')', completion['output'])
+                self.assertIn('grok worker', completion['output'])
+        # Other failures keep exit 1 and the generic room text.
+        worker, client, adapter, _ = self.setup_worker(); adapter.fail_execute = True
+        result = worker.run()
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('provider_quota_exhausted', result)
+        self.assertIn('stopped before it could deliver', client.completions[0]['output'])
+
+    def test_quota_codes_are_recognised_by_suffix_only(self):
+        for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):
+            self.assertTrue(provider_errors.is_quota(code))
+        for code in (None, '', 'quota_exhausted_later', 'claude_quota', 'Claude_quota_exhausted',
+                     'native_quota_unavailable', 'x' * 99 + '_quota_exhausted'):
+            self.assertFalse(provider_errors.is_quota(code))
 
     def test_maintain_retries_are_bounded(self):
         worker, client, adapter, clock = self.setup_worker(); client.empty = True

@@ -60,10 +60,10 @@ class _SlowFrames:
 
 
 class _SlowProcess:
-    def __init__(self, frames, stdin):
+    def __init__(self, frames, stdin, returncode=0):
         self.frames = frames
         self.stdin = stdin
-        self.returncode = 0
+        self.returncode = returncode
         self.pid = 1
 
     def poll(self):
@@ -378,8 +378,8 @@ class ClaudeAdapter(unittest.TestCase):
             self.assertEqual(fixture.native.next_renew, due)
             c.close(handle)
 
-    def _slow_prompt(self, *, prepare_execute=None, heartbeat=None):
-        """execute() -> prompt(); the answer is withheld across three renew intervals."""
+    def _slow_prompt(self, *, prepare_execute=None, heartbeat=None, waits=3, answer=None, returncode=0):
+        """execute() -> prompt(); the answer is withheld across `waits` renew intervals."""
         fixture = Fixture()
         clock = {'now': 10_000.0}
         command = '11111111-1111-4111-8111-111111111111'
@@ -390,15 +390,17 @@ class ClaudeAdapter(unittest.TestCase):
             lifecycle = {'type': 'command_lifecycle', 'command_uuid': command, 'state': 'completed',
                          'uuid': '33333333-3333-4333-8333-333333333333',
                          'session_id': '22222222-2222-4222-8222-222222222222'}
-            script = _SlowFrames(clock, ['wait', 'wait', 'wait', lifecycle, result_event(), c.rt._EOF])
+            items = ['wait'] * waits + [lifecycle if item == 'lifecycle' else item for item in
+                                        (answer if answer is not None else ['lifecycle', result_event()])]
+            script = _SlowFrames(clock, items + [c.rt._EOF])
             stdin = _SlowStdin()
             native = c.Native.__new__(c.Native)
-            native.deadline = clock['now'] + 500
+            native.deadline = clock['now'] + 21 * waits + 500
             native.renew = lambda: c._renew(handle)
             native.next_renew = clock['now'] + 20
             native.writers = []
             native.frames = SimpleNamespace(failed=threading.Event(), queue=script)
-            native.process = _SlowProcess(script, stdin)
+            native.process = _SlowProcess(script, stdin, returncode)
             native.closed = False
 
             def close():
@@ -415,7 +417,7 @@ class ClaudeAdapter(unittest.TestCase):
             with patch.object(c.time, 'monotonic', lambda: clock['now']), \
                     patch.object(c, 'uuid4', return_value=command):
                 try:
-                    outcome.result = c.execute(handle, 'Project prompt', clock['now'] + 500)
+                    outcome.result = c.execute(handle, 'Project prompt', native.deadline)
                 except c.NativeError as error:
                     outcome.error = error
             return outcome
@@ -439,6 +441,85 @@ class ClaudeAdapter(unittest.TestCase):
         self.assertIn(b'Project prompt', outcome.stdin.chunks[0])
         self.assertEqual(outcome.events, ['stop', 'commit-release'])
         self.assertEqual(outcome.session.state, 'committed')
+
+    def test_turn_longer_than_the_credential_lease_keeps_renewing(self):
+        # A 300 s turn outlives the 240 s broker lease and the 45 s hub task
+        # lease many times over; every 20 s window must renew both.
+        when, beats = [], {'n': 0}
+
+        def prepare(native, clock, session):
+            def renew(lease):
+                self.assertLessEqual(native.next_renew, clock['now'])
+                when.append(clock['now'])
+            session.broker.renew.side_effect = renew
+
+        def beat():
+            beats['n'] += 1
+            return True
+
+        outcome = self._slow_prompt(prepare_execute=prepare, heartbeat=beat, waits=15)
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.result['text'], 'Verified project answer.')
+        self.assertEqual(len(when), 15)
+        self.assertGreater(when[-1] - 10_000.0, 300)
+        self.assertTrue(all(b - a <= 21 for a, b in zip([10_000.0] + when, when)))
+        # One heartbeat before the prompt, then one per renewal.
+        self.assertEqual(beats['n'], 1 + 15)
+        self.assertEqual(outcome.events, ['stop', 'commit-release'])
+        self.assertEqual(outcome.session.state, 'committed')
+
+    def test_account_limit_is_reported_as_quota_exhausted(self):
+        spend = 'You have hit your monthly spend limit for account user@example.com, resets 1pm'
+        cases = {
+            'result text': [result_event(is_error=True, result=spend)],
+            'assistant error': [{'type': 'assistant', 'error': 'rate_limit', 'message': {}},
+                                result_event(is_error=True, result='API Error')],
+            'rejected rate limit event': [{'type': 'rate_limit_event',
+                                           'rate_limit_info': {'status': 'rejected', 'resetsAt': 1}},
+                                          result_event(is_error=True, result='API Error')],
+            'billing error outranks server error': [
+                {'type': 'assistant', 'error': 'server_error', 'message': {}},
+                {'type': 'assistant', 'error': 'billing_error', 'message': {}},
+                result_event(is_error=True, subtype='error_during_execution', result='x')],
+        }
+        for name, answer in cases.items():
+            for returncode in (0, 1):
+                with self.subTest(name, returncode=returncode):
+                    outcome = self._slow_prompt(waits=0, answer=answer, returncode=returncode)
+                    self.assertIsInstance(outcome.error, c.NativeError)
+                    self.assertEqual(str(outcome.error), 'claude_quota_exhausted')
+                    self.assertNotIn('example.com', str(outcome.error))
+                    self.assertEqual(outcome.events, ['stop', 'commit-release'])
+                    self.assertTrue(outcome.handle.attempted)
+
+    def test_account_limit_before_result_still_names_the_cause(self):
+        # The CLI can exit after the refusal without writing a result frame.
+        refused = [{'type': 'assistant', 'error': 'billing_error', 'message': {}}]
+        outcome = self._slow_prompt(waits=0, answer=refused, returncode=1)
+        self.assertEqual(str(outcome.error), 'claude_quota_exhausted')
+
+    def test_other_provider_errors_keep_distinct_codes(self):
+        auth = self._slow_prompt(waits=0, answer=[{'type': 'assistant', 'error': 'authentication_failed',
+                                                   'message': {}},
+                                                  result_event(is_error=True, result='Invalid API key')])
+        self.assertEqual(str(auth.error), 'claude_authentication_failed')
+        odd = self._slow_prompt(waits=0, answer=[{'type': 'assistant', 'error': 'something new', 'message': {}},
+                                                 result_event(is_error=True, result='failed')])
+        self.assertEqual(str(odd.error), 'claude_provider_error')
+        plain = self._slow_prompt(waits=0, answer=['lifecycle', result_event(is_error=True, result='Something broke')])
+        self.assertEqual(str(plain.error), 'claude_task_not_successful')
+        crash = self._slow_prompt(waits=0, returncode=1)
+        self.assertEqual(str(crash.error), 'claude_exit_unsuccessful')
+        # Lifecycle failures keep their fixed code instead of the loop's generic one.
+        unfinished = self._slow_prompt(waits=0, answer=[result_event()])
+        self.assertIsInstance(unfinished.error, c.NativeError)
+        self.assertEqual(str(unfinished.error), 'claude_command_lifecycle_incomplete_outcome_uncertain')
+        # A limit warning on a turn that still succeeds is not a failure.
+        warned = self._slow_prompt(waits=0, answer=[{'type': 'rate_limit_event',
+                                                     'rate_limit_info': {'status': 'allowed_warning'}},
+                                                    'lifecycle', result_event()])
+        self.assertIsNone(warned.error)
+        self.assertEqual(warned.result['text'], 'Verified project answer.')
 
     def test_slow_prompt_renew_failure_keeps_schedule_and_vetted_code(self):
         calls = {'n': 0, 'due': None}

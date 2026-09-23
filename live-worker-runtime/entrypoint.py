@@ -17,6 +17,7 @@ sys.path[:0] = [str(HERE), '/opt/runcrew', '/opt/runcrew/app']
 from agent_hub.worker import Config, HubClient, NoRedirect, WorkerError
 from dynamic_broker import load_client
 from live_loop import Settings, Worker
+import provider_errors
 
 HUB = 'https://runcrew-hub-kdhodumsza-uc.a.run.app'
 
@@ -105,7 +106,9 @@ def main():
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stop)
         result = worker.run()
-        return 0 if result['outcome'] in ('completed', 'idle_drained') else 1
+        if result['outcome'] in ('completed', 'idle_drained'):
+            return 0
+        return worker.last_exit if worker.last_exit == provider_errors.QUOTA_EXIT_CODE else 1
     finally:
         # prepare() owns cleanup if a native child was started but its handle
         # could not be returned. Only a known zero-native case can finish here.

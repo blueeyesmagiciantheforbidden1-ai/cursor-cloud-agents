@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -40,6 +41,15 @@ MAX_ANSWER_BYTES = 15000
 IDLE_QUEUE_LIMIT = 8
 BILLING_POLICY = BillingPolicy(mode='subscription_only')
 _MODEL_PATTERN = None
+# A refused model call names its cause in a structured field (assistant.error,
+# a rejected rate_limit_event) or only in the error result's text. The text is
+# matched here and dropped: only a fixed code leaves the adapter. An account
+# limit is not a transient fault; the controller must not spend retries on it.
+QUOTA_TEXT = re.compile(r'usage limit|spend limit|rate limit|limit reached|hit your limit|'
+                        r'credit balance|out of extra usage|quota', re.IGNORECASE)
+ASSISTANT_ERRORS = {'rate_limit': 'claude_quota_exhausted', 'billing_error': 'claude_quota_exhausted',
+                    'authentication_failed': 'claude_authentication_failed',
+                    'server_error': 'claude_provider_server_error'}
 
 
 class NativeError(provider_errors.ProviderCodeError, RuntimeError):
@@ -169,6 +179,7 @@ class Native:
         self.stderr_thread = threading.Thread(target=self._discard, args=(self.process.stderr,), daemon=True)
         self.stderr_thread.start()
         self.closed = False
+        self.provider_failure = None
 
     @staticmethod
     def _discard(stream):
@@ -261,7 +272,29 @@ class Native:
             events.append(value)
         return events
 
+    def _note_failure(self, code):
+        # An account limit outranks any other signal from the same turn.
+        if self.provider_failure is None or code == 'claude_quota_exhausted':
+            self.provider_failure = code
+
     def prompt(self, text):
+        self.provider_failure = None
+        try:
+            return self._prompt(text)
+        except (NativeError, rt.ClaudeRuntimeError) as error:
+            # A refused call can end without a result frame or a completed
+            # lifecycle; the refusal is the cause either way.
+            if self.provider_failure:
+                raise NativeError(self.provider_failure) from None
+            if isinstance(error, NativeError):
+                raise
+            # Lifecycle errors carry fixed codes; keep them instead of the
+            # loop's generic native_or_connection_failure.
+            code = 'claude_' + str(error)
+            raise NativeError(code if provider_errors.SAFE_CODE.fullmatch(code)
+                              else 'claude_command_lifecycle_invalid') from None
+
+    def _prompt(self, text):
         sent = str(uuid4())
         lifecycle = rt._CommandLifecycle(sent)
         self.send({'type': 'user', 'message': {'role': 'user', 'content': text},
@@ -281,8 +314,18 @@ class Native:
                 if 'session_id' in event:
                     lifecycle.bind_session(event['session_id'])
                 need(event.get('model') == MODEL, 'claude_model_changed')
+            if kind == 'rate_limit_event':
+                info = event.get('rate_limit_info')
+                if isinstance(info, dict) and info.get('status') == 'rejected':
+                    self._note_failure('claude_quota_exhausted')
+            if kind == 'assistant' and isinstance(event.get('error'), str):
+                self._note_failure(ASSISTANT_ERRORS.get(event['error'], 'claude_provider_error'))
             if kind == 'result':
                 result = event
+                reason = event.get('result')
+                if (event.get('is_error') is not False and isinstance(reason, str)
+                        and QUOTA_TEXT.search(reason[:4096])):
+                    self._note_failure('claude_quota_exhausted')
         while True:
             trailing = self.receive(allow_eof=True)
             if trailing is rt._EOF:
@@ -295,7 +338,7 @@ class Native:
         while self.process.poll() is None:
             self.tick()
             time.sleep(0.02)
-        need(self.process.returncode == 0, 'claude_exit_unsuccessful')
+        need(self.process.returncode == 0, self.provider_failure or 'claude_exit_unsuccessful')
         return result
 
     def close(self):
@@ -457,7 +500,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(handle.heartbeat() is True, 'claude_hub_heartbeat_lost')
         handle.attempted = True
         result = handle.native.prompt(prompt)
-        need(result.get('is_error') is False and result.get('subtype') == 'success', 'claude_task_not_successful')
+        need(result.get('is_error') is False and result.get('subtype') == 'success',
+             getattr(handle.native, 'provider_failure', None) or 'claude_task_not_successful')
         text = result.get('result')
         need(isinstance(text, str) and 0 < len(text.encode()) <= MAX_ANSWER_BYTES, 'claude_answer_missing_or_large')
         used = result.get('modelUsage')

@@ -373,15 +373,24 @@ class Worker:
                 outcome.update(outcome='idle_drained', model_call_attempted=False)
                 self.last_exit = 0
                 return outcome
-            self.last_exit = 1
+            quota = provider_errors.is_quota(code)
+            self.last_exit = provider_errors.QUOTA_EXIT_CODE if quota else 1
             outcome.update(error_code=code, model_call_attempted=self.model_call_attempted,
                            claim_attempted=self.claim_attempted)
+            if quota:
+                outcome['provider_quota_exhausted'] = True
             if self.completion_payload is not None:
                 outcome['completion_delivery'] = 'unconfirmed'
             elif self.cleaned and self.task and isinstance(self.task, dict) and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', '')):
+                if quota:
+                    text = ('The ' + self.settings.agent + ' worker could not answer: the provider refused the '
+                            'model call because the account usage limit is exhausted (' + code + '). '
+                            'Retry this room after the limit resets.')
+                else:
+                    text = ('The cloud worker stopped before it could deliver a verified answer (' + code + '). '
+                            'It did not automatically repeat the model request.')
                 try:
-                    self.complete('The cloud worker stopped before it could deliver a verified answer (' + code + '). '
-                                  'It did not automatically repeat the model request.', 1)
+                    self.complete(text, 1)
                 except Exception:
                     outcome['completion_delivery'] = 'unconfirmed'
             return outcome

@@ -10,6 +10,13 @@ reach the hub. Mirrors the check codex applies in its own ``_fail``.
 import re
 
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
+# An account usage, spend or rate limit refused the model call: waiting for the
+# provider's reset is the only fix, so it is not a transient fault. Adapters
+# name these codes <something>_quota_exhausted (codex already raises
+# included_quota_exhausted). The worker exits QUOTA_EXIT_CODE instead of 1 so
+# the controller can park the slot instead of spending retries on it.
+QUOTA_SUFFIX = '_quota_exhausted'
+QUOTA_EXIT_CODE = 75
 
 
 class ProviderCodeError(Exception):
@@ -22,3 +29,7 @@ def error_code(error):
         return None
     code = str(error)
     return code if SAFE_CODE.fullmatch(code) else None
+
+
+def is_quota(code):
+    return isinstance(code, str) and SAFE_CODE.fullmatch(code) is not None and code.endswith(QUOTA_SUFFIX)
