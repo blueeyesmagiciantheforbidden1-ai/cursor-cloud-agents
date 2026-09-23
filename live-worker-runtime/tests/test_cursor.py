@@ -78,11 +78,18 @@ class Fixture:
                 self.session_id, self.prompt_sent, self.answer, self.counts = None, False, '', {}
                 self.closed = False
                 self.idle_hook = None
+                self.idle_frame = None
 
             def alive(self):
                 return not self.closed
 
             def idle_pump(self):
+                # Same bound NativeProcess.pump enforces once stdout is still open.
+                if c.time.monotonic() >= self.deadline:
+                    raise c.metadata.MetadataError('native_metadata_deadline')
+                if self.idle_frame is not None:
+                    frame, self.idle_frame = self.idle_frame, None
+                    c.review.strict_json(frame)
                 if self.idle_hook:
                     self.idle_hook(self)
 
@@ -310,6 +317,98 @@ class CursorAdapter(unittest.TestCase):
             fixture.native.closed = False
             c.close(handle)
 
+    def test_maintain_outlives_startup_deadline_and_vets_a_bad_idle_frame(self):
+        clock = {'now': 50_000.0}
+
+        def now():
+            return clock['now']
+
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root, patch.object(c.time, 'monotonic', now):
+            session = fixture.session(root)
+            before = now()
+            with patch.object(c, '_metadata_process', fixture.metadata_process), \
+                    patch.object(c, '_acp_process', fixture.acp_process):
+                handle = c.prepare(session, lambda: True, before + 180)
+            self.assertGreaterEqual(handle.native.deadline, before + c.WARM_SECONDS)
+            self.assertLess(handle.native.deadline, before + c.WARM_SECONDS + 30)
+            warm = handle.native.deadline
+            clock['now'] = before + 180
+            ready = c.maintain(handle)
+            self.assertTrue(ready['ready_for_project_prompt'])
+            self.assertEqual(handle.native.deadline, warm)
+            clock['now'] = warm - 1
+            self.assertTrue(c.maintain(handle)['authenticated'])
+            self.assertEqual(handle.native.deadline, warm)
+            fixture.native.idle_frame = b'{"jsonrpc":'
+            with self.assertRaises(c.NativeError) as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'cursor_idle_protocol_invalid')
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertNotIn('jsonrpc', str(caught.exception))
+            self.assertTrue(handle.finished)
+            self.assertIsNone(handle.native)
+            self.assertEqual(fixture.events[-2:], ['stop', 'commit-release'])
+            self.assertFalse(handle.readiness['authenticated'])
+
+    def test_idle_protocol_and_renew_faults_close_with_vetted_codes(self):
+        from agent_hub.cloud_credential_broker import BrokerError
+        cases = (
+            ('output_bound', lambda native: (_ for _ in ()).throw(
+                c.metadata.MetadataError('native_metadata_output_bound')), 'cursor_idle_protocol_invalid'),
+            ('frame_bound', lambda native: (_ for _ in ()).throw(
+                c.metadata.MetadataError('native_metadata_frame_bound')), 'cursor_idle_protocol_invalid'),
+            ('review_error', lambda native: (_ for _ in ()).throw(c.review.ReviewError('duplicate_json_key')),
+             'cursor_idle_protocol_invalid'),
+            ('broker_renew', lambda native: (_ for _ in ()).throw(BrokerError('lease_renew_rejected')),
+             'cursor_idle_renew_failed'),
+        )
+        for name, hook, code in cases:
+            with self.subTest(fault=name):
+                fixture = Fixture()
+                with tempfile.TemporaryDirectory() as root:
+                    session, handle = self.prepare(fixture, root)
+                    fixture.native.idle_hook = hook
+                    with self.assertRaises(c.NativeError) as caught:
+                        c.maintain(handle)
+                    self.assertEqual(str(caught.exception), code)
+                    self.assertNotIn('lease_renew', str(caught.exception))
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertTrue(handle.finished)
+                    self.assertIsNone(handle.native)
+                    session.finish.assert_called_once_with(native_stopped=True)
+
+    def test_vetted_idle_error_is_not_remapped_and_leaves_the_handle_open(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            fixture.native.idle_hook = lambda native: (_ for _ in ()).throw(c.NativeError('cursor_lease_lost'))
+            with self.assertRaises(c.NativeError) as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'cursor_lease_lost')
+            self.assertFalse(handle.finished)
+            self.assertIs(handle.native, fixture.native)
+            session.finish.assert_not_called()
+            c.close(handle)
+
+    def test_execute_replaces_the_warm_deadline(self):
+        seen = {}
+
+        def hook(native, params):
+            seen['deadline'] = native.deadline
+            native.answer = 'Verified project answer.'
+            native.counts = {'agent_message_chunk': 1}
+            return {'stopReason': 'end_turn'}
+
+        fixture = Fixture(prompt_hook=hook)
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            warm = handle.native.deadline
+            task_deadline = time.monotonic() + 60
+            c.execute(handle, 'Project prompt', task_deadline)
+            self.assertEqual(seen['deadline'], task_deadline)
+            self.assertNotEqual(seen['deadline'], warm)
+
 
 class LiveProtocol(unittest.TestCase):
     """LiveProcess frame handling without a native process."""
@@ -381,6 +480,24 @@ class LiveProtocol(unittest.TestCase):
         live.idle_pump()
         self.assertEqual(live.counts, {'session_info_update': 1})
         self.assertEqual(live.answer, '')
+
+    def test_idle_pump_deadline_and_malformed_frame(self):
+        clock = {'now': 90_000.0}
+        live = self.process()
+        live.next_heartbeat = clock['now'] + 10_000
+        live.deadline = clock['now'] + 180
+        live.selector = SimpleNamespace(get_map=lambda: {1: object()}, select=lambda _timeout: [])
+        with patch.object(c.time, 'monotonic', lambda: clock['now']), \
+                patch.object(c.metadata.time, 'monotonic', lambda: clock['now']):
+            clock['now'] += 180
+            with self.assertRaises(c.metadata.MetadataError) as caught:
+                live.idle_pump()
+            self.assertEqual(str(caught.exception), 'native_metadata_deadline')
+            live.deadline = clock['now'] + c.WARM_SECONDS
+            live.idle_pump()
+            live.buffer = bytearray(b'{"jsonrpc":\n')
+            with self.assertRaises(json.JSONDecodeError):
+                live.idle_pump()
 
 
 if __name__ == '__main__':
