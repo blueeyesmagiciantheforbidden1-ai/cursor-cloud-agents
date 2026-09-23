@@ -65,3 +65,13 @@ Findings, agreed across Alpha and Light:
 - The failed room's real code was `project_work_only` (`live_loop.py` `task_prompt`), which fires before any provider or deadline check. The room lacked `purpose == 'project'`; the hub revision serving since then stores it. A fresh room on the current revision is the test; the old room stays failed.
 - Any non-zero exit from any agent fails the whole room with no automatic retry (`core.py` completion path). Deliberate; leave it.
 - Hardening still to do, deferred because `core.py`/`test_hub.py` already carry two unmerged patches (room engine on Retina, usage gate on Demand) that overlap: reject a room at `create()` when `timeout_seconds` is below what an agent on it needs. Only codex has a floor today (`FINALIZE_RESERVE` 45 + 30 in `providers/codex.py`, plus the loop's 25 s completion reserve, so about 100 s; use 120). Keep other agents at 30. Pair it with a test that derives the codex number from the adapter constants so it cannot go stale. A worker cannot enforce this itself because `timeout_seconds` only arrives inside the claim.
+
+### Fleet capability as verified on 2026-09-22
+
+| Machine | Host | Has | Lacks |
+| --- | --- | --- | --- |
+| Alpha | WIN-R7K3M9X2P6N | git with GitHub credential (fetch and push verified on both repos), this checkout, `C:\API_KEYS` pack, Python 3.12 at `AppData\Local\Programs\Python\Python312` | gcloud, hub manager token (lookup blocked as credential exploration) |
+| Light | WIN-L8Q2M6V9R4K | gcloud (project visible; `run jobs executions list` works), GitHub read on both repos | `logging read` (user denied), Firestore document read (classifier denied), runcrew checkout, verified push |
+| Demand / Retina | WIN-4RR6E8E6DGC (one box) | Cursor worker directories only | gcloud, any checkout, hub URL or token, GitHub credential |
+
+No machine can create a hub room; that requires the manager token, so a live five-agent test has to start from the operator's ChatGPT connector. Cursor's split that assigned Firestore reads to Retina does not match that box.
