@@ -520,6 +520,109 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(store.state['slot_template_sha256'], digest(cloud.job['template']))
         self.assertEqual(cloud.run_count, 1)
 
+    def _strip_binding(self, store):
+        for key in ('policy_sha256', 'slot_job_uid', 'slot_enabled', 'slot_template_sha256'):
+            store.state.pop(key, None)
+
+    def test_legacy_policy_and_template_change_is_refused_while_job_has_previous_template(self):
+        # The live job still shows the previous template, so a template-only
+        # re-key would succeed. A policy edit in the same change must not.
+        controller, store, cloud, _, _, _ = self.make()
+        self._legacy_state(controller, store)
+        before, version = deepcopy(store.state), store.version
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        controller.slot['template_sha256'] = digest({'offline': 'rolled-template'})
+        self.assertEqual(digest(cloud.job['template']), digest({'offline': 'fixed-template'}))
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        self.assertEqual(cloud.run_count, 0)
+
+    def test_job_uid_and_template_change_is_refused_without_split_fields(self):
+        # Legacy document, and a new-format document with the split fields
+        # removed, while the job still has the previous template.
+        cases = ('legacy', 'stripped')
+        for name in cases:
+            with self.subTest(shape=name):
+                controller, store, cloud, _, _, _ = self.make()
+                if name == 'legacy':
+                    self._legacy_state(controller, store)
+                else:
+                    self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+                    cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+                        reconciling=False, runningCount=0, succeededCount=1)
+                    controller.broker.state.update(execution_uid=NEXT_UID)
+                    self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+                    self._strip_binding(store)
+                before, version = deepcopy(store.state), store.version
+                archives, runs = deepcopy(store.archives), cloud.run_count
+                controller.slot['template_sha256'] = digest({'offline': 'rolled-template'})
+                controller.slot['job_uid'] = '44444444-4444-4444-4444-444444444444'
+                self.assertEqual(digest(cloud.job['template']), digest({'offline': 'fixed-template'}))
+                with self.assertRaises(ControllerError) as caught:
+                    controller.tick()
+                self.assertEqual(str(caught.exception), 'controller_config_changed')
+                self.assertEqual(store.state, before)
+                self.assertEqual(store.version, version)
+                self.assertEqual(store.archives, archives)
+                self.assertEqual(cloud.run_count, runs)
+
+    def test_policy_change_on_terminal_active_does_not_archive_or_write(self):
+        controller, store, cloud, broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        before, version = deepcopy(store.state), store.version
+        with self.assertRaises(ControllerError) as caught:
+            controller.tick()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.state['phase'], 'active')
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_reset_refuses_a_policy_change(self):
+        controller, store, cloud, _, _, _ = self.blocked()
+        before, version = deepcopy(store.state), store.version
+        controller.policy = replace(controller.policy, lease_seconds=180)
+        with self.assertRaises(ControllerError) as caught:
+            controller.reset()
+        self.assertEqual(str(caught.exception), 'controller_config_changed')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        self.assertEqual(cloud.run_count, 1)
+
+    def test_active_match_does_not_rewrite_until_the_drain(self):
+        # A legacy active document keeps its bytes while the execution runs.
+        # The drain archives that receipt, then the idle pass of the same tick
+        # records the split fields.
+        controller, store, cloud, broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self._strip_binding(store)
+        before, version = deepcopy(store.state), store.version
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state, before)
+        self.assertEqual(store.version, version)
+        self.assertEqual(store.archives, [])
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:00:01Z',
+            reconciling=False, runningCount=0, succeededCount=1)
+        broker.state.update(execution_uid=NEXT_UID)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertEqual(store.state['policy_sha256'], digest(asdict(controller.policy)))
+        self.assertEqual(store.state['slot_template_sha256'], controller.slot['template_sha256'])
+        self.assertEqual(len(store.archives), 1)
+        archived, _ = store.archives[0]
+        self.assertEqual(archived['phase'], 'active')
+        self.assertNotIn('policy_sha256', archived)
+
     def test_legacy_policy_change_and_unprovable_template_change_are_refused(self):
         controller, store, cloud, _, _, _ = self.make()
         self._legacy_state(controller, store)

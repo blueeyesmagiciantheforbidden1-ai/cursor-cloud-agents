@@ -165,11 +165,17 @@ class Controller:
         Idle and blocked are the only phases that may take the new digest: the
         next launch has not started, or the slot is already stopped. Binding,
         launch, grant, and active keep controller_config_changed so a rollout
-        cannot retarget an attempt that is already in flight. The re-key is one
-        CAS of the new config_sha256 plus the split fields; the caller continues
-        on that state.
+        cannot retarget an attempt that is already in flight. A matching config
+        is not rewritten in those phases either. A CAS while the execution is
+        still active changes the receipt a concurrent revision will archive, and
+        the two receipts then disagree (controller_archive_uncertain). The
+        active drain saves idle and continues this loop, so the binding is
+        recorded on that later pass of the same tick. The re-key itself is one
+        CAS of the new config_sha256 plus the split fields.
         """
         if state.get('config_sha256') == self.config_sha:
+            if state.get('phase') not in ('idle', 'blocked'):
+                return state, version
             return self._remember_binding(state, version)
         if state.get('phase') not in ('idle', 'blocked'):
             raise ControllerError('controller_config_changed')
