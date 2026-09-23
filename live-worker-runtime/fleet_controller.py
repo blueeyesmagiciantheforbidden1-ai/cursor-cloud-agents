@@ -1,8 +1,10 @@
 """Cloud-owned replenishment of single-use warm jobs, with durable intents.
 
-Only clean terminal executions with released credential ownership are replaced.
-Unknown launches, failed jobs and quarantined credentials stop that slot instead
-of spending money in a restart loop. This module contains no provider calls.
+Clean terminal executions with released credential ownership are replaced; a
+failed one that released cleanly is replaced after a backoff, and the third
+consecutive failure stops the slot. Unknown launches, unreleased or quarantined
+credentials stop the slot at once instead of spending money in a restart loop.
+This module contains no provider calls.
 """
 from __future__ import annotations
 

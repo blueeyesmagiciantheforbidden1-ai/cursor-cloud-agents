@@ -134,6 +134,18 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
         self.assertEqual(cloud.run_count, 2)
 
+    def test_failure_count_survives_a_relaunch_and_backoff_doubles(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.fail_current(cloud, broker)
+        self.assertEqual(controller.tick()['consecutive_failures'], 1)
+        controller.clock = lambda: 1200
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['consecutive_failures'], 1)
+        self.fail_current(cloud, broker)
+        result = controller.tick()
+        self.assertEqual(result['consecutive_failures'], 2)
+        self.assertEqual(store.state['next_launch_at'], 1200 + 240)
+
     def test_third_consecutive_failure_stops_the_slot(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
         store.state['consecutive_failures'] = 2
