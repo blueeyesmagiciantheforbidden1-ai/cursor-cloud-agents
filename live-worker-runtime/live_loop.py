@@ -53,6 +53,18 @@ def idle_fault(error):
     return 'fail'
 
 
+def handle_released(handle):
+    """True once maintain() has closed or quarantined the native session.
+
+    A retryable idle fault may be polled again only while that session is still
+    open. Copilot closes and then re-raises copilot_hub_heartbeat_lost; calling
+    maintain() again targets a dead handle until the warm window ends.
+    """
+    if getattr(handle, 'finished', False) or getattr(handle, 'close_failed', False):
+        return True
+    return getattr(handle, 'state', None) in ('closed', 'closing', 'quarantined')
+
+
 @dataclass(frozen=True)
 class Settings:
     agent: str
@@ -238,7 +250,9 @@ class Worker:
                     fault = idle_fault(error)
                     if fault == 'drain':
                         break
-                    if fault != 'retry':
+                    # A closed or quarantined handle must not be polled until
+                    # idle_deadline. The original code stays the outcome.
+                    if fault != 'retry' or handle_released(self.handle):
                         raise
                     self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))
                     continue
@@ -258,6 +272,10 @@ class Worker:
                             and warm - self.clock() < self._task_budget()) or self.stopping:
                         break
                     self.sleep(max(0, idle_deadline - self.clock()))
+                    break
+                # The loop condition is not rechecked after maintain() or report().
+                # A stop requested during this iteration must not take a lease.
+                if self.stopping:
                     break
                 self.claim_attempted = True
                 # An uncertain claim ends this execution. Never silently claim

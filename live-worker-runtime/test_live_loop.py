@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
-from live_loop import Worker, Settings, LiveError, task_prompt
+from live_loop import Worker, Settings, LiveError, task_prompt, handle_released
 from provider_errors import ProviderCodeError, error_code
 
 
@@ -283,7 +283,8 @@ class LoopTests(unittest.TestCase):
 
     def test_idle_transient_maintain_errors_are_retried(self):
         for error in (OSError('transient native pipe'), CodeError('hub_lease_lost'),
-                      CodeError('claude_hub_heartbeat_lost'), CodeError('cursor_lease_lost')):
+                      CodeError('claude_hub_heartbeat_lost'), CodeError('cursor_lease_lost'),
+                      CodeError('copilot_hub_heartbeat_lost')):
             with self.subTest(error=str(error)):
                 worker, client, adapter, clock = self.setup_worker(); client.empty = True
                 pending = [error]
@@ -512,6 +513,189 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(worker.last_exit, 1)
         self.assertEqual(client.completions, [])
         self.assertNotIn('execute', adapter.calls)
+
+    def test_closed_handle_maintain_fault_is_not_retried_until_the_deadline(self):
+        # Copilot maintain() closes, then re-raises copilot_hub_heartbeat_lost.
+        # That code is idle-retryable, so the loop used to call maintain() on
+        # the dead handle until warm_seconds elapsed and then exit 0.
+        worker, client, adapter, clock = self.setup_worker()
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            handle.finished = True
+            raise CodeError('copilot_hub_heartbeat_lost')
+        def close(handle):
+            adapter.calls.append('close')
+        adapter.maintain, adapter.close = maintain, close
+        result = worker.run()
+        self.assertEqual(adapter.calls.count('maintain'), 1)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['error_code'], 'copilot_hub_heartbeat_lost')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(client.claims, 0)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIn('close', adapter.calls)
+        self.assertEqual(clock.now, 100)
+        self.assertLess(clock.now - 100, 45)
+
+    def test_closed_handle_follow_up_does_not_replace_the_original_code(self):
+        # The second maintain() on a finished Copilot handle is
+        # copilot_handle_not_idle. Retrying once recorded that instead of the
+        # heartbeat loss that closed the session.
+        worker, client, adapter, clock = self.setup_worker()
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            if getattr(handle, 'finished', False):
+                raise CodeError('copilot_handle_not_idle')
+            handle.finished = True
+            raise CodeError('copilot_hub_heartbeat_lost')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(adapter.calls.count('maintain'), 1)
+        self.assertEqual(result['error_code'], 'copilot_hub_heartbeat_lost')
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(clock.now, 100)
+        self.assertEqual(client.claims, 0)
+
+    def test_quarantined_handle_is_not_polled_and_cannot_exit_clean(self):
+        worker, client, adapter, clock = self.setup_worker()
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            handle.close_failed = True
+            handle.state = 'quarantined'
+            raise CodeError('hub_lease_lost')
+        def close(handle):
+            adapter.calls.append('close')
+            raise ValueError('quarantined')
+        adapter.maintain, adapter.close = maintain, close
+        result = worker.run()
+        self.assertEqual(adapter.calls.count('maintain'), 1)
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(client.claims, 0)
+        self.assertEqual(clock.now, 100)
+
+    def test_session_loss_after_the_adapter_closed_still_drains(self):
+        # warm-session loss is a failure classification in idle_fault, then
+        # the except path drains only when close has released the credential.
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            handle.finished = True
+            raise CodeError('copilot_warm_session_lost')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertNotIn('error_code', result)
+        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(adapter.calls.count('maintain'), 1)
+        self.assertIn('close', adapter.calls)
+        self.assertEqual(client.claims, 0)
+
+    def test_stop_during_maintain_does_not_claim(self):
+        # warm_seconds still covers a task, so the short-window break does not
+        # run. stopping set during maintain must still skip the claim.
+        worker, client, adapter, clock = self.setup_worker()
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            worker.stopping = True
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(client.claims, 0)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertNotIn('error_code', result)
+        self.assertEqual(worker.last_exit, 0)
+        self.assertIn('close', adapter.calls)
+        self.assertEqual(clock.now, 100)
+
+    def test_stop_during_maintain_without_credential_release_exits_unclean(self):
+        worker, client, adapter, _ = self.setup_worker()
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            worker.stopping = True
+        def close(handle):
+            adapter.calls.append('close')
+            raise ValueError('quarantined')
+        adapter.maintain, adapter.close = maintain, close
+        result = worker.run()
+        self.assertEqual(client.claims, 0)
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(worker.last_exit, 1)
+
+    def test_lost_claim_does_not_hold_a_lease_or_exit_clean_without_release(self):
+        # Hub lease is 45s (agent_hub.core.LEASE_SECONDS) and only a heartbeat
+        # with the token extends it. A lost claim response may have assigned
+        # the room, but this process never sees the token: it must not post a
+        # task heartbeat, must not claim again, and must return immediately.
+        # Exit 0 only if close released the credential.
+        worker, client, adapter, clock = self.setup_worker(); client.fail_claim = True
+        result = worker.run()
+        heartbeats = [path for path, _ in client.calls if path.endswith('/heartbeat')]
+        self.assertEqual(heartbeats, [])
+        self.assertEqual(client.claims, 1)
+        self.assertEqual(clock.now, 100)
+        self.assertLess(clock.now - 100, 45)
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertIn('close', adapter.calls)
+        self.assertNotIn('execute', adapter.calls)
+
+        worker, client, adapter, clock = self.setup_worker(); client.fail_claim = True
+        def close(handle):
+            adapter.calls.append('close')
+            raise ValueError('quarantined')
+        adapter.close = close
+        result = worker.run()
+        self.assertEqual(client.claims, 1)
+        self.assertEqual([path for path, _ in client.calls if path.endswith('/heartbeat')], [])
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(clock.now, 100)
+
+    def test_offline_report_failure_does_not_hide_a_failed_release(self):
+        # A missed final /report is not a credential. Exit 0 stays a clean
+        # release; a failed close still exits unclean even if the report also fails.
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        original = client.post
+        def post(path, value):
+            if path.endswith('/report') and value.get('status') == 'offline' and value.get('last_exit_code') == 0:
+                client.calls.append((path, copy.deepcopy(value)))
+                raise OSError('offline report dropped')
+            return original(path, value)
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(result['offline_report'], 'unconfirmed')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertIn('close', adapter.calls)
+
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        original = client.post
+        def close(handle):
+            adapter.calls.append('close')
+            raise ValueError('quarantined')
+        def post_both(path, value):
+            if path.endswith('/report') and value.get('status') == 'offline' and value.get('last_exit_code') is not None:
+                client.calls.append((path, copy.deepcopy(value)))
+                raise OSError('offline report dropped')
+            return original(path, value)
+        adapter.close = close
+        client.post = post_both
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertEqual(result.get('offline_report'), 'unconfirmed')
+
+    def test_handle_released_matches_provider_close_flags(self):
+        self.assertFalse(handle_released(SimpleNamespace(state='ready')))
+        self.assertFalse(handle_released(SimpleNamespace()))
+        self.assertTrue(handle_released(SimpleNamespace(finished=True)))
+        self.assertTrue(handle_released(SimpleNamespace(close_failed=True)))
+        for state in ('closed', 'closing', 'quarantined'):
+            self.assertTrue(handle_released(SimpleNamespace(state=state)))
 
     def test_idle_session_loss_without_credential_release_stays_failed(self):
         worker, client, adapter, _ = self.setup_worker(); client.empty = True
