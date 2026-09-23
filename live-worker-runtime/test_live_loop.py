@@ -255,7 +255,7 @@ class LoopTests(unittest.TestCase):
         finalize = module_constant(ast.parse(source), 'FINALIZE_RESERVE')
         need = int(re.search(r'EXECUTE_WARM_FLOOR = FINALIZE_RESERVE \+ (\d+)', source).group(1))
         self.assertIn('need(EXECUTE_WARM_FLOOR <= remaining <= 900', source)
-        self.assertIn('warm_deadline - time.monotonic() >= EXECUTE_WARM_FLOOR', source)
+        self.assertIn("need(time.monotonic() < handle.warm_deadline, 'warm_session_expired')", source)
         self.assertLessEqual(finalize + need + reserve, hub_codex_minimum)
 
     def test_idle_drains_and_releases_without_prompt(self):
