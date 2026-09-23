@@ -397,6 +397,56 @@ class CodexLive(unittest.TestCase):
         self.session.finish.assert_not_called()
         c.close(handle)
 
+    def test_poll_idle_hub_loss_is_retried_until_a_task_is_claimed(self):
+        # maintain wraps poll_idle: a hub_lease_lost from the renew callback is an
+        # idle retry only while the warm handle is ready and unclaimed.
+        handle = self.prepare()
+        handle.next_renew = time.monotonic() + 1000
+        due = handle.native.next_renew = time.monotonic() - 1
+        self.heartbeat.return_value = False
+        before = self.session.broker.renew.call_count
+        readiness = c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertFalse(handle.consumed)
+        self.assertTrue(readiness['ready_for_project_prompt'])
+        self.assertEqual(self.session.broker.renew.call_count, before + 1)
+        self.assertGreater(handle.next_renew, time.monotonic())
+        self.assertEqual(handle.native.next_renew, due)
+        self.session.finish.assert_not_called()
+        self.assertIsNone(self.native.process.poll())
+        self.assertEqual(self.prompt_count(), 0)
+        self.heartbeat.return_value = True
+        c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertFalse(handle.consumed)
+        self.assertGreater(handle.native.next_renew, time.monotonic())
+        self.assertEqual(self.session.broker.renew.call_count, before + 2)
+        self.session.finish.assert_not_called()
+        c.close(handle)
+
+        self._fresh_session()
+        handle = self.prepare()
+        handle.native.next_renew = time.monotonic() + 1000
+        real_poll = handle.native.poll_idle
+
+        def poll_idle():
+            # Arm only this call, after execute's strict renew and metadata collect.
+            handle.native.next_renew = 0
+            return real_poll()
+
+        handle.native.poll_idle = poll_idle
+
+        def beat():
+            return handle.native.next_renew > time.monotonic()
+
+        self.heartbeat.side_effect = beat
+        with self.assertRaisesRegex(c.LiveCodexError, '^hub_lease_lost$') as caught:
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertTrue(handle.consumed)
+        self.assertEqual(handle.state, 'closed')
+        self.assertEqual(self.prompt_count(), 0)
+        self.assertFalse(caught.exception.model_call_attempted)
+
     def _broker_renew_failure(self, handle):
         self.session.broker.renew.side_effect = RuntimeError('SYNTHETIC_BROKER_DOWN')
         with self.assertRaises(c.LiveCodexError) as caught:

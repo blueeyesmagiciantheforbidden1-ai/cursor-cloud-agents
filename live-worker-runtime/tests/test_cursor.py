@@ -660,6 +660,37 @@ class LiveProtocol(unittest.TestCase):
         with self.assertRaisesRegex(c.NativeError, '^cursor_lease_lost$'):
             live.pump()
 
+    def test_tolerated_broker_failure_retries_at_retry_seconds_while_hub_heartbeat_runs(self):
+        state = {'now': 5_000.0}
+
+        def clock():
+            return state['now']
+
+        beats = []
+        handle = c.Handle(session=SimpleNamespace(
+            lease=SimpleNamespace(), broker=SimpleNamespace(renew=Mock(
+                side_effect=MutationUncertain('broker_http_outcome_uncertain')))),
+            heartbeat=lambda: beats.append(True) or True,
+            lease_clock=broker_renew.LeaseClock(c.NativeError, 'cursor', state['now'], clock=clock))
+        live = c.LiveProcess.__new__(c.LiveProcess)
+        live.heartbeat = lambda: c._renew(handle)
+        live.deadline = state['now'] + 30
+        live.selector = SimpleNamespace(get_map=lambda: {1: object()}, select=lambda timeout: [])
+        live.next_heartbeat = state['now']
+        with patch('time.monotonic', clock):
+            live.pump()
+            self.assertEqual(beats, [True])
+            self.assertEqual(live.next_heartbeat, state['now'] + broker_renew.RETRY_SECONDS)
+            # Inside the retry interval the broker is not called again.
+            live.pump()
+            self.assertEqual(beats, [True])
+            self.assertEqual(handle.session.broker.renew.call_count, 1)
+            state['now'] += broker_renew.RETRY_SECONDS
+            live.pump()
+        self.assertEqual(beats, [True, True])
+        self.assertEqual(handle.session.broker.renew.call_count, 2)
+        self.assertEqual(live.next_heartbeat, state['now'] + broker_renew.RETRY_SECONDS)
+
     def test_metadata_pump_tolerance(self):
         handle = c.Handle(session=SimpleNamespace(
             lease=SimpleNamespace(), broker=SimpleNamespace(renew=Mock(
