@@ -18,7 +18,10 @@ Build and deploy, one provider at a time, from the pack directory under the depl
     gcloud --configuration=runcrew-deploy builds submit --config cloudbuild.json . \
       --gcs-source-staging-dir=gs://project-0c6d31fa-509e-4116-a2c_cloudbuild/source
     gcloud --configuration=runcrew-deploy run jobs update runcrew-worker-<job> --region us-central1 \
-      --image us-central1-docker.pkg.dev/project-0c6d31fa-509e-4116-a2c/runcrew-hub/<provider>-worker@<digest>
+      --image us-central1-docker.pkg.dev/project-0c6d31fa-509e-4116-a2c/runcrew-hub/<provider>-worker@<digest> \
+      --update-env-vars RUNCREW_IMAGE_DIGEST=sha256:<digest>
+
+Set `RUNCREW_IMAGE_DIGEST` on that `jobs update` to `sha256:` plus the same 64-character lowercase hex digest as the image. The worker sends its capability manifest on `POST /v1/workers/report` only when that variable is set and every manifest field validates. If the variable is missing, or any field is missing or invalid, the worker omits `capability` and the report still succeeds. Use `--update-env-vars` so the job's existing environment stays in place. The manifest also needs `CLI_NAME`, `CLI_VERSION`, and `TOOLS_POLICY` already defined as fixed constants on the provider adapter; versions are not invented, so a provider that does not already publish one of them omits the manifest even when the digest is set.
 
 Updating a job's image changes its template digest. The slot's `template_sha256` in the controller's `fleet.json` has to match that digest, or the next tick refuses with `job_template_changed`. That digest is also part of `config_sha256` (policy + slot), which `runcrew_fleet_state` keeps from the tick that created it. A template-only change is re-keyed, not refused: when the slot is `idle` or `blocked` and the previous template still proves the stored digest, the controller CAS-saves the new `config_sha256` and launches on the new template. The state records `policy_sha256`, `slot_job_uid`, `slot_enabled`, and `slot_template_sha256` so the proof is the previous template filled back into the current policy and slot. A document written before those fields existed (only `config_sha256`) is handled in either of two orders:
 

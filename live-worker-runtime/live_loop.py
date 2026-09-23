@@ -6,13 +6,18 @@ claim is retried here. Completion alone is idempotent and may be redelivered.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 import re
 import time
 
 import provider_errors
+
+# Process start for this interpreter. The capability manifest stamps it once.
+_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 class LiveError(provider_errors.ProviderCodeError, RuntimeError):
@@ -139,11 +144,177 @@ def task_prompt(task, room, agent):
     return result
 
 
+# Hub POST /v1/workers/report capability object. A present value that is null,
+# partial, or carrying an unknown key is rejected in full, so this side sends
+# the object only when every field matches and otherwise omits the key.
+_CAPABILITY_FIELDS = (
+    'runner', 'region', 'cli_name', 'cli_version', 'workspace_mode', 'tools_policy',
+    'model', 'effort', 'auth_alias', 'image_digest', 'started_at',
+)
+_REGION = re.compile(r'[a-z][a-z0-9-]{0,31}')
+_CLI_NAME = re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,31}')
+_CLI_VERSION = re.compile(r'[A-Za-z0-9._+-]{1,32}')
+_TOOLS_POLICY = re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,63}')
+_MODEL = re.compile(r'[A-Za-z0-9._:@/+\[\]-]{1,64}')
+_EFFORT = re.compile(r'[A-Za-z0-9._-]{1,32}')
+_AUTH_ALIAS = re.compile(r'[A-Za-z0-9_-]{1,32}')
+_IMAGE_DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
+_SPAN_NAMES = frozenset({'startup', 'claim', 'task_setup', 'model_call', 'close', 'complete'})
+_SPAN_FIELDS = ('trace_id', 'room_id', 'step', 'attempt_key', 'span', 'duration_ms', 'outcome', 'error_code')
+
+
+def _fullmatch(pattern, value):
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _started_at_valid(value, now):
+    """Timezone-aware ISO-8601, at most 40 characters, not in the future."""
+    if not isinstance(value, str) or not value or len(value) > 40:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (ValueError, OverflowError, TypeError):
+        return False
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return False
+    try:
+        current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            return False
+        return parsed.timestamp() <= current.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
+def capability_valid(value, now=None):
+    """True only for a complete capability object the hub would accept."""
+    try:
+        if type(value) is not dict or set(value) != set(_CAPABILITY_FIELDS):
+            return False
+        if value['runner'] not in ('cloud_run_job', 'local'):
+            return False
+        if value['workspace_mode'] not in ('read_only', 'write'):
+            return False
+        if not _fullmatch(_REGION, value['region']):
+            return False
+        if not _fullmatch(_CLI_NAME, value['cli_name']):
+            return False
+        if not _fullmatch(_CLI_VERSION, value['cli_version']):
+            return False
+        if not _fullmatch(_TOOLS_POLICY, value['tools_policy']):
+            return False
+        if not _fullmatch(_MODEL, value['model']):
+            return False
+        if not _fullmatch(_EFFORT, value['effort']):
+            return False
+        if not _fullmatch(_AUTH_ALIAS, value['auth_alias']):
+            return False
+        if not _fullmatch(_IMAGE_DIGEST, value['image_digest']):
+            return False
+        return _started_at_valid(value['started_at'], now)
+    except Exception:
+        return False
+
+
+def _adapter_attr(adapter, name):
+    try:
+        return getattr(adapter, name, None)
+    except Exception:
+        return None
+
+
+def capability_manifest(adapter, agent, started_at, environ=None, now=None):
+    """One complete manifest, or None when any field is missing or invalid.
+
+    Never returns a partial object and never raises: a bad manifest must not
+    fail the worker report.
+    """
+    try:
+        if environ is None:
+            environ = os.environ
+        region = environ.get('RUNCREW_REGION') or 'us-central1'
+        manifest = {
+            'runner': 'cloud_run_job' if environ.get('CLOUD_RUN_EXECUTION') else 'local',
+            'region': region,
+            'cli_name': _adapter_attr(adapter, 'CLI_NAME'),
+            'cli_version': _adapter_attr(adapter, 'CLI_VERSION'),
+            'workspace_mode': 'read_only',
+            'tools_policy': _adapter_attr(adapter, 'TOOLS_POLICY'),
+            'model': _adapter_attr(adapter, 'MODEL'),
+            'effort': _adapter_attr(adapter, 'EFFORT'),
+            'auth_alias': agent,
+            'image_digest': environ.get('RUNCREW_IMAGE_DIGEST') or None,
+            'started_at': started_at,
+        }
+        if not capability_valid(manifest, now=now):
+            return None
+        return manifest
+    except Exception:
+        return None
+
+
+def attempt_key(token):
+    """First 16 hex chars of sha256(lease_token). The token itself is never returned."""
+    try:
+        if not isinstance(token, str) or not 1 <= len(token) <= 128:
+            return None
+        digest = hashlib.sha256(token.encode('utf-8')).hexdigest()[:16]
+    except Exception:
+        return None
+    if re.fullmatch(r'[a-f0-9]{16}', digest):
+        return digest
+    return None
+
+
+def _span_code(error):
+    return provider_errors.error_code(error) or 'native_or_connection_failure'
+
+
+def _span_context(task, key):
+    room_id = None
+    step = None
+    if isinstance(task, dict):
+        room = task.get('room_id')
+        if isinstance(room, str) and re.fullmatch(r'[a-f0-9]{32}', room):
+            room_id = room
+        value = task.get('step')
+        if type(value) is int and 0 <= value <= 10000:
+            step = value
+    if not (isinstance(key, str) and re.fullmatch(r'[a-f0-9]{16}', key)):
+        key = None
+    return room_id, step, key
+
+
+def _usage_measured_at(handle):
+    """UTC ISO timestamp when the handle exposes a usage or preflight snapshot.
+
+    Reads the two attributes and nothing else. A raising attribute is ignored.
+    The snapshot itself is never copied.
+    """
+    if handle is None:
+        return None
+
+    def read(name):
+        try:
+            return getattr(handle, name, None)
+        except Exception:
+            return None
+
+    try:
+        usage, preflight = read('usage'), read('preflight')
+        if (type(usage) is dict and len(usage) > 0) or (type(preflight) is dict and len(preflight) > 0):
+            return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    except Exception:
+        return None
+    return None
+
+
 class Worker:
     def __init__(self, settings, client, adapter, session, *, clock=time.monotonic,
-                 sleep=time.sleep, log=lambda record: None):
+                 sleep=time.sleep, log=lambda record: None, trace_id=None):
         self.settings, self.client, self.adapter, self.session = settings, client, adapter, session
         self.clock, self.sleep, self.log = clock, sleep, log
+        self.trace_id = trace_id if isinstance(trace_id, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', trace_id) else None
         self.handle = None
         self.task = None
         self.ready = False
@@ -154,6 +325,77 @@ class Worker:
         self.model_call_attempted = False
         self.completion_payload = None
         self.cleaned = False
+        self.spans = []
+        self._attempt_key = None
+        self._capability_ready = False
+        self._capability_value = None
+
+    def _capability(self):
+        """Build the manifest once per run. Failure omits it; it never raises."""
+        if self._capability_ready:
+            return self._capability_value
+        self._capability_ready = True
+        try:
+            self._capability_value = capability_manifest(
+                self.adapter, self.settings.agent, _PROCESS_STARTED_AT)
+        except Exception:
+            self._capability_value = None
+        if not capability_valid(self._capability_value):
+            self._capability_value = None
+        return self._capability_value
+
+    def _duration_ms(self, started):
+        try:
+            elapsed = self.clock() - started
+        except Exception:
+            return 0
+        if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+            return 0
+        return int(elapsed * 1000)
+
+    def _emit_span(self, span, started, outcome, *, error_code=None, task=None, attempt_key=None):
+        """One runcrew_live_span line. Fixed codes only; log failures do not fail the run."""
+        if span not in _SPAN_NAMES:
+            return
+        if not isinstance(outcome, str) or provider_errors.SAFE_CODE.fullmatch(outcome) is None:
+            outcome = 'native_or_connection_failure'
+        if error_code is not None and (not isinstance(error_code, str)
+                                        or provider_errors.SAFE_CODE.fullmatch(error_code) is None):
+            error_code = 'native_or_connection_failure'
+        room_id, step, key = _span_context(task, attempt_key)
+        record = {
+            'trace_id': self.trace_id, 'room_id': room_id, 'step': step, 'attempt_key': key,
+            'span': span, 'duration_ms': self._duration_ms(started), 'outcome': outcome,
+            'error_code': error_code,
+        }
+        stored = {field: record[field] for field in _SPAN_FIELDS}
+        self.spans.append(stored)
+        try:
+            self.log({'kind': 'runcrew_live_span', **stored})
+        except Exception:
+            pass
+
+    def _close_for_span(self):
+        started = self.clock()
+        try:
+            self.adapter.close(self.handle)
+        except Exception as error:
+            code = _span_code(error)
+            self._emit_span('close', started, code, error_code=code, task=self.task, attempt_key=self._attempt_key)
+            raise
+        self.cleaned = True
+        self._emit_span('close', started, 'ok', task=self.task, attempt_key=self._attempt_key)
+
+    def _complete_for_span(self, output, exit_code, *, error_code=None):
+        started = self.clock()
+        try:
+            self.complete(output, exit_code, error_code=error_code)
+        except Exception as error:
+            code = _span_code(error)
+            self._emit_span('complete', started, code, error_code=code,
+                            task=self.task, attempt_key=self._attempt_key)
+            raise
+        self._emit_span('complete', started, 'ok', task=self.task, attempt_key=self._attempt_key)
 
     def report(self, *, force=False):
         if not force and self.clock() < self.next_report:
@@ -163,6 +405,12 @@ class Worker:
                    'auth_status': 'verified' if self.ready else 'unknown',
                    'current_room_id': self.task.get('room_id') if self.task else None,
                    'last_exit_code': self.last_exit, 'usage': []}
+        try:
+            capability = self._capability()
+        except Exception:
+            capability = None
+        if capability_valid(capability):
+            payload['capability'] = dict(capability)
         receipt = self.client.post('/v1/workers/report', payload)
         require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
         self.next_report = self.clock() + 25
@@ -266,8 +514,15 @@ class Worker:
                 # credential is already leased and nothing would release it.
                 if idle_fault(error) != 'retry':
                     raise
-            self.handle = self.adapter.prepare(self.session, self.heartbeat,
-                                               self.clock() + self.settings.startup_seconds)
+            startup_started = self.clock()
+            try:
+                self.handle = self.adapter.prepare(self.session, self.heartbeat,
+                                                   self.clock() + self.settings.startup_seconds)
+            except Exception as error:
+                code = _span_code(error)
+                self._emit_span('startup', startup_started, code, error_code=code)
+                raise
+            self._emit_span('startup', startup_started, 'ok')
             self.ready = True
             idle_deadline = self.clock() + self.settings.warm_seconds
             try:
@@ -318,29 +573,57 @@ class Worker:
                 # may have leased a room whose reply was lost; that room stalls,
                 # so the record must say so and the controller must count it
                 # (backoff, three-strike block). Never claim again here.
+                claim_started = self.clock()
                 try:
-                    result = self.client.post(path, {})
+                    try:
+                        result = self.client.post(path, {})
+                    except Exception as error:
+                        if provider_errors.error_code(error) is not None:
+                            raise
+                        raise LiveError('claim_response_uncertain') from None
+                    require(isinstance(result, dict) and 'task' in result, 'claim_response_invalid')
+                    if result['task'] is None:
+                        claim_outcome, claim_task, claim_key = 'empty', None, None
+                    else:
+                        self.task = result['task']
+                        self._attempt_key = attempt_key(
+                            self.task.get('lease_token') if isinstance(self.task, dict) else None)
+                        claim_outcome, claim_task, claim_key = 'ok', self.task, self._attempt_key
                 except Exception as error:
-                    if provider_errors.error_code(error) is not None:
-                        raise
-                    raise LiveError('claim_response_uncertain') from None
-                require(isinstance(result, dict) and 'task' in result, 'claim_response_invalid')
-                if result['task'] is None:
+                    code = _span_code(error)
+                    self._emit_span('claim', claim_started, code, error_code=code)
+                    raise
+                self._emit_span('claim', claim_started, claim_outcome, task=claim_task, attempt_key=claim_key)
+                if claim_outcome == 'empty':
                     self.sleep(min(self.settings.poll_seconds, max(0, idle_deadline - self.clock())))
                     continue
-                self.task = result['task']
-                deadline, prompt = self._prepare_task()
+                setup_started = self.clock()
+                try:
+                    deadline, prompt = self._prepare_task()
+                except Exception as error:
+                    code = _span_code(error)
+                    self._emit_span('task_setup', setup_started, code, error_code=code,
+                                    task=self.task, attempt_key=self._attempt_key)
+                    raise
+                self._emit_span('task_setup', setup_started, 'ok', task=self.task, attempt_key=self._attempt_key)
                 self.model_call_attempted = True
-                reply = self.adapter.execute(self.handle, prompt, deadline, task_kind='project')
-                require(isinstance(reply, dict) and isinstance(reply.get('text'), str)
-                        and 0 < len(reply['text'].encode()) <= 15000, 'agent_result_invalid')
+                model_started = self.clock()
+                try:
+                    reply = self.adapter.execute(self.handle, prompt, deadline, task_kind='project')
+                    require(isinstance(reply, dict) and isinstance(reply.get('text'), str)
+                            and 0 < len(reply['text'].encode()) <= 15000, 'agent_result_invalid')
+                except Exception as error:
+                    code = _span_code(error)
+                    self._emit_span('model_call', model_started, code, error_code=code,
+                                    task=self.task, attempt_key=self._attempt_key)
+                    raise
+                self._emit_span('model_call', model_started, 'ok', task=self.task, attempt_key=self._attempt_key)
                 # Adapters must finish the credential transaction before a
                 # verified result is delivered. close is independently safe
                 # and idempotent; it must never launch another native process.
-                self.adapter.close(self.handle)
-                self.cleaned = True
+                self._close_for_span()
                 self.ready = False
-                self.complete(reply['text'], 0)
+                self._complete_for_span(reply['text'], 0)
                 outcome.update(outcome='completed', room_id=self.task['room_id'],
                                model=reply.get('model'), effort=reply.get('effort'),
                                answer_sha256=hashlib.sha256(reply['text'].encode()).hexdigest(),
@@ -366,8 +649,7 @@ class Worker:
                                  and self.task is None and not self.model_call_attempted)
             if self.handle is not None and not self.cleaned:
                 try:
-                    self.adapter.close(self.handle)
-                    self.cleaned = True
+                    self._close_for_span()
                 except Exception:
                     self.last_exit = 1
                     outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed',
@@ -395,7 +677,7 @@ class Worker:
                     text = ('The cloud worker stopped before it could deliver a verified answer (' + code + '). '
                             'It did not automatically repeat the model request.')
                 try:
-                    self.complete(text, 1, error_code=code)
+                    self._complete_for_span(text, 1, error_code=code)
                 except Exception:
                     outcome['completion_delivery'] = 'unconfirmed'
             return outcome
@@ -403,11 +685,14 @@ class Worker:
             self.ready = False
             if self.handle is not None and not self.cleaned:
                 try:
-                    self.adapter.close(self.handle)
-                    self.cleaned = True
+                    self._close_for_span()
                 except Exception:
                     outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed')
                     self.last_exit = 1
+            measured = _usage_measured_at(self.handle)
+            if measured is not None:
+                outcome['usage_measured_at'] = measured
+            outcome['spans'] = [dict(item) for item in self.spans]
             try:
                 self.report(force=True)
             except Exception:

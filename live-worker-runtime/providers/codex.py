@@ -26,6 +26,8 @@ import provider_errors
 import transport
 
 MODEL, EFFORT = 'gpt-6-astra', 'ultra'
+CLI_NAME = 'runcrew_codex_live'
+CLI_VERSION = '1'
 MAX_PROMPT, MAX_ANSWER = 200000, 15000
 WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
 # execute() refuses a task deadline shorter than this. The live loop's claim

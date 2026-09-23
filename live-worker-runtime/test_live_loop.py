@@ -1,10 +1,16 @@
 import ast
 import copy
+import hashlib
+import json
+import os
 import re
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
+import live_loop
 from live_loop import Worker, Settings, LiveError, task_prompt, handle_released
 import provider_errors
 from provider_errors import ProviderCodeError, error_code
@@ -12,6 +18,37 @@ from provider_errors import ProviderCodeError, error_code
 
 ROOM = 'a' * 32
 PROVIDERS = Path(__file__).resolve().parent / 'providers'
+SPAN_FIELDS = ('trace_id', 'room_id', 'step', 'attempt_key', 'span', 'duration_ms', 'outcome', 'error_code')
+DIGEST = 'sha256:' + ('ab' * 32)
+TRACE = '01234567-89ab-cdef-0123-456789abcdef'
+
+
+@contextmanager
+def capability_env(**values):
+    """Set manifest env for one assertion and restore whatever was there."""
+    keys = {'CLOUD_RUN_EXECUTION', 'RUNCREW_REGION', 'RUNCREW_IMAGE_DIGEST'} | set(values)
+    saved = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    for key, value in values.items():
+        if value is not None:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def arm_manifest(adapter):
+    adapter.CLI_NAME = 'runcrew-live-grok'
+    adapter.CLI_VERSION = '1'
+    adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+    adapter.MODEL = 'grok-4.7'
+    adapter.EFFORT = 'xhigh'
 BUILTIN_EXCEPTIONS = {'BaseException', 'Exception', 'RuntimeError', 'ValueError', 'OSError',
                       'KeyError', 'TypeError', 'LookupError', 'ArithmeticError'}
 
@@ -81,6 +118,37 @@ class ProviderErrorTests(unittest.TestCase):
         self.assertIsNone(error_code(RuntimeError('task_deadline_out_of_bounds')))
         self.assertIsNone(error_code(ValueError('native_not_running')))
 
+    def test_capability_constants_repeat_an_existing_literal(self):
+        # Versions and policies are published only when the module already
+        # contains that exact literal. A newly invented version fails this.
+        names = ('CLI_NAME', 'CLI_VERSION', 'TOOLS_POLICY')
+        seen = {name: 0 for name in names}
+        now = datetime(2026, 9, 23, tzinfo=timezone.utc)
+        for path in sorted(PROVIDERS.glob('*.py')):
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+            assigned = {}
+            for node in tree.body:
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name) and node.targets[0].id in names
+                        and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                    assigned[node.targets[0].id] = node.value.value
+            literals = [node.value for node in ast.walk(tree)
+                        if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+            for name, value in assigned.items():
+                seen[name] += 1
+                self.assertGreaterEqual(literals.count(value), 2, path.name + ':' + name + '=' + value)
+                filler = {
+                    'runner': 'local', 'region': 'us-central1', 'cli_name': 'grok', 'cli_version': '1',
+                    'workspace_mode': 'read_only', 'tools_policy': 'deny_all', 'model': 'grok-4.7',
+                    'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
+                    'started_at': '2020-01-01T00:00:00Z',
+                }
+                filler[name.lower()] = value
+                self.assertTrue(live_loop.capability_valid(filler, now=now), path.name + ':' + name)
+        self.assertGreaterEqual(seen['CLI_NAME'], 1)
+        self.assertGreaterEqual(seen['CLI_VERSION'], 1)
+        self.assertGreaterEqual(seen['TOOLS_POLICY'], 1)
+
 
 class Clock:
     def __init__(self): self.now = 100
@@ -144,11 +212,20 @@ class Adapter:
 
 
 class LoopTests(unittest.TestCase):
-    def setup_worker(self):
+    def setup_worker(self, trace_id=None, log=None):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
-                        object(), clock=clock, sleep=clock.sleep)
+                        object(), clock=clock, sleep=clock.sleep,
+                        log=log if log is not None else (lambda record: None), trace_id=trace_id)
         return worker, client, adapter, clock
+
+    def span_lines(self, logs):
+        return [item for item in logs if isinstance(item, dict) and item.get('kind') == 'runcrew_live_span']
+
+    def assert_hidden(self, logs, *secrets):
+        blob = json.dumps(logs)
+        for secret in secrets:
+            self.assertNotIn(secret, blob)
 
     def test_one_model_call_and_close_before_completion(self):
         worker, client, adapter, _ = self.setup_worker()
@@ -819,6 +896,296 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(result['outcome'], 'credential_cleanup_failed')
         self.assertEqual(client.completions, [])
         self.assertEqual(worker.last_exit, 1)
+
+    def _span_contract(self, spans, trace_id):
+        for item in spans:
+            self.assertEqual(set(item), {'kind', *SPAN_FIELDS})
+            self.assertEqual(item['trace_id'], trace_id)
+            self.assertIsInstance(item['duration_ms'], int)
+            self.assertGreaterEqual(item['duration_ms'], 0)
+            self.assertTrue(provider_errors.SAFE_CODE.fullmatch(item['outcome']))
+            if item['error_code'] is not None:
+                self.assertEqual(item['error_code'], item['outcome'])
+
+    def test_spans_for_a_completed_task(self):
+        logs = []
+        token = 'lease-token-not-for-logs'
+        prompt = 'PROMPT-SECRET-not-for-logs'
+        answer = 'ANSWER-SECRET-not-for-logs'
+        worker, client, adapter, clock = self.setup_worker(trace_id=TRACE, log=logs.append)
+        client.task['lease_token'] = token
+        client.task['prompt'] = client.room['prompt'] = prompt
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            clock.now += 1
+            return SimpleNamespace(state='ready', usage={'marker': 'SNAPSHOT-SECRET'},
+                                   preflight={'quota': {'marker': 'PREFLIGHT-SECRET'}})
+        def execute(handle, prompt_text, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            clock.now += 2
+            return {'text': answer, 'model': 'example', 'effort': 'max', 'usage': None}
+        adapter.prepare, adapter.execute = prepare, execute
+        result = worker.run()
+        spans = self.span_lines(logs)
+        self.assertEqual([item['span'] for item in spans],
+                         ['startup', 'claim', 'task_setup', 'model_call', 'close', 'complete'])
+        self.assertEqual([item['outcome'] for item in spans], ['ok', 'ok', 'ok', 'ok', 'ok', 'ok'])
+        self.assertTrue(all(item['error_code'] is None for item in spans))
+        self._span_contract(spans, TRACE)
+        self.assertEqual(spans[0]['duration_ms'], 1000)
+        self.assertEqual(spans[3]['duration_ms'], 2000)
+        self.assertIsNone(spans[0]['attempt_key'])
+        self.assertIsNone(spans[0]['room_id'])
+        self.assertIsNone(spans[0]['step'])
+        key = hashlib.sha256(token.encode()).hexdigest()[:16]
+        for item in spans[1:]:
+            self.assertEqual(item['attempt_key'], key)
+            self.assertNotEqual(item['attempt_key'], token)
+            self.assertEqual(item['room_id'], ROOM)
+            self.assertEqual(item['step'], 0)
+        self.assertEqual(result['spans'], [{field: item[field] for field in SPAN_FIELDS} for item in spans])
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertIn('usage_measured_at', result)
+        measured = datetime.fromisoformat(result['usage_measured_at'].replace('Z', '+00:00'))
+        self.assertIsNotNone(measured.tzinfo)
+        self.assertLessEqual(measured.timestamp(), datetime.now(timezone.utc).timestamp())
+        self.assert_hidden(logs, token, prompt, answer, 'SNAPSHOT-SECRET', 'PREFLIGHT-SECRET')
+
+    def test_spans_for_a_pre_model_failure(self):
+        logs = []
+        token = 'lease-token-not-for-logs'
+        prompt = 'PROMPT-SECRET-not-for-logs'
+        worker, client, adapter, _ = self.setup_worker(trace_id=TRACE, log=logs.append)
+        client.task['lease_token'] = token
+        client.task['prompt'] = client.room['prompt'] = prompt
+        del client.room['purpose']
+        result = worker.run()
+        spans = self.span_lines(logs)
+        self.assertEqual([item['span'] for item in spans],
+                         ['startup', 'claim', 'task_setup', 'close', 'complete'])
+        self.assertEqual([item['outcome'] for item in spans],
+                         ['ok', 'ok', 'purpose_missing', 'ok', 'ok'])
+        self.assertEqual([item['error_code'] for item in spans],
+                         [None, None, 'purpose_missing', None, None])
+        self._span_contract(spans, TRACE)
+        self.assertNotIn('model_call', [item['span'] for item in spans])
+        self.assertEqual(result['error_code'], 'purpose_missing')
+        self.assertFalse(result['model_call_attempted'])
+        self.assertNotIn('usage_measured_at', result)
+        self.assert_hidden(logs, token, prompt)
+
+    def test_spans_for_a_model_failure(self):
+        logs = []
+        token = 'lease-token-not-for-logs'
+        prompt = 'PROMPT-SECRET-not-for-logs'
+        worker, client, adapter, _ = self.setup_worker(trace_id=TRACE, log=logs.append)
+        client.task['lease_token'] = token
+        client.task['prompt'] = client.room['prompt'] = prompt
+        def execute(handle, prompt_text, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            raise CodeError('task_deadline_out_of_bounds')
+        adapter.execute = execute
+        result = worker.run()
+        spans = self.span_lines(logs)
+        self.assertEqual([item['span'] for item in spans],
+                         ['startup', 'claim', 'task_setup', 'model_call', 'close', 'complete'])
+        self.assertEqual([item['outcome'] for item in spans],
+                         ['ok', 'ok', 'ok', 'task_deadline_out_of_bounds', 'ok', 'ok'])
+        self.assertEqual(spans[3]['error_code'], 'task_deadline_out_of_bounds')
+        self._span_contract(spans, TRACE)
+        self.assertEqual(result['error_code'], 'task_deadline_out_of_bounds')
+        self.assertTrue(result['model_call_attempted'])
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assert_hidden(logs, token, prompt, 'provider detail must not leak')
+
+    def test_spans_for_an_idle_drain(self):
+        logs = []
+        token = 'lease-token-not-for-logs'
+        prompt = 'PROMPT-SECRET-not-for-logs'
+        worker, client, adapter, _ = self.setup_worker(log=logs.append)
+        client.empty = True
+        client.task['lease_token'] = token
+        client.task['prompt'] = client.room['prompt'] = prompt
+        result = worker.run()
+        spans = self.span_lines(logs)
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertGreater(client.claims, 0)
+        self.assertEqual([item['span'] for item in spans],
+                         ['startup'] + ['claim'] * client.claims + ['close'])
+        self.assertEqual([item['outcome'] for item in spans],
+                         ['ok'] + ['empty'] * client.claims + ['ok'])
+        self.assertTrue(all(item['error_code'] is None for item in spans))
+        self.assertTrue(all(item['attempt_key'] is None and item['room_id'] is None for item in spans))
+        self._span_contract(spans, None)
+        self.assertNotIn('model_call', [item['span'] for item in spans])
+        self.assertNotIn('task_setup', [item['span'] for item in spans])
+        self.assertNotIn('complete', [item['span'] for item in spans])
+        self.assertNotIn('usage_measured_at', result)
+        self.assertEqual(result['spans'], [{field: item[field] for field in SPAN_FIELDS} for item in spans])
+        self.assert_hidden(logs, token, prompt)
+        unsafe = Worker(Settings('grok', 'grok-live'), client, adapter, object(), trace_id='not/a token')
+        self.assertIsNone(unsafe.trace_id)
+
+    def test_usage_snapshot_read_never_raises_or_is_copied(self):
+        logs = []
+        worker, client, adapter, _ = self.setup_worker(log=logs.append)
+        class Handle:
+            state = 'ready'
+            @property
+            def usage(self):
+                raise RuntimeError('usage exploded SNAPSHOT-SECRET')
+            @property
+            def preflight(self):
+                raise RuntimeError('preflight exploded PREFLIGHT-SECRET')
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            return Handle()
+        adapter.prepare = prepare
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('usage_measured_at', result)
+        self.assert_hidden(logs, 'SNAPSHOT-SECRET', 'PREFLIGHT-SECRET', 'exploded')
+
+    def test_capability_manifest_is_sent_exactly_when_valid(self):
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.report(force=True)
+            manifest = client.calls[-1][1]['capability']
+            self.assertEqual(manifest, {
+                'runner': 'local', 'region': 'us-central1', 'cli_name': 'runcrew-live-grok',
+                'cli_version': '1', 'workspace_mode': 'read_only',
+                'tools_policy': 'deny_all_and_abort_on_observed_tool', 'model': 'grok-4.7',
+                'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
+                'started_at': live_loop._PROCESS_STARTED_AT,
+            })
+            self.assertEqual(set(manifest), set(live_loop._CAPABILITY_FIELDS))
+            adapter.CLI_VERSION = 'not a version'
+            os.environ.pop('RUNCREW_IMAGE_DIGEST', None)
+            worker.report(force=True)
+            self.assertEqual(client.calls[-1][1]['capability'], manifest)
+        with capability_env(CLOUD_RUN_EXECUTION='runcrew-worker-grok-abcde',
+                            RUNCREW_REGION='europe-west1', RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.report(force=True)
+            manifest = client.calls[-1][1]['capability']
+            self.assertEqual(manifest['runner'], 'cloud_run_job')
+            self.assertEqual(manifest['region'], 'europe-west1')
+            self.assertEqual(set(manifest), set(live_loop._CAPABILITY_FIELDS))
+
+    def test_capability_manifest_is_omitted_when_any_field_is_missing_or_invalid(self):
+        mutations = (
+            ('missing_digest', {}, {}),
+            ('blank_digest', {'RUNCREW_IMAGE_DIGEST': ''}, {}),
+            ('short_digest', {'RUNCREW_IMAGE_DIGEST': 'sha256:' + 'ab' * 31}, {}),
+            ('upper_digest', {'RUNCREW_IMAGE_DIGEST': 'sha256:' + 'AB' * 32}, {}),
+            ('bare_digest', {'RUNCREW_IMAGE_DIGEST': 'ab' * 32}, {}),
+            ('extra_digest', {'RUNCREW_IMAGE_DIGEST': DIGEST + 'aa'}, {}),
+            ('bad_region', {'RUNCREW_IMAGE_DIGEST': DIGEST, 'RUNCREW_REGION': 'US-central1'}, {}),
+            ('underscore_region', {'RUNCREW_IMAGE_DIGEST': DIGEST, 'RUNCREW_REGION': 'us_central1'}, {}),
+            ('long_region', {'RUNCREW_IMAGE_DIGEST': DIGEST, 'RUNCREW_REGION': 'a' + 'b' * 32}, {}),
+            ('missing_cli_name', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'CLI_NAME': None}),
+            ('digit_cli_name', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'CLI_NAME': '1grok'}),
+            ('missing_version', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'CLI_VERSION': None}),
+            ('spaced_version', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'CLI_VERSION': 'v 1'}),
+            ('long_version', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'CLI_VERSION': 'a' * 33}),
+            ('missing_tools', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'TOOLS_POLICY': None}),
+            ('digit_tools', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'TOOLS_POLICY': '1deny'}),
+            ('missing_model', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'MODEL': None}),
+            ('spaced_model', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'MODEL': 'grok 4'}),
+            ('missing_effort', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'EFFORT': None}),
+            ('long_effort', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'EFFORT': 'e' * 33}),
+        )
+        for label, env, changes in mutations:
+            with self.subTest(label=label):
+                with capability_env(**env):
+                    worker, client, adapter, _ = self.setup_worker()
+                    arm_manifest(adapter)
+                    for key, value in changes.items():
+                        if value is None:
+                            delattr(adapter, key)
+                        else:
+                            setattr(adapter, key, value)
+                    worker.report(force=True)
+                    payload = client.calls[-1][1]
+                    self.assertNotIn('capability', payload)
+                    self.assertEqual(payload['status'], 'offline')
+        now = datetime(2026, 9, 23, tzinfo=timezone.utc)
+        valid = {
+            'runner': 'local', 'region': 'us-central1', 'cli_name': 'grok', 'cli_version': '1',
+            'workspace_mode': 'read_only', 'tools_policy': 'deny_all', 'model': 'grok-4.7',
+            'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
+            'started_at': '2020-01-01T00:00:00Z',
+        }
+        self.assertTrue(live_loop.capability_valid(valid, now=now))
+        self.assertFalse(live_loop.capability_valid(None, now=now))
+        self.assertFalse(live_loop.capability_valid({'capability': None}, now=now))
+        partial = dict(valid)
+        del partial['effort']
+        self.assertFalse(live_loop.capability_valid(partial, now=now))
+        extra = dict(valid)
+        extra['note'] = 'unknown'
+        self.assertFalse(live_loop.capability_valid(extra, now=now))
+        for field, bad in (
+            ('runner', 'vm'), ('runner', None), ('workspace_mode', 'admin'),
+            ('auth_alias', 'bad alias'), ('auth_alias', 'has.dot'), ('auth_alias', 'a' * 33),
+            ('started_at', '2020-01-01T00:00:00'), ('started_at', '2999-01-01T00:00:00Z'),
+            ('started_at', '2020-01-01T00:00:00Z' + ('x' * 21)), ('image_digest', None),
+        ):
+            broken = dict(valid)
+            broken[field] = bad
+            self.assertFalse(live_loop.capability_valid(broken, now=now), field)
+        writable = dict(valid)
+        writable['workspace_mode'] = 'write'
+        self.assertTrue(live_loop.capability_valid(writable, now=now))
+        original = live_loop._PROCESS_STARTED_AT
+        live_loop._PROCESS_STARTED_AT = '2999-01-01T00:00:00Z'
+        try:
+            with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+                worker, client, adapter, _ = self.setup_worker()
+                arm_manifest(adapter)
+                worker.report(force=True)
+                self.assertNotIn('capability', client.calls[-1][1])
+        finally:
+            live_loop._PROCESS_STARTED_AT = original
+
+    def test_report_never_fails_because_of_the_manifest(self):
+        class RaisingAdapter(Adapter):
+            @property
+            def CLI_NAME(self):
+                raise RuntimeError('cli name exploded /tmp/native-secret')
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            clock = Clock(); client = Client(clock); adapter = RaisingAdapter()
+            adapter.CLI_VERSION = '1'
+            adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+            adapter.MODEL = 'grok-4.7'
+            adapter.EFFORT = 'xhigh'
+            worker = Worker(Settings('grok', 'grok-live'), client, adapter, object(),
+                            clock=clock, sleep=clock.sleep)
+            worker.report(force=True)
+            self.assertNotIn('capability', client.calls[-1][1])
+            self.assertNotIn('native-secret', json.dumps(client.calls))
+            self.assertEqual(client.calls[-1][1]['status'], 'offline')
+        worker, client, adapter, _ = self.setup_worker()
+        arm_manifest(adapter)
+        def boom(*args, **kwargs):
+            raise RuntimeError('manifest builder exploded /tmp/native-secret')
+        original = live_loop.capability_manifest
+        live_loop.capability_manifest = boom
+        try:
+            with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+                worker.report(force=True)
+        finally:
+            live_loop.capability_manifest = original
+        self.assertNotIn('capability', client.calls[-1][1])
+        self.assertNotIn('native-secret', json.dumps(client.calls))
+        self.assertEqual(client.calls[-1][1]['worker_id'], 'grok-live')
+
+    def test_entrypoint_wires_trace_id_and_span_lines(self):
+        source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')
+        self.assertIn('trace_id=broker.execution_uid', source)
+        self.assertIn("value.get('kind') == 'runcrew_live_span'", source)
 
 
 if __name__ == '__main__': unittest.main()

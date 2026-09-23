@@ -32,6 +32,7 @@ import provider_errors
 
 MODEL = 'claude-fable-5-1'
 EFFORT = 'max'
+TOOLS_POLICY = 'read_only_tools_dontAsk_restricted'
 # Keep this binding identical to the enrolled Claude Ryan profile (never derived from a prompt).
 ACCOUNT_REF = 'fb55abaefbe43b9b1cbd82a01f04c398968b29182c598cda9b77477c9110b29f'
 EXECUTABLE = str(auth.CLAUDE_EXECUTABLE)

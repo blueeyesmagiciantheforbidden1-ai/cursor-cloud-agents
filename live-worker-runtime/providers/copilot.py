@@ -24,6 +24,7 @@ from uuid import uuid4
 import provider_errors
 
 MODEL, EFFORT = 'kimi-k3', 'max'
+TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
 # The prepare() argument is only the startup budget. The live loop then waits
 # up to an hour. This cap does not slide; maintain() must not push it forward.
 WARM_SECONDS = 3600

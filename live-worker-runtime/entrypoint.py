@@ -98,9 +98,14 @@ def main():
         config = Config(hub_url=HUB, agent_id=agent, token=token,
                         token_env='HUB_AGENT_TOKEN', workspaces={'default': home},
                         cloud_run_auth=True, cloud_run_auth_mode='metadata', worker_id=worker_id)
+        def emit(value):
+            if isinstance(value, dict) and value.get('kind') == 'runcrew_live_span':
+                print(json.dumps(value), flush=True)
+                return
+            print(json.dumps({'kind': 'runcrew_live_result',
+                'execution_uid': broker.execution_uid, 'worker_id': worker_id, **value}), flush=True)
         worker = Worker(settings, Client(config), adapter, session,
-                        log=lambda value: print(json.dumps({'kind': 'runcrew_live_result',
-                            'execution_uid': broker.execution_uid, 'worker_id': worker_id, **value}), flush=True))
+                        log=emit, trace_id=broker.execution_uid)
         def stop(signum, frame):
             worker.stopping = True
             raise KeyboardInterrupt
