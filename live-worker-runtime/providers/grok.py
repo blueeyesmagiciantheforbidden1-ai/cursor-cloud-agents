@@ -20,6 +20,9 @@ from ._grok_protocol import Native, NativeError, NativeStartupStopped, need, unw
 
 MODEL = 'grok-4.7'
 EFFORT = 'xhigh'
+CLI_NAME = 'runcrew-live-grok'
+CLI_VERSION = '1'
+TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
 OWNER = 'cursor-owner@example.invalid'
 # Keep this binding identical to the enrolled profile (never derived from a prompt).
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
