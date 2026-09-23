@@ -110,11 +110,14 @@ class Controller:
         return state
 
     def never_bound(self, state, value):
-        """True when the latest execution is this slot's own launch whose grant was never published.
+        """True when the latest execution is this slot's own failed launch that never acquired the credential.
 
-        Such an execution could not acquire the credential (the worker dies at
-        bootstrap without a grant), so the broker's release record still names
-        the previous holder; demanding equality with it would deadlock the slot.
+        Either its grant was never published (the worker dies at bootstrap
+        without one), or the broker's release record still names the slot's
+        previous holder: acquiring moves the record to the new execution, so a
+        record that never moved means this execution never held the credential.
+        Demanding equality with it would deadlock the slot. The clean release
+        itself is still checked by idle_credential().
         """
         if not isinstance(state, dict) or state.get('execution_uid') != value.get('uid'):
             return False
@@ -124,7 +127,14 @@ class Controller:
         grant_sha256, expires_at = state.get('grant_sha256'), state.get('expires_at')
         if not (isinstance(grant_sha256, str) and re.fullmatch(r'[a-f0-9]{64}', grant_sha256) and type(expires_at) is int):
             return False
-        return self.grant_factory(self.policy.binding(grant_sha256, expires_at)).read() is None
+        if self.grant_factory(self.policy.binding(grant_sha256, expires_at)).read() is None:
+            return True
+        # release_uid: the holder whose clean release licensed this launch
+        # (older launches recorded only previous_uid, the same execution).
+        holder = state.get('release_uid', state.get('previous_uid'))
+        credential, _ = self.broker._read()
+        return (isinstance(holder, str) and holder != value.get('uid')
+                and credential.get('execution_uid') == holder)
 
     def current_terminal(self, job, state=None):
         latest = job.get('latestCreatedExecution', {}).get('name')
@@ -160,11 +170,12 @@ class Controller:
                 if self.clock() < state.get('next_launch_at', 0):
                     return {'status': 'replacement_cooldown', 'generation': state['generation']}
                 job = self.job(); previous = self.current_terminal(job, state)
+                release_uid = self.broker._read()[0].get('execution_uid')
                 grant = secrets.token_urlsafe(48)
                 state, version = self.save(state, version, phase='binding_intent',
                     generation=state['generation'] + 1, intent=uuid.uuid4().hex,
                     grant=grant, grant_sha256=hashlib.sha256(grant.encode()).hexdigest(),
-                    expires_at=int(self.clock()) + 7200, previous_uid=previous['uid'])
+                    expires_at=int(self.clock()) + 7200, previous_uid=previous['uid'], release_uid=release_uid)
                 binding = self.policy.binding(state['grant_sha256'], state['expires_at'])
                 self.bindings.publish(binding)
                 state, version = self.save(state, version, phase='binding_ready')
@@ -219,7 +230,7 @@ class Controller:
                 if not clean:
                     failures = state.get('consecutive_failures', 0) + 1
                     try:
-                        self.idle_credential(execution)
+                        self.idle_credential(None if self.never_bound(state, execution) else execution)
                         released = True
                     except ControllerError:
                         released = False

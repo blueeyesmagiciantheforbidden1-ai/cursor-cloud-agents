@@ -110,7 +110,8 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(cloud.run_count, 1); self.assertEqual(grants.calls, 1)
 
     def test_failed_terminal_job_blocks_replenishment(self):
-        controller, store, cloud, _, _, _ = self.make(); controller.tick()
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        broker.state.update(phase='leased', execution_uid=NEXT_UID)  # failed while holding it
         cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
             reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
         self.assertEqual(controller.tick()['status'], 'blocked')
@@ -173,18 +174,20 @@ class FleetReviewTests(unittest.TestCase):
 
     def test_failure_without_clean_release_stops_the_slot(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
-        self.fail_current(cloud, broker, uid=PRIOR_UID)
+        self.fail_current(cloud, broker)
+        broker.state.update(phase='leased')  # the failed worker still holds it
         self.assertEqual(controller.tick()['status'], 'blocked')
         self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
         self.assertEqual(cloud.run_count, 1)
 
     def blocked(self):
-        """A slot stopped by a failed execution whose credential release names another holder; the broker then catches up."""
+        """A slot stopped by a failure while holding the credential; the broker then releases."""
         controller, store, cloud, broker, bindings, grants = self.make(); controller.tick()
+        broker.state.update(phase='leased', execution_uid=NEXT_UID)
         cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
             reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
         self.assertEqual(controller.tick()['status'], 'blocked')
-        broker.state.update(execution_uid=NEXT_UID)
+        broker.state.update(phase='idle', execution_uid=NEXT_UID)
         return controller, store, cloud, broker, bindings, grants
 
     def test_reset_returns_blocked_slot_to_idle_and_next_tick_replaces(self):
@@ -219,13 +222,22 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
         self.assertEqual(cloud.run_count, 2)
 
-    def test_never_bound_rule_needs_an_unpublished_grant_and_a_failed_execution(self):
+    def test_failure_before_acquiring_the_credential_is_retried(self):
+        # The grant was published but the worker failed before acquiring: the
+        # broker record still names the previous holder, so it never held it.
         controller, store, cloud, broker, _, grants = self.make(); controller.tick()
         cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
             reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
-        # The grant WAS published, so this execution held the credential: the
-        # broker record must name it, and the mismatch is a real refusal.
-        self.assertEqual(len(grants.published), 1)
+        self.assertEqual(len(grants.published), 1); self.assertEqual(broker.state['execution_uid'], PRIOR_UID)
+        self.assertEqual(controller.tick()['status'], 'replacement_after_failure')
+        controller.clock = lambda: 1200
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+
+    def test_release_naming_a_third_execution_is_refused(self):
+        controller, store, cloud, broker, _, grants = self.make(); controller.tick()
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        broker.state.update(execution_uid='55555555-5555-5555-5555-555555555555')
         self.assertEqual(controller.tick()['status'], 'blocked')
         with self.assertRaises(ControllerError) as caught: controller.reset()
         self.assertEqual(str(caught.exception), 'credential_release_execution_mismatch')
@@ -271,7 +283,7 @@ class FleetReviewTests(unittest.TestCase):
 
     def test_reset_refuses_unless_credential_cleanly_released(self):
         for change in ({'phase': 'quarantined'}, {'quarantine_reason': 'provider_refresh_uncertain'},
-                       {'fence': 9}, {'execution_uid': PRIOR_UID}):
+                       {'fence': 9}, {'execution_uid': '55555555-5555-5555-5555-555555555555'}):
             with self.subTest(change=change):
                 controller, store, cloud, broker, _, _ = self.blocked(); broker.state.update(change)
                 with self.assertRaises(ControllerError): controller.reset()
