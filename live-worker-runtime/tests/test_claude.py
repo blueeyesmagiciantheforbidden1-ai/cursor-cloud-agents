@@ -472,8 +472,10 @@ class ClaudeAdapter(unittest.TestCase):
         spend = 'You have hit your monthly spend limit for account user@example.com, resets 1pm'
         cases = {
             'result text': [result_event(is_error=True, result=spend)],
-            'assistant error': [{'type': 'assistant', 'error': 'rate_limit', 'message': {}},
-                                result_event(is_error=True, result='API Error')],
+            'billing error': [{'type': 'assistant', 'error': 'billing_error', 'message': {}},
+                              result_event(is_error=True, result='API Error')],
+            'rate limit plus usage-limit text': [{'type': 'assistant', 'error': 'rate_limit', 'message': {}},
+                                                 result_event(is_error=True, result='Claude AI usage limit reached|1')],
             'rejected rate limit event': [{'type': 'rate_limit_event',
                                            'rate_limit_info': {'status': 'rejected', 'resetsAt': 1}},
                                           result_event(is_error=True, result='API Error')],
@@ -506,6 +508,13 @@ class ClaudeAdapter(unittest.TestCase):
         odd = self._slow_prompt(waits=0, answer=[{'type': 'assistant', 'error': 'something new', 'message': {}},
                                                  result_event(is_error=True, result='failed')])
         self.assertEqual(str(odd.error), 'claude_provider_error')
+        # A bare 429 is not proof of an account limit: its own code, a normal strike.
+        for returncode in (0, 1):
+            limited = self._slow_prompt(waits=0, returncode=returncode, answer=[
+                {'type': 'assistant', 'error': 'rate_limit', 'message': {}},
+                result_event(is_error=True, result='API Error: 429 rate_limit_error')])
+            self.assertEqual(str(limited.error), 'claude_rate_limited')
+            self.assertFalse(c.provider_errors.is_quota(str(limited.error)))
         plain = self._slow_prompt(waits=0, answer=['lifecycle', result_event(is_error=True, result='Something broke')])
         self.assertEqual(str(plain.error), 'claude_task_not_successful')
         crash = self._slow_prompt(waits=0, returncode=1)

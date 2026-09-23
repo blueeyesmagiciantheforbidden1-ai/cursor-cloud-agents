@@ -45,9 +45,13 @@ _MODEL_PATTERN = None
 # a rejected rate_limit_event) or only in the error result's text. The text is
 # matched here and dropped: only a fixed code leaves the adapter. An account
 # limit is not a transient fault; the controller must not spend retries on it.
-QUOTA_TEXT = re.compile(r'usage limit|spend limit|rate limit|limit reached|hit your limit|'
+# Only definitive account-limit signals map to claude_quota_exhausted, because
+# the controller parks that slot for an hour or more. A bare rate_limit (429
+# after the CLI's own retries) may be short-lived: it keeps its own code and
+# stays an ordinary, visible strike.
+QUOTA_TEXT = re.compile(r'usage limit|spend limit|limit reached|hit your limit|'
                         r'credit balance|out of extra usage|quota', re.IGNORECASE)
-ASSISTANT_ERRORS = {'rate_limit': 'claude_quota_exhausted', 'billing_error': 'claude_quota_exhausted',
+ASSISTANT_ERRORS = {'billing_error': 'claude_quota_exhausted', 'rate_limit': 'claude_rate_limited',
                     'authentication_failed': 'claude_authentication_failed',
                     'server_error': 'claude_provider_server_error'}
 
