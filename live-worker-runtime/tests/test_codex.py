@@ -14,8 +14,13 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT.parent / 'agent-hub'))
 sys.path.insert(0, str(ROOT.parent / 'codex-cloud-transport'))
 sys.path.insert(0, str(ROOT))
+import broker_renew
+import live_loop
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
+from agent_hub.credential_broker_service import BoundaryError
 from providers import codex as c
 
 EMAIL = 'cursor-owner@example.invalid'
@@ -512,6 +517,150 @@ class CodexLive(unittest.TestCase):
             c.execute(handle, 'Project task.', time.monotonic() + 180)
         self.assertEqual(self.prompt_count(), 1)
 
+    def test_idle_transient_renew_failure_keeps_warm_process(self):
+        errors = [MutationUncertain('broker_http_outcome_uncertain'),
+                  BoundaryError('metadata_identity_unavailable')]
+        for error in errors:
+            with self.subTest(error=str(error)):
+                handle = self.prepare()
+                anchor = handle.lease_clock.renewed_at
+                self.session.broker.renew.reset_mock(side_effect=True)
+                self.heartbeat.reset_mock()
+                handle.next_renew = 0
+                handle.native.next_renew = time.monotonic() + 1000
+                self.session.broker.renew.side_effect = error
+                readiness = c.maintain(handle)
+                self.assertEqual(handle.state, 'ready')
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.session.finish.assert_not_called()
+                self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                self.assertLessEqual(handle.next_renew, time.monotonic() + broker_renew.RETRY_SECONDS)
+                self.heartbeat.assert_called()
+                self.session.broker.renew.side_effect = None
+                handle.next_renew = 0
+                c.maintain(handle)
+                self.assertGreater(handle.lease_clock.renewed_at, anchor)
+                c.close(handle)
+
+    def test_tick_path_transient_renew_failure_is_rearmed_for_retry(self):
+        handle = self.prepare()
+        self.session.broker.renew.reset_mock(side_effect=True)
+        handle.next_renew = time.monotonic() + 1000
+        handle.native.next_renew = 0
+        before = self.session.broker.renew.call_count
+        self.session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+        readiness = c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertTrue(readiness['ready_for_project_prompt'])
+        self.assertEqual(self.session.broker.renew.call_count, before + 1)
+        self.assertLessEqual(handle.native.next_renew, time.monotonic() + broker_renew.RETRY_SECONDS)
+        self.assertLess(handle.native.next_renew, time.monotonic() + 25)
+        c.close(handle)
+
+    def test_tick_path_hub_heartbeat_loss_keeps_warm_process(self):
+        handle = self.prepare()
+        handle.next_renew = time.monotonic() + 1000
+        handle.native.next_renew = 0
+        self.heartbeat.return_value = False
+        readiness = c.maintain(handle)
+        self.assertEqual(handle.state, 'ready')
+        self.assertTrue(readiness['ready_for_project_prompt'])
+        self.session.finish.assert_not_called()
+        self.assertIsNone(self.native.process.poll())
+        c.close(handle)
+
+    def test_renew_tolerance_is_bounded(self):
+        for tick in (False, True):
+            with self.subTest(tick=tick):
+                handle = self.prepare()
+                handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+                self.session.broker.renew.side_effect = MutationUncertain('x')
+                if tick:
+                    handle.next_renew = time.monotonic() + 1000
+                    handle.native.next_renew = 0
+                else:
+                    handle.next_renew = 0
+                    handle.native.next_renew = time.monotonic() + 1000
+                with self.assertRaisesRegex(c.LiveCodexError, '^codex_broker_renew_failed$') as caught:
+                    c.maintain(handle)
+                self.assertEqual(handle.state, 'closed')
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+
+    def test_rejections_are_immediate(self):
+        errors = [Conflict('broker_operation_rejected'), BrokerError('broker_request_denied'),
+                  BoundaryError('credential_fence_lost')]
+        for error in errors:
+            with self.subTest(error=str(error)):
+                handle = self.prepare()
+                anchor = handle.lease_clock.renewed_at
+                handle.next_renew = 0
+                handle.native.next_renew = time.monotonic() + 1000
+                self.session.broker.renew.side_effect = error
+                with self.assertRaisesRegex(c.LiveCodexError, '^codex_broker_renew_rejected$'):
+                    c.maintain(handle)
+                self.assertEqual(handle.lease_clock.renewed_at, anchor)
+
+    def test_execute_pre_prompt_renew_is_strict(self):
+        handle = self.prepare()
+        handle.native.next_renew = time.monotonic() + 1000
+        self.session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+        with self.assertRaisesRegex(c.LiveCodexError, '^codex_broker_renew_failed$'):
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(self.prompt_count(), 0)
+
+    def _arm_turn_renew(self, native):
+        real = native._frame
+        armed = {'done': False}
+
+        def frame():
+            if not armed['done'] and any(item['method'] == 'turn/start' for item in native.requests):
+                armed['done'] = True
+                native.next_renew = 0
+            return real()
+
+        native._frame = frame
+
+    def test_execute_pump_tolerates_one_blip_during_turn(self):
+        handle = self.prepare()
+        self._arm_turn_renew(self.native)
+        pending = [None, MutationUncertain('broker_http_outcome_uncertain')]
+
+        def effect(lease):
+            item = pending.pop(0) if pending else None
+            if item is not None:
+                raise item
+
+        self.session.broker.renew.side_effect = effect
+        beats = {'n': 0}
+        previous = self.heartbeat.side_effect
+
+        def beat():
+            beats['n'] += 1
+            return True
+
+        self.heartbeat.side_effect = beat
+        result = c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(result['text'], 'A real-parser offline answer.')
+        self.assertEqual(self.session.state, 'committed')
+        self.assertEqual(self.prompt_count(), 1)
+        self.assertGreaterEqual(beats['n'], 2)
+        self.heartbeat.side_effect = previous
+
+    def test_execute_pump_past_window_fails_the_turn(self):
+        handle = self.prepare()
+        self._arm_turn_renew(self.native)
+        calls = {'n': 0}
+
+        def stale(lease):
+            calls['n'] += 1
+            if calls['n'] >= 2:
+                handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+                raise MutationUncertain('x')
+
+        self.session.broker.renew.side_effect = stale
+        with self.assertRaisesRegex(c.LiveCodexError, '^codex_broker_renew_failed$'):
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+
     def test_concurrent_or_reentrant_operations_are_denied(self):
         handle = self.prepare(); handle.lock.acquire()
         with self.assertRaisesRegex(c.LiveCodexError, 'concurrent_provider_operation'): c.maintain(handle)
@@ -532,6 +681,23 @@ class WireWrites(unittest.TestCase):
         c.WarmRPC._send(native, message)
         self.assertEqual(json.loads(native.process.stdin.getvalue()), message)
         self.assertEqual(native.process.stdin.getvalue().count(b'\n'), 1)
+
+    def test_warm_rpc_tick_lowers_next_renew_to_retry(self):
+        native = object.__new__(c.WarmRPC)
+        native.failed = threading.Event()
+        native.deadline = time.monotonic() + 100
+        native.renew = lambda: None
+        retry = time.monotonic() + 10
+        native.renew_retry_at = retry
+        native.next_renew = 0
+        native.tick()
+        self.assertEqual(native.next_renew, retry)
+        self.assertIsNone(native.renew_retry_at)
+        native.next_renew = 0
+        before = time.monotonic()
+        native.tick()
+        self.assertAlmostEqual(native.next_renew, before + 25, delta=1)
+        self.assertIsNone(native.renew_retry_at)
 
     def test_real_sender_rejects_zero_write_progress(self):
         native = object.__new__(c.WarmRPC)

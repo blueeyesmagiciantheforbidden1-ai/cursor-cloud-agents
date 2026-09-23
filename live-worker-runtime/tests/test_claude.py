@@ -12,11 +12,16 @@ import unittest
 from unittest.mock import Mock, patch
 
 HERE = Path(__file__).resolve().parents[1]
+HUB = HERE.parent / 'agent-hub'
 SOURCE = Path(r'C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e7f-992bfc4740b3/agent-hub')
-for entry in (str(HERE), str(SOURCE)):
+for entry in (str(SOURCE), str(HUB), str(HERE)):
     if entry not in sys.path:
-        sys.path.append(entry)
+        sys.path.insert(0, entry)
 
+import broker_renew  # noqa: E402
+import live_loop  # noqa: E402
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain  # noqa: E402
+from agent_hub.credential_broker_service import BoundaryError  # noqa: E402
 from providers import claude as c  # noqa: E402
 
 TOKEN = 'PRIVATE_OFFLINE_SUBSCRIPTION_TOKEN'
@@ -85,12 +90,14 @@ def result_event(**changes):
 
 
 class Fixture:
-    def __init__(self, *, overrides=None, prompt_hook=None, close_error=None, finish_error=None, idle=()):
+    def __init__(self, *, overrides=None, prompt_hook=None, close_error=None, finish_error=None, idle=(),
+                 renew_due=False):
         self.events, self.calls, self.prompts = [], [], []
         self.overrides = overrides or {}
         self.prompt_hook = prompt_hook
         self.close_error, self.finish_error = close_error, finish_error
         self.idle = list(idle)
+        self.renew_due = renew_due
         self.native = None
         self.environment = None
         self.factory = self._factory
@@ -102,7 +109,7 @@ class Fixture:
         class FakeNative:
             def __init__(self):
                 self.renew, self.deadline, self.workspace = renew, deadline, workspace
-                self.next_renew = time.monotonic() + 20
+                self.next_renew = 0 if owner.renew_due else time.monotonic() + 20
                 self.closed = False
                 self.frames = SimpleNamespace(failed=threading.Event())
                 self.process = SimpleNamespace(poll=lambda: 0 if self.closed else None)
@@ -574,6 +581,239 @@ class ClaudeAdapter(unittest.TestCase):
         safe = self._slow_prompt(prepare_execute=install_safe_code)
         self.assertEqual(str(safe.error), 'credential_lease_not_active')
         self.assertEqual(safe.native.next_renew, 10_020.0)
+
+    def test_transient_idle_renew_failure_keeps_session_and_retries(self):
+        errors = [MutationUncertain('broker_http_outcome_uncertain'), BoundaryError('transport_failed'),
+                  BoundaryError('metadata_identity_unavailable')]
+        for error in errors:
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as root:
+                fixture = Fixture()
+                session, handle = self.prepare(fixture, root)
+                beats = []
+                handle.heartbeat = lambda: beats.append(True) or True
+                session.broker.renew.side_effect = error
+                anchor = handle.lease_clock.renewed_at
+                fixture.native.next_renew = time.monotonic() - 1
+                ready = c.maintain(handle)
+                self.assertTrue(ready['ready_for_project_prompt'])
+                self.assertEqual(fixture.events, [])
+                session.finish.assert_not_called()
+                session.broker.quarantine.assert_not_called()
+                self.assertEqual(beats, [True])
+                self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                now = time.monotonic()
+                self.assertGreater(fixture.native.next_renew, now)
+                self.assertLessEqual(fixture.native.next_renew, now + broker_renew.RETRY_SECONDS)
+                session.broker.renew.side_effect = None
+                fixture.native.next_renew = time.monotonic() - 1
+                c.maintain(handle)
+                self.assertFalse(handle.lease_clock.degraded)
+                self.assertGreater(handle.lease_clock.renewed_at, anchor)
+                self.assertAlmostEqual(fixture.native.next_renew, time.monotonic() + 20, delta=1)
+                c.close(handle)
+
+    def test_renew_failure_past_window_raises_claude_broker_renew_failed(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            session.broker.renew.side_effect = MutationUncertain('private detail')
+            fixture.native.next_renew = time.monotonic() - 1
+            with self.assertRaisesRegex(c.NativeError, '^claude_broker_renew_failed$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertIs(handle.native, fixture.native)
+            self.assertFalse(fixture.native.closed)
+            c.close(handle)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_conflict_and_denied_are_rejected_at_once(self):
+        errors = [Conflict('broker_operation_rejected'), BrokerError('broker_request_denied'),
+                  BrokerError('credential_lease_not_active')]
+        for error in errors:
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as root:
+                fixture = Fixture()
+                session, handle = self.prepare(fixture, root)
+                due = fixture.native.next_renew = time.monotonic() - 1
+                session.broker.renew.side_effect = error
+                with self.assertRaisesRegex(c.NativeError, '^claude_broker_renew_rejected$') as caught:
+                    c.maintain(handle)
+                self.assertEqual(session.broker.renew.call_count, 1)
+                self.assertEqual(fixture.native.next_renew, due)
+                self.assertIsNone(caught.exception.__cause__)
+                c.close(handle)
+
+    def test_tolerated_failure_still_heartbeats(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            fixture.native.next_renew = time.monotonic() - 1
+            session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+            handle.heartbeat = lambda: False
+            with self.assertRaisesRegex(c.NativeError, '^claude_hub_heartbeat_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'retry')
+            c.close(handle)
+
+    def test_tick_during_prompt_tolerates_one_blip(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            beats = []
+            handle.heartbeat = lambda: beats.append(True) or True
+
+            def hook(native, text):
+                native.next_renew = time.monotonic() - 1
+                session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+                native.tick()
+                return result_event()
+
+            fixture.prompt_hook = hook
+            result = c.execute(handle, 'Project prompt', time.monotonic() + 30)
+            self.assertEqual(result['text'], 'Verified project answer.')
+            self.assertEqual(fixture.prompts, ['Project prompt'])
+            # execute heartbeats before the prompt, then tick heartbeats on the blip.
+            self.assertEqual(beats, [True, True])
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+
+            def stale(native, text):
+                handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+                native.next_renew = 0
+                session.broker.renew.side_effect = MutationUncertain('x')
+                native.tick()
+                return result_event()
+
+            fixture.prompt_hook = stale
+            with self.assertRaisesRegex(c.NativeError, '^claude_broker_renew_failed$'):
+                c.execute(handle, 'Project prompt', time.monotonic() + 30)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_degraded_lease_gets_strict_renew_before_prompt(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = MutationUncertain('x')
+            fixture.native.next_renew = time.monotonic() - 1
+            c.maintain(handle)
+            with self.assertRaisesRegex(c.NativeError, '^claude_broker_renew_failed$'):
+                c.execute(handle, 'Project prompt', time.monotonic() + 30)
+            self.assertEqual(fixture.prompts, [])
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = MutationUncertain('x')
+            fixture.native.next_renew = time.monotonic() - 1
+            c.maintain(handle)
+            session.broker.renew.side_effect = None
+            result = c.execute(handle, 'Project prompt', time.monotonic() + 30)
+            self.assertEqual(result['text'], 'Verified project answer.')
+            self.assertEqual(fixture.prompts, ['Project prompt'])
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            before = session.broker.renew.call_count
+            c.execute(handle, 'Project prompt', time.monotonic() + 30)
+            self.assertEqual(session.broker.renew.call_count, before)
+
+    def test_prepare_anchors_lease_clock_without_renewing(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            before = time.monotonic()
+            session, handle = self.prepare(fixture, root)
+            after = time.monotonic()
+            self.assertGreaterEqual(handle.lease_clock.renewed_at, before)
+            self.assertLessEqual(handle.lease_clock.renewed_at, after)
+            session.broker.renew.assert_not_called()
+            c.close(handle)
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.lease.lease_id = 'c' * 32
+            t0 = time.monotonic() - 5
+            with patch.dict(broker_renew._acquire_started, {'c' * 32: t0}), \
+                    patch.object(c, 'NativeProcess', fixture.factory), \
+                    patch.object(c, 'launch_context_error', lambda *a: None):
+                handle = c.prepare(session, lambda: True, time.monotonic() + 30)
+            self.assertEqual(handle.lease_clock.renewed_at, t0)
+            session.broker.renew.assert_not_called()
+            c.close(handle)
+
+    def test_worker_survives_idle_blips_and_fails_after_window(self):
+        origin = time.monotonic()
+        state = {'now': origin}
+
+        def now():
+            return state['now']
+
+        def sleep(seconds):
+            state['now'] += seconds
+
+        class IdleClient:
+            def __init__(self):
+                self.claims = 0
+
+            def post(self, path, value):
+                if str(path).endswith('/claim'):
+                    self.claims += 1
+                    return {'task': None}
+                return {'accepted': True, 'active': True, 'deadline': 10 ** 12, 'server_time': 1}
+
+            def get_room(self, room_id):
+                raise AssertionError(room_id)
+
+        pending = [MutationUncertain('broker_http_outcome_uncertain'), BoundaryError('transport_failed')]
+
+        def effect(lease):
+            if pending:
+                raise pending.pop(0)
+
+        fixture = Fixture(renew_due=True)
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.broker.renew.side_effect = effect
+            client = IdleClient()
+            with patch.object(c, 'NativeProcess', fixture.factory), \
+                    patch.object(c, 'launch_context_error', lambda *a: None), \
+                    patch('time.monotonic', now):
+                worker = live_loop.Worker(live_loop.Settings('claude', 'claude-live', warm_seconds=60),
+                                          client, c, session, clock=now, sleep=sleep, log=lambda record: None)
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'idle_drained')
+            self.assertEqual(worker.last_exit, 0)
+        fixture = Fixture(renew_due=True)
+        maintains = {'n': 0}
+        real = c.maintain
+
+        def counting(handle):
+            maintains['n'] += 1
+            return real(handle)
+
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.lease.lease_id = 'd' * 32
+            session.broker.renew.side_effect = MutationUncertain('x')
+            old = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            client = IdleClient()
+            state['now'] = origin
+            with patch.dict(broker_renew._acquire_started, {'d' * 32: old}), \
+                    patch.object(c, 'NativeProcess', fixture.factory), \
+                    patch.object(c, 'launch_context_error', lambda *a: None), \
+                    patch.object(c, 'maintain', counting), \
+                    patch('time.monotonic', now):
+                worker = live_loop.Worker(live_loop.Settings('claude', 'claude-live', warm_seconds=60),
+                                          client, c, session, clock=now, sleep=sleep, log=lambda record: None)
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'failed')
+            self.assertEqual(result['error_code'], 'claude_broker_renew_failed')
+            self.assertEqual(worker.last_exit, 1)
+            self.assertEqual(maintains['n'], 1)
+            self.assertEqual(client.claims, 0)
 
     def test_command_matches_the_audited_subscription_profile(self):
         argv = c.command().argv

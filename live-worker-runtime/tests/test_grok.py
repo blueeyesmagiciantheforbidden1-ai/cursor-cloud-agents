@@ -5,12 +5,24 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+HERE = Path(__file__).resolve().parents[1]
+HUB = Path(__file__).resolve().parents[2] / 'agent-hub'
+for entry in (str(HERE), str(HUB)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+import broker_renew
+import live_loop
+import provider_errors
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
+from agent_hub.credential_broker_service import BoundaryError
 from providers import grok as g
 from providers import _grok_protocol as wire
 
@@ -32,11 +44,13 @@ def catalog():
 
 
 class Fixture:
-    def __init__(self, *, overrides=None, task_hook=None, close_error=None, finish_error=None):
+    def __init__(self, *, overrides=None, task_hook=None, close_error=None, finish_error=None,
+                 pump=False, prompt_renews=0, renew_due=False):
         self.events, self.calls = [], []
         self.overrides = overrides or {}
         self.task_hook = task_hook
         self.close_error, self.finish_error = close_error, finish_error
+        self.pump, self.prompt_renews, self.renew_due = pump, prompt_renews, renew_due
         self.native = None
         self.factory = self._factory
 
@@ -45,12 +59,20 @@ class Fixture:
         class FakeNative:
             def __init__(self):
                 self.renew, self.deadline = renew, deadline
-                self.next_renew = time.monotonic()+20
+                self.next_renew = 0 if owner.renew_due else time.monotonic()+20
                 self.notifications, self.internal_ack_counts = [], {'skills-reload': 1}
                 self.closed = False
                 self.process = SimpleNamespace(poll=lambda: 0 if self.closed else None)
             def request(self, method, params):
-                owner.calls.append((method, copy.deepcopy(params)))
+                if owner.pump and method == 'session/prompt' and owner.prompt_renews:
+                    owner.calls.append((method, copy.deepcopy(params)))
+                    for _ in range(owner.prompt_renews):
+                        self.next_renew = 0
+                        self.next_renew = broker_renew.next_due(self.renew(), 20)
+                else:
+                    if owner.pump and time.monotonic() >= self.next_renew:
+                        self.next_renew = broker_renew.next_due(self.renew(), 20)
+                    owner.calls.append((method, copy.deepcopy(params)))
                 if method in owner.overrides:
                     value = owner.overrides[method]
                     if isinstance(value, Exception):
@@ -347,6 +369,285 @@ class GrokAdapter(unittest.TestCase):
                 self.assertFalse(any(name == 'session/prompt' for name, _ in fixture.calls))
 
 
+    def _beats(self):
+        seen = []
+
+        def beat():
+            seen.append(True)
+            return True
+
+        return seen, beat
+
+    def test_transient_idle_renew_failure_keeps_session_and_retries(self):
+        errors = [MutationUncertain('broker_http_outcome_uncertain'), BoundaryError('transport_failed'),
+                  BoundaryError('transport_limit'), BoundaryError('metadata_identity_unavailable')]
+        for error in errors:
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as root:
+                fixture = Fixture()
+                session, handle = self.prepare(fixture, root)
+                beats = []
+                handle.heartbeat = lambda: beats.append(True) or True
+                session.broker.renew.side_effect = error
+                anchor = handle.lease_clock.renewed_at
+                fixture.native.next_renew = time.monotonic() - 1
+                ready = g.maintain(handle)
+                self.assertTrue(ready['ready_for_project_prompt'])
+                self.assertEqual(fixture.events, [])
+                session.finish.assert_not_called()
+                session.broker.quarantine.assert_not_called()
+                self.assertEqual(beats, [True])
+                self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                self.assertTrue(handle.lease_clock.degraded)
+                now = time.monotonic()
+                self.assertGreater(fixture.native.next_renew, now)
+                self.assertLessEqual(fixture.native.next_renew, now + broker_renew.RETRY_SECONDS)
+                session.broker.renew.side_effect = None
+                fixture.native.next_renew = time.monotonic() - 1
+                g.maintain(handle)
+                self.assertEqual(session.broker.renew.call_count, 2)
+                self.assertFalse(handle.lease_clock.degraded)
+                self.assertGreater(handle.lease_clock.renewed_at, anchor)
+                self.assertAlmostEqual(fixture.native.next_renew, time.monotonic() + 20, delta=1)
+                g.close(handle)
+
+    def test_renew_rejections_fail_idle_at_once(self):
+        errors = [Conflict('broker_operation_rejected'), BrokerError('broker_request_denied'),
+                  BoundaryError('credential_fence_lost'), BoundaryError('request_invalid')]
+        for error in errors:
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as root:
+                fixture = Fixture()
+                session, handle = self.prepare(fixture, root)
+                session.broker.renew.side_effect = error
+                fixture.native.next_renew = time.monotonic() - 1
+                with self.assertRaisesRegex(g.NativeError, '^grok_broker_renew_rejected$') as caught:
+                    g.maintain(handle)
+                self.assertIsNone(caught.exception.__cause__)
+                self.assertTrue(caught.exception.__suppress_context__)
+                self.assertNotIn(str(error), str(caught.exception))
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+                self.assertEqual(fixture.events, [])
+                self.assertEqual(session.broker.renew.call_count, 1)
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_renew_failure_past_window_fails_with_vetted_code(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            session.broker.renew.side_effect = MutationUncertain('private detail')
+            fixture.native.next_renew = time.monotonic() - 1
+            with self.assertRaisesRegex(g.NativeError, '^grok_broker_renew_failed$') as caught:
+                g.maintain(handle)
+            self.assertNotIn('private', str(caught.exception))
+            self.assertEqual(provider_errors.error_code(caught.exception), 'grok_broker_renew_failed')
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertNotIn('grok_broker_renew_failed', live_loop._IDLE_RETRY_CODES)
+            self.assertNotIn('grok_broker_renew_failed', live_loop._IDLE_DRAIN_CODES)
+            self.assertEqual(fixture.events, [])
+            g.close(handle)
+
+    def test_tolerated_renew_failure_still_heartbeats(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+            fixture.native.next_renew = due = time.monotonic() - 1
+            handle.heartbeat = lambda: False
+            with self.assertRaisesRegex(g.NativeError, '^grok_hub_heartbeat_lost$') as caught:
+                g.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'retry')
+            self.assertEqual(fixture.native.next_renew, due)
+            self.assertIsNone(fixture.native.process.poll())
+            g.close(handle)
+
+    def test_prepare_anchors_lease_clock(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            before = time.monotonic()
+            session, handle = self.prepare(fixture, root)
+            after = time.monotonic()
+            self.assertGreaterEqual(handle.lease_clock.renewed_at, before)
+            self.assertLessEqual(handle.lease_clock.renewed_at, after)
+            session.broker.renew.assert_not_called()
+            g.close(handle)
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.lease.lease_id = 'x' * 32
+            t0 = time.monotonic() - 5
+            with patch.dict(broker_renew._acquire_started, {'x' * 32: t0}):
+                with patch.object(g, 'NativeProcess', fixture.factory):
+                    handle = g.prepare(session, lambda: True, time.monotonic() + 30)
+            self.assertEqual(handle.lease_clock.renewed_at, t0)
+            session.broker.renew.assert_not_called()
+            g.close(handle)
+
+    def test_transient_renew_failure_during_turn_keeps_the_turn(self):
+        fixture = Fixture(pump=True, prompt_renews=3)
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            seen = []
+            handle.heartbeat = lambda: seen.append(handle.lease_clock.degraded) or True
+            session.broker.renew.side_effect = [None, MutationUncertain('x'), None]
+            result = g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertEqual(result['text'], 'Verified project answer.')
+            self.assertEqual(sum(name == 'session/prompt' for name, _ in fixture.calls), 1)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+            self.assertIn(True, seen)
+
+    def test_renew_failure_past_window_during_turn_fails_with_vetted_code(self):
+        fixture = Fixture(pump=True, prompt_renews=1)
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            session.broker.renew.side_effect = MutationUncertain('private detail')
+            with self.assertRaisesRegex(g.NativeError, '^grok_broker_renew_failed$'):
+                g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertEqual(sum(name == 'session/prompt' for name, _ in fixture.calls), 1)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+            with self.assertRaisesRegex(g.NativeError, 'task_replay_forbidden'):
+                g.execute(handle, 'No second prompt.', time.monotonic() + 30)
+            self.assertEqual(sum(name == 'session/prompt' for name, _ in fixture.calls), 1)
+
+    def test_conflict_during_turn_is_rejected_at_once(self):
+        fixture = Fixture(pump=True, prompt_renews=1)
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = Conflict('broker_operation_rejected')
+            with self.assertRaisesRegex(g.NativeError, '^grok_broker_renew_rejected$'):
+                g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_degraded_lease_gets_strict_renew_before_prompt(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = MutationUncertain('x')
+            fixture.native.next_renew = time.monotonic() - 1
+            g.maintain(handle)
+            self.assertTrue(handle.lease_clock.degraded)
+            session.broker.renew.side_effect = None
+            before = session.broker.renew.call_count
+            result = g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertEqual(result['text'], 'Verified project answer.')
+            self.assertEqual(session.broker.renew.call_count, before + 1)
+            self.assertEqual(sum(name == 'session/prompt' for name, _ in fixture.calls), 1)
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = MutationUncertain('x')
+            fixture.native.next_renew = time.monotonic() - 1
+            g.maintain(handle)
+            with self.assertRaisesRegex(g.NativeError, '^grok_broker_renew_failed$'):
+                g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertFalse(any(name == 'session/prompt' for name, _ in fixture.calls))
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            before = session.broker.renew.call_count
+            g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertEqual(session.broker.renew.call_count, before)
+
+    def test_startup_pump_tolerates_then_fails_past_window(self):
+        fixture = Fixture(pump=True, renew_due=True)
+        state = {'n': 0}
+
+        def effect(lease):
+            state['n'] += 1
+            if state['n'] == 1:
+                raise MutationUncertain('broker_http_outcome_uncertain')
+
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.broker.renew.side_effect = effect
+            with patch.object(g, 'NativeProcess', fixture.factory):
+                handle = g.prepare(session, lambda: True, time.monotonic() + 30)
+            self.assertTrue(handle.readiness['ready_for_project_prompt'])
+            g.close(handle)
+        fixture = Fixture(pump=True, renew_due=True)
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.lease.lease_id = 'y' * 32
+            session.broker.renew.side_effect = MutationUncertain('x')
+            old = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            with patch.dict(broker_renew._acquire_started, {'y' * 32: old}):
+                with patch.object(g, 'NativeProcess', fixture.factory):
+                    with self.assertRaisesRegex(g.NativeError, '^grok_broker_renew_failed$'):
+                        g.prepare(session, lambda: True, time.monotonic() + 30)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_worker_survives_one_idle_blip_and_fails_after_window(self):
+        origin = time.monotonic()
+        state = {'now': origin}
+
+        def now():
+            return state['now']
+
+        def sleep(seconds):
+            state['now'] += seconds
+
+        class IdleClient:
+            def __init__(self):
+                self.claims = 0
+
+            def post(self, path, value):
+                if str(path).endswith('/claim'):
+                    self.claims += 1
+                    return {'task': None}
+                return {'accepted': True, 'active': True, 'deadline': 10 ** 12, 'server_time': 1}
+
+            def get_room(self, room_id):
+                raise AssertionError(room_id)
+
+        calls = {'n': 0}
+
+        def effect(lease):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise MutationUncertain('broker_http_outcome_uncertain')
+
+        fixture = Fixture(renew_due=True)
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.broker.renew.side_effect = effect
+            client = IdleClient()
+            with patch.object(g, 'NativeProcess', fixture.factory), patch('time.monotonic', now):
+                worker = live_loop.Worker(live_loop.Settings('grok', 'grok-live', warm_seconds=60),
+                                          client, g, session, clock=now, sleep=sleep, log=lambda record: None)
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'idle_drained')
+            self.assertEqual(worker.last_exit, 0)
+        fixture = Fixture(renew_due=True)
+        maintains = {'n': 0}
+        real = g.maintain
+
+        def counting(handle):
+            maintains['n'] += 1
+            return real(handle)
+
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            session.lease.lease_id = 'z' * 32
+            session.broker.renew.side_effect = MutationUncertain('x')
+            old = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            client = IdleClient()
+            state['now'] = origin
+            with patch.dict(broker_renew._acquire_started, {'z' * 32: old}), \
+                    patch.object(g, 'NativeProcess', fixture.factory), \
+                    patch.object(g, 'maintain', counting), \
+                    patch('time.monotonic', now):
+                worker = live_loop.Worker(live_loop.Settings('grok', 'grok-live', warm_seconds=60),
+                                          client, g, session, clock=now, sleep=sleep, log=lambda record: None)
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'failed')
+            self.assertEqual(result['error_code'], 'grok_broker_renew_failed')
+            self.assertEqual(worker.last_exit, 1)
+            self.assertEqual(maintains['n'], 1)
+            self.assertEqual(client.claims, 0)
+
+
 class BillingPolicy(unittest.TestCase):
     def test_native_omissions_are_unavailable_and_cent_empty_is_zero(self):
         result = g._billing(billing(), {'rule': {}})
@@ -440,6 +741,63 @@ class TransportSmoke(unittest.TestCase):
         self.assertEqual(wire.rpc_error_code({'code': 429, 'message': 'insufficient_quota'}),
                          'grok_quota_exhausted')
         self.assertEqual(wire.rpc_error_code({'code': 429, 'message': 'rate_limit'}), 'native_rpc_429')
+
+    def test_pump_rearms_after_renew_outcome(self):
+        def run(renew, after):
+            process = self.transport([{'jsonrpc': '2.0', 'id': '1', 'result': {'email': 'fixture'}}])
+            with patch.object(wire.subprocess, 'Popen', return_value=process), \
+                    patch.object(wire.os, 'killpg', create=True), \
+                    patch.object(wire.signal, 'SIGKILL', 9, create=True):
+                native = wire.Native(Path('/offline'), renew, time.monotonic() + 5)
+                native.next_renew = time.monotonic() - 1
+                try:
+                    native.request('x.ai/auth/info', {})
+                except g.NativeError as error:
+                    after(native, error)
+                else:
+                    after(native, None)
+                native.close()
+
+        recorded = {}
+
+        def tolerated():
+            recorded['t'] = time.monotonic()
+            return False
+
+        def check_retry(native, error):
+            self.assertIsNone(error)
+            now = time.monotonic()
+            self.assertGreater(native.next_renew, now)
+            self.assertLessEqual(native.next_renew, now + broker_renew.RETRY_SECONDS)
+            self.assertGreaterEqual(native.next_renew, recorded['t'] + broker_renew.RETRY_SECONDS)
+
+        run(tolerated, check_retry)
+
+        def check_cadence(native, error):
+            self.assertIsNone(error)
+            self.assertAlmostEqual(native.next_renew, time.monotonic() + 20, delta=1)
+
+        run(lambda: True, check_cadence)
+        run(lambda: None, check_cadence)
+
+        due = {}
+
+        def boom():
+            raise wire.NativeError('grok_hub_heartbeat_lost')
+
+        def run_raise():
+            process = self.transport([{'jsonrpc': '2.0', 'id': '1', 'result': {'email': 'fixture'}}])
+            with patch.object(wire.subprocess, 'Popen', return_value=process), \
+                    patch.object(wire.os, 'killpg', create=True), \
+                    patch.object(wire.signal, 'SIGKILL', 9, create=True):
+                native = wire.Native(Path('/offline'), boom, time.monotonic() + 5)
+                due['value'] = native.next_renew = time.monotonic() - 1
+                with self.assertRaisesRegex(g.NativeError, '^grok_hub_heartbeat_lost$'):
+                    native.request('x.ai/auth/info', {})
+                self.assertEqual(native.next_renew, due['value'])
+                native.close()
+
+        run_raise()
 
 
 if __name__ == '__main__':

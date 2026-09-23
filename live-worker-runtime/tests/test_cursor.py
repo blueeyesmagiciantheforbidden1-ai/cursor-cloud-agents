@@ -1,5 +1,6 @@
 """Offline live-Cursor lifecycle/policy tests. No native executable or network."""
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -11,16 +12,33 @@ import unittest
 from unittest.mock import Mock, patch
 
 HERE = Path(__file__).resolve().parents[1]
+HUB = HERE.parent / 'agent-hub'
 SOURCE = Path(r'C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e7f-992bfc4740b3/agent-hub')
-for entry in (str(HERE), str(HERE.parent), str(SOURCE / 'deploy' / 'cursor-worker')):
+for entry in (str(SOURCE / 'deploy' / 'cursor-worker'), str(HERE.parent), str(HUB), str(HERE)):
     if entry not in sys.path:
-        sys.path.append(entry)
+        sys.path.insert(0, entry)
 
+import broker_renew  # noqa: E402
+import live_loop  # noqa: E402
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain  # noqa: E402
+from agent_hub.credential_broker_service import BoundaryError  # noqa: E402
 from providers import cursor as c  # noqa: E402
 
 KEY = 'PRIVATE_OFFLINE_CURSOR_KEY'
 OWNER_EMAIL = 'cursor-owner@example.invalid'
+# The placeholder owner email is not the enrolled account hash. The harness
+# pins ACCOUNT_REF to that email so offline status fixtures match the owner check.
+c.ACCOUNT_REF = hashlib.sha256(OWNER_EMAIL.strip().lower().encode()).hexdigest()
 SID = '12345678-1234-1234-1234-123456789abc'
+
+
+def beat_if_due(native, *, code='cursor_lease_lost'):
+    """Same due-check the real pumps use. A far next_heartbeat skips the call."""
+    if time.monotonic() < getattr(native, 'next_heartbeat', 0):
+        return
+    renewed = native.heartbeat()
+    c.need(type(renewed) is bool, code)
+    native.next_heartbeat = broker_renew.next_due(renewed, c.HEARTBEAT_SECONDS)
 
 
 def option(key, category, values, current):
@@ -54,6 +72,10 @@ class Fixture:
         owner.metadata_calls.append(command)
 
         class FakeMetadata:
+            def __init__(self):
+                self.heartbeat = heartbeat
+                self.next_heartbeat = time.monotonic() + 3600
+
             def __enter__(self):
                 return self
 
@@ -61,6 +83,7 @@ class Fixture:
                 owner.events.append('metadata-stop')
 
             def completed_output(self):
+                beat_if_due(self, code='cursor_lease_lost_during_metadata')
                 settings = Path(environment['CURSOR_CONFIG_DIR']) / 'cli-config.json'
                 if command == ('models',):
                     settings.write_text('{}', encoding='utf-8')
@@ -79,11 +102,13 @@ class Fixture:
                 self.closed = False
                 self.idle_hook = None
                 self.idle_frame = None
+                self.next_heartbeat = time.monotonic() + 3600
 
             def alive(self):
                 return not self.closed
 
             def idle_pump(self):
+                beat_if_due(self)
                 # Same bound NativeProcess.pump enforces once stdout is still open.
                 if c.time.monotonic() >= self.deadline:
                     raise c.metadata.MetadataError('native_metadata_deadline')
@@ -94,6 +119,7 @@ class Fixture:
                     self.idle_hook(self)
 
             def request(self, method, params):
+                beat_if_due(self)
                 owner.calls.append((method, copy.deepcopy(params)))
                 if method in owner.overrides:
                     value = owner.overrides[method]
@@ -409,6 +435,117 @@ class CursorAdapter(unittest.TestCase):
             self.assertEqual(seen['deadline'], task_deadline)
             self.assertNotEqual(seen['deadline'], warm)
 
+    def _clock_handle(self, now=0):
+        state = {'now': now}
+
+        def clock():
+            return state['now']
+
+        clock.state = state
+        lease = SimpleNamespace()
+        broker = SimpleNamespace(renew=Mock())
+        session = SimpleNamespace(lease=lease, broker=broker)
+        beats = []
+        handle = c.Handle(session=session, heartbeat=lambda: beats.append(True) or True,
+                          lease_clock=broker_renew.LeaseClock(c.NativeError, 'cursor', now, clock=clock))
+        return handle, beats, broker, clock
+
+    def test_renew_tolerates_transient_errors_until_window(self):
+        handle, beats, broker, clock = self._clock_handle(0)
+        self.assertIs(c._renew(handle), True)
+        cases = ((10, MutationUncertain('broker_http_outcome_uncertain')),
+                 (100, BoundaryError('transport_failed')),
+                 (180, MutationUncertain('broker_http_outcome_uncertain')))
+        for when, error in cases:
+            with self.subTest(when=when):
+                clock.state['now'] = when
+                broker.renew.side_effect = error
+                self.assertIs(c._renew(handle), False)
+        self.assertEqual(len(beats), 4)
+        clock.state['now'] = 181
+        broker.renew.side_effect = MutationUncertain('x')
+        with self.assertRaisesRegex(c.NativeError, '^cursor_broker_renew_failed$') as caught:
+            c._renew(handle)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_renew_rejections_are_immediate(self):
+        errors = [Conflict('broker_operation_rejected'), BrokerError('broker_request_denied'),
+                  BoundaryError('credential_fence_lost')]
+        for error in errors:
+            with self.subTest(error=str(error)):
+                handle, _beats, broker, clock = self._clock_handle(0)
+                anchor = handle.lease_clock.renewed_at
+                broker.renew.side_effect = error
+                with self.assertRaisesRegex(c.NativeError, '^cursor_broker_renew_rejected$'):
+                    c._renew(handle)
+                self.assertEqual(handle.lease_clock.renewed_at, anchor)
+                self.assertEqual(broker.renew.call_count, 1)
+
+    def test_tolerated_renew_still_raises_hub_heartbeat_lost(self):
+        handle, _beats, broker, _clock = self._clock_handle(0)
+        broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+        handle.heartbeat = lambda: False
+        with self.assertRaisesRegex(c.NativeError, '^cursor_hub_heartbeat_lost$') as caught:
+            c._renew(handle)
+        self.assertEqual(live_loop.maintain_fault(caught.exception), 'retry')
+
+    def test_maintain_survives_transient_failures_until_window(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+            fixture.native.next_heartbeat = 0
+            ready = c.maintain(handle)
+            self.assertTrue(ready['ready_for_project_prompt'])
+            self.assertFalse(handle.finished)
+            self.assertIs(handle.native, fixture.native)
+            handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            fixture.native.next_heartbeat = 0
+            with self.assertRaisesRegex(c.NativeError, '^cursor_broker_renew_failed$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertFalse(handle.finished)
+            self.assertIs(handle.native, fixture.native)
+            c.close(handle)
+
+    def test_maintain_backstop_without_pump(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            live = c.LiveProcess.__new__(c.LiveProcess)
+            live.process = SimpleNamespace(poll=lambda: None, stdin=io.BytesIO())
+            live.selector = SimpleNamespace(get_map=lambda: {})
+            live.buffer = bytearray()
+            live.answer = ''
+            live.prompt_sent = False
+            live.deadline = time.monotonic() + 100
+            live.next_heartbeat = 0
+            live.heartbeat = lambda: (_ for _ in ()).throw(AssertionError('empty selector must not pump'))
+            handle.native = live
+            handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            with self.assertRaisesRegex(c.NativeError, '^cursor_broker_renew_failed$'):
+                c.maintain(handle)
+            self.assertFalse(handle.finished)
+
+    def test_execute_turn_survives_one_transient_renew(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+
+            def hook(native, params):
+                native.next_heartbeat = 0
+                session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+                beat_if_due(native)
+                native.answer = 'Verified project answer.'
+                native.counts = {'agent_message_chunk': 1}
+                return {'stopReason': 'end_turn'}
+
+            fixture.prompt_hook = hook
+            result = c.execute(handle, 'Project prompt', time.monotonic() + 60)
+            self.assertEqual(result['text'], 'Verified project answer.')
+            self.assertEqual(fixture.events[-2:], ['stop', 'commit-release'])
+            session.broker.renew.assert_called()
+
 
 class LiveProtocol(unittest.TestCase):
     """LiveProcess frame handling without a native process."""
@@ -498,6 +635,73 @@ class LiveProtocol(unittest.TestCase):
             live.buffer = bytearray(b'{"jsonrpc":\n')
             with self.assertRaises(json.JSONDecodeError):
                 live.idle_pump()
+
+    def test_pump_rearms_after_tolerated_failure(self):
+        handle = c.Handle(session=SimpleNamespace(
+            lease=SimpleNamespace(), broker=SimpleNamespace(renew=Mock())), heartbeat=lambda: True,
+            lease_clock=broker_renew.LeaseClock.for_lease(SimpleNamespace(), c.NativeError, 'cursor'))
+        live = c.LiveProcess.__new__(c.LiveProcess)
+        live.heartbeat = lambda: c._renew(handle)
+        live.deadline = time.monotonic() + 30
+        live.selector = SimpleNamespace(get_map=lambda: {1: object()}, select=lambda timeout: [])
+        live.next_heartbeat = 0
+        handle.session.broker.renew.side_effect = MutationUncertain('broker_http_outcome_uncertain')
+        before = time.monotonic()
+        live.pump()
+        self.assertGreaterEqual(live.next_heartbeat, before + broker_renew.RETRY_SECONDS)
+        self.assertLessEqual(live.next_heartbeat, time.monotonic() + broker_renew.RETRY_SECONDS)
+        handle.session.broker.renew.side_effect = None
+        live.next_heartbeat = 0
+        before = time.monotonic()
+        live.pump()
+        self.assertAlmostEqual(live.next_heartbeat, before + c.HEARTBEAT_SECONDS, delta=1)
+        live.heartbeat = lambda: None
+        live.next_heartbeat = 0
+        with self.assertRaisesRegex(c.NativeError, '^cursor_lease_lost$'):
+            live.pump()
+
+    def test_metadata_pump_tolerance(self):
+        handle = c.Handle(session=SimpleNamespace(
+            lease=SimpleNamespace(), broker=SimpleNamespace(renew=Mock(
+                side_effect=MutationUncertain('broker_http_outcome_uncertain')))),
+            heartbeat=lambda: True,
+            lease_clock=broker_renew.LeaseClock.for_lease(SimpleNamespace(), c.NativeError, 'cursor'))
+        with patch.object(c.metadata.NativeProcess, '__init__', lambda *args, **kwargs: None), \
+                patch.object(c.metadata.NativeProcess, 'pump', lambda *args, **kwargs: None):
+            native = c._metadata_process(('models',), {}, Path('.'), time.monotonic() + 30,
+                                         lambda: c._renew(handle))
+            native.deadline = time.monotonic() + 30
+            native.next_heartbeat = 0
+            before = time.monotonic()
+            native.pump()
+            self.assertGreaterEqual(native.next_heartbeat, before + broker_renew.RETRY_SECONDS)
+            self.assertLessEqual(native.next_heartbeat, time.monotonic() + broker_renew.RETRY_SECONDS)
+            handle.lease_clock.renewed_at = time.monotonic() - broker_renew.TOLERANCE_SECONDS - 1
+            native.next_heartbeat = 0
+            with self.assertRaisesRegex(c.NativeError, '^cursor_broker_renew_failed$'):
+                native.pump()
+
+    def test_pre_prompt_gate_is_strict(self):
+        live = c.LiveProcess.__new__(c.LiveProcess)
+        live.stage = 6
+        live.effective_selected = True
+        live.prompt_sent = False
+        live.session_id = SID
+        live.heartbeat = lambda: False
+        live.process = SimpleNamespace(stdin=io.BytesIO())
+        params = {'sessionId': SID, 'prompt': [{'type': 'text', 'text': 'Project prompt'}]}
+        with self.assertRaisesRegex(c.NativeError, '^cursor_broker_renew_failed$'):
+            live.request('session/prompt', params)
+        self.assertEqual(live.process.stdin.getvalue(), b'')
+        live.heartbeat = lambda: True
+        live.stage = 6
+        live.prompt_sent = False
+        result = {'jsonrpc': '2.0', 'id': 7, 'result': {'stopReason': 'end_turn'}}
+        live.buffer = bytearray(json.dumps(result).encode() + b'\n')
+        live.process = SimpleNamespace(stdin=io.BytesIO())
+        returned = live.request('session/prompt', params)
+        self.assertEqual(returned['stopReason'], 'end_turn')
+        self.assertIn(b'session/prompt', live.process.stdin.getvalue())
 
 
 if __name__ == '__main__':

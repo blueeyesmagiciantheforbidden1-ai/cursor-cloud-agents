@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / 'live-worker-runtime'
 PROVIDERS = ('claude', 'codex', 'copilot', 'cursor', 'grok')
 PLACEHOLDER = 'cursor-owner@example.invalid'
-COMMON = ('live_loop.py', 'provider_errors.py', 'entrypoint.py', 'dynamic_broker.py',
+COMMON = ('live_loop.py', 'provider_errors.py', 'broker_renew.py', 'entrypoint.py', 'dynamic_broker.py',
           'test_dynamic_broker.py', 'test_live_loop.py')
 # Files whose placeholder line is the operator's owner pin in the built image.
 PINNED = {'providers/grok.py', 'tests/test_codex.py', 'tests/test_cursor.py'}

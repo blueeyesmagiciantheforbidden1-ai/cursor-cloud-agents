@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import sys
+import time
 from urllib.request import Request, build_opener, ProxyHandler
 import uuid
 
@@ -17,6 +18,7 @@ sys.path[:0] = [str(HERE), '/opt/runcrew', '/opt/runcrew/app']
 from agent_hub.worker import Config, HubClient, NoRedirect, WorkerError
 from dynamic_broker import load_client
 from live_loop import Settings, Worker
+import broker_renew
 import provider_errors
 
 HUB = 'https://runcrew-hub-kdhodumsza-uc.a.run.app'
@@ -86,7 +88,9 @@ def main():
     with intent.open('x', encoding='utf-8') as stream:
         json.dump({'request_id': request_id, 'execution_uid': broker.execution_uid}, stream)
         stream.flush(); os.fsync(stream.fileno())
+    acquire_started = time.monotonic()
     lease = broker.acquire(broker.execution, request_id)
+    broker_renew.record_acquire_start(lease.lease_id, acquire_started)
     from credential_state import RefreshSession
     session = RefreshSession(broker, lease, home)
     worker = None

@@ -1250,4 +1250,48 @@ class LoopTests(unittest.TestCase):
         self.assertIn("value.get('kind') == 'runcrew_live_span'", source)
 
 
+class BrokerRenewGuardTests(unittest.TestCase):
+    """Fail codes for an exhausted or rejected renew. Neither is a retry or a drain."""
+
+    def test_both_codes_fail_for_every_provider(self):
+        providers = ('grok', 'codex', 'copilot', 'claude', 'cursor')
+        for provider in providers:
+            for suffix in ('_broker_renew_failed', '_broker_renew_rejected'):
+                code = provider + suffix
+                with self.subTest(code=code):
+                    error = CodeError(code)
+                    self.assertEqual(live_loop.maintain_fault(error), 'fail')
+                    self.assertEqual(live_loop.idle_fault(error), 'fail')
+                    self.assertNotIn(code, live_loop._IDLE_RETRY_CODES)
+                    self.assertNotIn(code, live_loop._IDLE_DRAIN_CODES)
+                    self.assertEqual(provider_errors.error_code(error), code)
+
+    def test_maintain_failure_claims_nothing_and_closes(self):
+        worker, client, adapter, _clock = LoopTests().setup_worker()
+        client.empty = True
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            raise CodeError('grok_broker_renew_failed')
+
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(adapter.calls.count('maintain'), 1)
+        self.assertEqual(client.claims, 0)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['error_code'], 'grok_broker_renew_failed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertIn('close', adapter.calls)
+
+    def test_lease_seconds_and_entrypoint_acquire_stamp(self):
+        import broker_renew
+        import dynamic_broker
+        default = dynamic_broker.Policy.__dataclass_fields__['lease_seconds'].default
+        self.assertEqual(broker_renew.LEASE_SECONDS, default)
+        source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')
+        acquire_at = source.index('lease = broker.acquire(')
+        self.assertIn('acquire_started = time.monotonic()', source[:acquire_at])
+        self.assertIn('broker_renew.record_acquire_start(lease.lease_id, acquire_started)', source[acquire_at:])
+
+
 if __name__ == '__main__': unittest.main()
