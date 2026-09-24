@@ -782,6 +782,11 @@ class FleetReviewTests(unittest.TestCase):
         from agent_hub.cloud_credential_broker import CloudCredentialBroker
         # live-worker-runtime/tests shadows agent-hub/tests on sys.path.
         path = ROOT.parent / 'agent-hub' / 'tests' / 'test_cloud_credential_broker.py'
+        if not path.is_file():
+            # The controller and broker images run this file without the repo's
+            # agent-hub/tests (build 8d08a2eb failed here). The same chain runs
+            # in the full checkout and in test_abort_idle_controller_crosscheck.
+            self.skipTest('broker GoogleWire fixture exists only in the full checkout')
         spec = importlib.util.spec_from_file_location('credential_broker_google_wire', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
