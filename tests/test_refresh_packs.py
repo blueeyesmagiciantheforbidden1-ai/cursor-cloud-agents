@@ -265,8 +265,15 @@ class RefreshPacksTest(unittest.TestCase):
                         if rel in refresh_packs.PINNED:
                             expected = expected.replace(PLACEHOLDER, EMAIL)
                         self.assertEqual(copied, expected)
+                    hub = ROOT / 'agent-hub'
                     for rel in external:
-                        self.assertEqual((pack / rel).read_text(encoding='utf-8'), STUB)
+                        # agent_hub modules come from the checkout (the library the
+                        # suites test against); image-only modules stay from the base.
+                        checkout = hub / rel
+                        if rel.startswith('agent_hub/') and checkout.is_file():
+                            self.assertEqual((pack / rel).read_bytes(), checkout.read_bytes())
+                        else:
+                            self.assertEqual((pack / rel).read_text(encoding='utf-8'), STUB)
                     if provider in ('claude', 'cursor'):
                         self.assertNotEqual((pack / 'live' / 'credential_state.py').read_text(encoding='utf-8'), STUB)
                     else:
@@ -285,7 +292,49 @@ class RefreshPacksTest(unittest.TestCase):
                     self.assertEqual(build.count(':' + VERSION), 2)
                     self.assertNotIn(BASE, build)
                     self.assertEqual((pack / 'Dockerfile').read_bytes(), (base / 'Dockerfile').read_bytes())
-                    self.assertEqual(snapshot(pack / 'agent_hub'), snapshot(base / 'agent_hub'))
+                    # agent_hub keeps the base's file set; each module that exists in
+                    # the checkout carries the checkout's bytes, the rest the base's.
+                    packed, based = snapshot(pack / 'agent_hub'), snapshot(base / 'agent_hub')
+                    self.assertEqual(set(packed), set(based))
+                    for name, data in packed.items():
+                        checkout = ROOT / 'agent-hub' / 'agent_hub' / name
+                        self.assertEqual(data, checkout.read_bytes() if checkout.is_file() else based[name])
+
+    def test_every_agent_hub_name_the_worker_imports_exists_in_the_shipped_modules(self):
+        # 2026-09-24: live code imported UpstreamUnavailable while the packs
+        # still carried the base pack's older agent_hub; every image test
+        # failed. Packs now ship the checkout's agent_hub, so check names there.
+        hub = ROOT / 'agent-hub' / 'agent_hub'
+
+        def defined(module):
+            tree = ast.parse((hub / (module.replace('.', '/') + '.py')).read_text(encoding='utf-8'))
+            names = set()
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        for leaf in ast.walk(target):
+                            if isinstance(leaf, ast.Name):
+                                names.add(leaf.id)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    names.update((alias.asname or alias.name).split('.')[0] for alias in node.names)
+            return names
+
+        checked = 0
+        for provider in refresh_packs.PROVIDERS:
+            for rel, source in refresh_packs.live_files(provider).items():
+                if not rel.endswith('.py'):
+                    continue
+                for node in ast.walk(ast.parse(source.read_text(encoding='utf-8'))):
+                    if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith('agent_hub.'):
+                        module = node.module[len('agent_hub.'):]
+                        available = defined(module)
+                        for alias in node.names:
+                            with self.subTest(provider=provider, file=rel, name=f'{node.module}.{alias.name}'):
+                                self.assertIn(alias.name, available)
+                            checked += 1
+        self.assertGreater(checked, 10)
 
     def test_existing_target_pack_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -72,12 +72,14 @@ def base_drift(base, owner_email):
     files are compared with the owner email put back to the placeholder.
     """
     drift = []
-    for file in sorted((base / 'live').rglob('*')):
+    files = [(file, file.relative_to(base / 'live').as_posix()) for file in sorted((base / 'live').rglob('*'))]
+    files += [(file, 'agent_hub/' + file.relative_to(base / 'agent_hub').as_posix())
+              for file in sorted((base / 'agent_hub').rglob('*'))] if (base / 'agent_hub').is_dir() else []
+    for file, name in files:
         # Every file, not only Python: a pack-only data or config file is a
-        # hand change too.
+        # hand change too. agent_hub/ counts as well (the image runs it).
         if not file.is_file() or '__pycache__' in file.parts or file.suffix == '.pyc':
             continue
-        name = file.relative_to(base / 'live').as_posix()
         data = file.read_bytes()
         if name in PINNED and owner_email:
             data = data.replace(owner_email.encode(), PLACEHOLDER.encode())
@@ -100,6 +102,15 @@ def refresh(provider, packs, base_version, version, owner_email, out):
     if target.exists():
         raise SystemExit(f'{provider}: {target} already exists; refusing to overwrite a pack')
     shutil.copytree(base, target, ignore=shutil.ignore_patterns('__pycache__'))
+    # The image runs the agent_hub library the suites test against: every
+    # agent_hub module the base pack carries is taken from this checkout.
+    # 2026-09-24 the live-20260924a packs kept the 22b copies and failed their
+    # own image tests (no UpstreamUnavailable in cloud_credential_broker).
+    hub = ROOT / 'agent-hub' / 'agent_hub'
+    for module in sorted((target / 'agent_hub').rglob('*.py')):
+        name = module.relative_to(target / 'agent_hub')
+        if (hub / name).is_file():
+            copy(hub / name, module)
     live = target / 'live'
     for name, source in live_files(provider).items():
         if not source.is_file():
