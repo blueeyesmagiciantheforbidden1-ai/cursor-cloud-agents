@@ -7,6 +7,7 @@ takeover, generic URL, ambient ADC, or retry of Secret Manager addVersion exists
 from __future__ import annotations
 
 import base64
+import contextvars
 from dataclasses import dataclass, field
 import hashlib
 import http.client
@@ -26,10 +27,14 @@ COLLECTION = 'runcrew_provider_credentials'
 MAX_CREDENTIAL_BYTES = 64 * 1024  # Secret Manager's actual per-version limit.
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_CONTROL_BYTES = 16 * 1024
-# Below the worker client's 15s exchange budget so a stalled upstream read is
-# answered before that client gives up.
+# Per-call cap, and the total for one broker HTTP request. Both sit under the
+# worker client's 15s exchange budget. The request budget is per thread, never
+# a process-wide clock: the broker serves concurrent requests.
 UPSTREAM_BUDGET_SECONDS = 8
+REQUEST_BUDGET_SECONDS = 12
+REQUEST_BUDGET_FLOOR_SECONDS = 1
 UPSTREAM_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
+_request_deadline = contextvars.ContextVar('runcrew_broker_upstream_deadline', default=None)
 _DIGEST = re.compile(r'[a-f0-9]{64}')
 _ID = re.compile(r'[a-f0-9]{32}')
 _STAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z')
@@ -58,6 +63,31 @@ class UpstreamUnavailable(BrokerError):
     and MutationUncertain (a lost mutation acknowledgement, which still uses
     strong-read recovery). A read that raises this can be retried.
     """
+
+
+def begin_upstream_request():
+    """Start this thread's 12s upstream budget. Returns a token for end_upstream_request."""
+    return _request_deadline.set(time.monotonic() + REQUEST_BUDGET_SECONDS)
+
+
+def end_upstream_request(token):
+    _request_deadline.reset(token)
+
+
+def upstream_call_budget():
+    """Seconds for the next upstream call. Outside a broker request, the per-call cap.
+
+    Inside a request the call draws down the 12s deadline: timeout is
+    min(8, remaining). Less than 1s remaining refuses the call instead of
+    starting one the worker client would abandon.
+    """
+    deadline = _request_deadline.get()
+    if deadline is None:
+        return UPSTREAM_BUDGET_SECONDS
+    remaining = deadline - time.monotonic()
+    if remaining < REQUEST_BUDGET_FLOOR_SECONDS:
+        raise UpstreamUnavailable('upstream_request_budget_exhausted')
+    return min(UPSTREAM_BUDGET_SECONDS, remaining)
 
 
 def _require(condition, code):
@@ -229,8 +259,9 @@ def _decode_fields(value):
 class GoogleREST:
     """Actual Google REST transport, without ADC discovery, proxies or redirects.
 
-    Each call's socket timeout and watchdog share UPSTREAM_BUDGET_SECONDS (8),
-    under the worker client's 15-second budget. Response bytes are bounded.
+    Each call's socket timeout and watchdog share upstream_call_budget(): 8s,
+    or less when this broker request's 12s deadline is running low. Response
+    bytes are bounded. The total stays under the worker client's 15s budget.
     The watchdog shuts down the socket, including a Connection: close response.
     Hostname resolution still uses the platform resolver. There
     are no automatic HTTP retries, especially on non-idempotent addVersion.
@@ -245,9 +276,10 @@ class GoogleREST:
         expired = threading.Event()
         timer = None
         active_socket = None
+        budget = upstream_call_budget()
         try:
             connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(
-                host, timeout=UPSTREAM_BUDGET_SECONDS)
+                host, timeout=budget)
             def stop():
                 expired.set()
                 sock = active_socket or connection.sock
@@ -257,7 +289,7 @@ class GoogleREST:
                     except OSError:
                         pass
                 connection.close()
-            timer = threading.Timer(UPSTREAM_BUDGET_SECONDS, stop)
+            timer = threading.Timer(budget, stop)
             timer.daemon = True
             timer.start()
             connection.request(method, path, body=body, headers=headers or {})
@@ -478,11 +510,35 @@ class CloudCredentialBroker:
         try:
             body = self._access(lease.version)
             self.assert_current(lease)
+        except UpstreamUnavailable:
+            # No bytes were returned and no native process can have started.
+            # Idle this exact lease so the controller can relaunch. Quarantine
+            # only when that abort cannot be confirmed, or the lease is no
+            # longer exactly the one just written.
+            if not self._release_unserved_lease(lease):
+                self._best_quarantine(lease, 'credential_read_failed')
+                raise BrokerError('credential_acquisition_unavailable') from None
+            raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
         except BrokerError:
             self._best_quarantine(lease, 'credential_read_failed')
             raise BrokerError('credential_acquisition_unavailable') from None
         return Lease(lease.profile, lease.account_ref, lease.canonical_account_ref, lease.fence,
                      lease.version, lease.lease_id, lease.execution, lease.execution_uid, body)
+
+    def _release_unserved_lease(self, lease):
+        """CAS the just-written lease back to a clean idle release. False if unconfirmed."""
+        try:
+            state, stamp = self._read()
+            self._owned(state, lease)
+            if state['phase'] != 'leased' or state['version'] != lease.version:
+                return False
+            self._write({**state, 'phase': 'idle', 'lease_until_ms': 0,
+                         'last_release_id': lease.lease_id,
+                         'last_release_fence': lease.fence,
+                         'last_release_version': lease.version}, stamp)
+        except (UpstreamUnavailable, MutationUncertain, BrokerError):
+            return False
+        return True
 
     def _owned(self, state, lease):
         _require(isinstance(lease, Lease) and lease.profile == self.config.profile

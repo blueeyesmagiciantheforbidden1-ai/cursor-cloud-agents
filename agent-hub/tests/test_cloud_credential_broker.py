@@ -208,6 +208,95 @@ class BrokerTests(unittest.TestCase):
             self.assertBlocked(call)
         self.assertEqual(self.wire.state['phase'], 'leased')
 
+    def _stall_rest(self, mode):
+        wire = self.wire
+
+        class Rest:
+            def __init__(self):
+                self.posts = 0
+                self.gets = 0
+
+            def request(self, method, host, path, value=None):
+                # access: stall the secret read. uncertain/fence/version stall that
+                # same read, then fail the idle abort (lost ack, fence, or version).
+                if (method == 'GET' and host == 'secretmanager.googleapis.com'
+                        and mode in ('access', 'uncertain', 'fence', 'version')):
+                    raise cb.UpstreamUnavailable('google_upstream_unavailable')
+                if host == 'firestore.googleapis.com' and method == 'GET':
+                    self.gets += 1
+                    if mode == 'assert' and self.gets == 2:
+                        raise cb.UpstreamUnavailable('google_upstream_unavailable')
+                if host == 'firestore.googleapis.com' and method == 'POST':
+                    self.posts += 1
+                    if mode == 'uncertain' and self.posts == 2:
+                        raise cb.MutationUncertain('injected_lost_ack')
+                    result = wire.request(method, host, path, value)
+                    if self.posts == 1 and mode == 'fence':
+                        wire.state['fence'] += 1
+                    if self.posts == 1 and mode == 'version':
+                        wire.state['version'] = wire.config.secret_name + '/versions/2'
+                    return result
+                return wire.request(method, host, path, value)
+
+        self.broker.rest = Rest()
+
+    def _assert_clean_release(self, request_id='1' * 32):
+        version = self.config.secret_name + '/versions/1'
+        state = self.wire.state
+        self.assertEqual(state['phase'], 'idle')
+        self.assertEqual(state['quarantine_reason'], '')
+        self.assertEqual(state['lease_until_ms'], 0)
+        self.assertEqual(state['last_release_id'], request_id)
+        self.assertEqual(state['last_release_fence'], 1)
+        self.assertEqual(state['last_release_version'], version)
+        self.assertEqual(state['version'], version)
+        self.assertEqual(state['fence'], 1)
+
+    def test_access_stall_after_lease_write_idles_without_quarantine(self):
+        self._stall_rest('access')
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$') as caught:
+            self.acquire()
+        self.assertNotIsInstance(caught.exception, cb.Conflict)
+        self._assert_clean_release()
+        with self.assertRaisesRegex(cb.BrokerError, '^execution_already_consumed$'):
+            self.acquire('2' * 32)
+        self.broker.rest = self.wire
+        self.wire.new_execution()
+        successor = self.acquire('2' * 32)
+        self.assertEqual(successor.fence, 2)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+
+    def test_assert_current_stall_after_lease_write_idles_without_quarantine(self):
+        self._stall_rest('assert')
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self._assert_clean_release()
+        self.assertEqual(self.wire.secret_reads, 1)
+
+    def test_uncertain_abort_after_access_stall_quarantines(self):
+        self._stall_rest('uncertain')
+        with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
+            self.acquire()
+        self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
+        self.assertEqual(self.wire.state['phase'], 'quarantined')
+        self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
+
+    def test_definitive_fence_or_version_loss_still_quarantines(self):
+        self._stall_rest('fence')
+        with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
+            self.acquire()
+        self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['last_release_id'], '')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.setUp()
+        self._stall_rest('version')
+        with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
+            self.acquire()
+        self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
+        self.assertEqual(self.wire.state['phase'], 'quarantined')
+        self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
+
     def test_acquire_lost_ack_resolved_by_strong_read_without_second_fence(self):
         self.wire.lose_phase_ack = 'leased'
         first = self.acquire()
@@ -509,6 +598,67 @@ class TransportTests(unittest.TestCase):
             self.assertNotIsInstance(caught.exception, cb.Conflict)
             self.assertNotIsInstance(caught.exception, cb.MutationUncertain)
         self.assertEqual(response.limit, cb.MAX_RESPONSE_BYTES + 1)
+
+    def test_request_budget_is_per_thread_and_refuses_under_one_second(self):
+        self.assertEqual(cb.REQUEST_BUDGET_SECONDS, 12)
+        self.assertEqual(cb.REQUEST_BUDGET_FLOOR_SECONDS, 1)
+        self.assertLess(cb.REQUEST_BUDGET_SECONDS, 15)
+        self.assertGreater(cb.REQUEST_BUDGET_SECONDS, cb.UPSTREAM_BUDGET_SECONDS)
+        created = []
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                created.append(timeout)
+
+            def request(self, *args, **kwargs):
+                raise AssertionError('refused call must not connect')
+
+            def close(self):
+                pass
+
+        token = cb.begin_upstream_request()
+        try:
+            self.assertEqual(cb.upstream_call_budget(), 8)
+            cb._request_deadline.set(time.monotonic() + 0.2)
+            with patch.object(cb.http.client, 'HTTPSConnection', Connection):
+                with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
+                    self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+            self.assertEqual(created, [])
+        finally:
+            cb.end_upstream_request(token)
+        self.assertEqual(cb.upstream_call_budget(), 8)
+        seen = {}
+        barrier = threading.Barrier(2)
+
+        def blocked():
+            token = cb.begin_upstream_request()
+            cb._request_deadline.set(time.monotonic() + 0.05)
+            barrier.wait(timeout=2)
+            try:
+                cb.upstream_call_budget()
+                seen['blocked'] = 'allowed'
+            except cb.UpstreamUnavailable:
+                seen['blocked'] = 'refused'
+            finally:
+                cb.end_upstream_request(token)
+
+        def open_request():
+            token = cb.begin_upstream_request()
+            barrier.wait(timeout=2)
+            try:
+                seen['open'] = cb.upstream_call_budget()
+            finally:
+                cb.end_upstream_request(token)
+
+        threads = [threading.Thread(target=blocked), threading.Thread(target=open_request)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(seen, {'blocked': 'refused', 'open': 8})
 
     def _connection(self, status, body, *, fail=None):
         class Response:

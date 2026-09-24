@@ -107,6 +107,10 @@ def exchange(host, path, *, method='GET', body=None, headers=None, metadata=Fals
     so a platform DNS stall is not strictly bounded by the socket watchdog.
     """
     require(not metadata or host == 'metadata.google.internal', 'endpoint_invalid')
+    # A broker request draws every upstream call down from one 12s deadline.
+    # The worker client never sets that deadline, so its own 15s cap is unchanged.
+    if backend._request_deadline.get() is not None:
+        timeout_seconds = backend.upstream_call_budget()
     require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 15,
             'transport_limit')
     connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(host, timeout=min(10, timeout_seconds))
@@ -512,6 +516,7 @@ def handler_for(service):
 
         def do_POST(self):
             started = time.monotonic()
+            budget = backend.begin_upstream_request()
             action, status, code = 'unknown', 500, 'broker_unavailable'
             try:
                 require(self.path.startswith(PREFIX) and self.path[len(PREFIX):] in ACTIONS)
@@ -539,6 +544,7 @@ def handler_for(service):
                 except (OSError, ValueError):
                     pass
             finally:
+                backend.end_upstream_request(budget)
                 log_broker_request(action, status, code, started)
 
         def do_GET(self):

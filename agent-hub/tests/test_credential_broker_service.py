@@ -480,6 +480,200 @@ class ServiceTests(unittest.TestCase):
             self.assertIs(type(line['duration_ms']), int)
             self.assertGreaterEqual(line['duration_ms'], 0)
 
+    def _serve(self):
+        server = service.BrokerServer(('127.0.0.1', 0), self.service)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def _stop(self, server, thread):
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+
+    def _post(self, server, action, body, timeout=3):
+        connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=timeout)
+        try:
+            connection.request('POST', service.PREFIX + action, body=json.dumps(body).encode(), headers={
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer synthetic.jwt.signature',
+                'X-RunCrew-Execution-Grant': GRANT,
+            })
+            response = connection.getresponse()
+            return response.status, response.getheader('Retry-After'), response.read()
+        finally:
+            connection.close()
+
+    def _stall_rest(self, mode):
+        wire = self.wire
+
+        class Rest:
+            def __init__(self):
+                self.gets = 0
+
+            def request(self, method, host, path, value=None):
+                if method == 'GET' and host == 'secretmanager.googleapis.com' and mode == 'access':
+                    raise backend.UpstreamUnavailable('google_upstream_unavailable')
+                if host == 'firestore.googleapis.com' and method == 'GET':
+                    self.gets += 1
+                    if mode == 'assert' and self.gets == 2:
+                        raise backend.UpstreamUnavailable('google_upstream_unavailable')
+                return wire.request(method, host, path, value)
+
+        self.broker.rest = Rest()
+
+    def _assert_clean_release(self):
+        version = self.profile.secret_name + '/versions/1'
+        state = self.wire.state
+        self.assertEqual(state['phase'], 'idle')
+        self.assertEqual(state['quarantine_reason'], '')
+        self.assertEqual(state['lease_until_ms'], 0)
+        self.assertEqual(state['last_release_id'], '1' * 32)
+        self.assertEqual(state['last_release_fence'], 1)
+        self.assertEqual(state['last_release_version'], version)
+        self.assertEqual(state['version'], version)
+        self.assertEqual(state['fence'], 1)
+
+    def test_post_lease_stall_answers_503_and_idles_the_lease(self):
+        server, thread = self._serve()
+        try:
+            self._stall_rest('access')
+            status, retry, raw = self._post(server, 'acquire', {'request_id': '1' * 32})
+            self.assertEqual((status, retry), (503, '2'))
+            self.assertEqual(json.loads(raw), {'error': 'broker_upstream_unavailable'})
+            self.assertNotIn(b'credential_b64', raw)
+            self.assertNotIn(b'opaque', raw)
+            self._assert_clean_release()
+            self.assertEqual(self.wire.secret_reads, 0)
+            self.wire.state = backend.initial_control_state(
+                self.profile, self.profile.secret_name + '/versions/1', 'c' * 64)
+            self.wire.revision = 1
+            self._stall_rest('assert')
+            status, retry, raw = self._post(server, 'acquire', {'request_id': '1' * 32})
+            self.assertEqual((status, retry), (503, '2'))
+            self.assertEqual(json.loads(raw), {'error': 'broker_upstream_unavailable'})
+            self.assertNotIn(b'credential_b64', raw)
+            self._assert_clean_release()
+            self.assertEqual(self.wire.secret_reads, 1)
+        finally:
+            self._stop(server, thread)
+
+    def test_request_budget_stops_five_second_calls_with_503(self):
+        timeouts = []
+        completed = []
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                timeouts.append(timeout)
+                self.closed = threading.Event()
+
+            def request(self, *args, **kwargs):
+                if self.closed.wait(5):
+                    raise TimeoutError('stalled')
+
+            def getresponse(self):
+                completed.append(timeouts[-1])
+
+                class Response:
+                    status = 200
+
+                    def read(self, limit):
+                        return b'{}'
+
+                    def getheader(self, name):
+                        return None
+
+                return Response()
+
+            def close(self):
+                self.closed.set()
+
+        rest = backend.GoogleREST(self.profile)
+
+        def read():
+            for _ in range(4):
+                rest._exchange('firestore.googleapis.com', '/v1/documents/stacked', 'GET')
+            return self.active
+
+        self.grant_store.read = read
+        server, thread = self._serve()
+        started = time.monotonic()
+        try:
+            with patch.object(backend.http.client, 'HTTPSConnection', Connection):
+                status, retry, raw = self._post(server, 'bootstrap', {}, timeout=20)
+            elapsed = time.monotonic() - started
+        finally:
+            self._stop(server, thread)
+        self.assertEqual((status, retry), (503, '2'))
+        self.assertEqual(json.loads(raw), {'error': 'broker_upstream_unavailable'})
+        self.assertGreaterEqual(elapsed, 10)
+        self.assertLess(elapsed, 15)
+        self.assertEqual(timeouts[0], 8)
+        self.assertTrue(all(item <= 8 for item in timeouts))
+        self.assertLess(len(timeouts), 4)
+        self.assertLessEqual(len(completed), 2)
+        self.assertTrue(any(item < 8 for item in timeouts))
+
+    def test_fast_upstream_call_keeps_the_eight_second_cap(self):
+        timeouts = []
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                timeouts.append(timeout)
+
+            def request(self, *args, **kwargs):
+                return None
+
+            def getresponse(self):
+                class Response:
+                    status = 200
+
+                    def read(self, limit):
+                        return b'{}'
+
+                    def getheader(self, name):
+                        return None
+
+                return Response()
+
+            def close(self):
+                return None
+
+        rest = backend.GoogleREST(self.profile)
+
+        def read():
+            rest._exchange('firestore.googleapis.com', '/v1/documents/fast', 'GET')
+            return self.active
+
+        self.grant_store.read = read
+        server, thread = self._serve()
+        started = time.monotonic()
+        try:
+            with patch.object(backend.http.client, 'HTTPSConnection', Connection):
+                status, _, raw = self._post(server, 'bootstrap', {})
+            elapsed = time.monotonic() - started
+        finally:
+            self._stop(server, thread)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)['ready'], True)
+        self.assertLess(elapsed, 2)
+        self.assertEqual(timeouts, [8])
+        self.assertIsNone(backend._request_deadline.get())
+        token = backend.begin_upstream_request()
+        try:
+            backend._request_deadline.set(time.monotonic() + 0.2)
+            with patch.object(service.http.client, 'HTTPSConnection') as connection:
+                with self.assertRaisesRegex(backend.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
+                    service.exchange('firestore.googleapis.com', '/v1/documents/floor')
+                connection.assert_not_called()
+        finally:
+            backend.end_upstream_request(token)
+        self.assertEqual(service.exchange.__kwdefaults__['timeout_seconds'], 15)
+
 
 class SignedIdentityTests(unittest.TestCase):
     @classmethod
