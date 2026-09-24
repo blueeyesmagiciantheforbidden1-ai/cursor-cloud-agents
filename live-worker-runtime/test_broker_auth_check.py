@@ -51,14 +51,35 @@ class BrokerAuthCheckTests(unittest.TestCase):
         with patch.object(broker_auth_check, 'TOKEN', tampered):
             self._assert_fixed(broker_auth_check.check)
 
-    def test_wrong_key_fails_with_fixed_code(self):
-        from cryptography.hazmat.primitives.asymmetric import rsa
+    def test_wrong_audience_fails_with_fixed_code(self):
+        with patch.object(broker_auth_check, 'AUDIENCE', 'https://other.invalid/broker'):
+            self._assert_fixed(broker_auth_check.check)
+
+    def test_wrong_issuer_fails_with_fixed_code(self):
         from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from google.auth import jwt
+        from google.auth.crypt import RSASigner
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        certificate = _self_signed_certificate(key)
+        signer = RSASigner.from_string(key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()).decode(), key_id='k')
+        token = jwt.encode(signer, {
+            'aud': broker_auth_check.AUDIENCE, 'iss': 'https://attacker.invalid',
+            'iat': broker_auth_check.ISSUED, 'exp': broker_auth_check.EXPIRES,
+            'probe': broker_auth_check.CLAIM_VALUE}).decode()
+        del key, signer
+        with patch.object(broker_auth_check, 'CERT_PEM', certificate), patch.object(
+                broker_auth_check, 'TOKEN', token):
+            self._assert_fixed(broker_auth_check.check)
+
+    def test_certificate_for_another_key_fails_with_fixed_code(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
         other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        public = other.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        certificate = _self_signed_certificate(other)
         del other
-        with patch.object(broker_auth_check, 'PUBLIC_KEY_PEM', public):
+        with patch.object(broker_auth_check, 'CERT_PEM', certificate):
             self._assert_fixed(broker_auth_check.check)
 
     def test_blocked_google_import_fails_with_fixed_code(self):
@@ -158,7 +179,7 @@ class BrokerAuthCheckTests(unittest.TestCase):
         self.assertIn('serve.py --check\n', fleet)
         source = (ROOT / 'live-worker-runtime' / 'broker_auth_check.py').read_text(encoding='utf-8')
         self.assertNotIn('PRIVATE KEY', source)
-        self.assertIn('BEGIN PUBLIC KEY', source)
+        self.assertIn('BEGIN CERTIFICATE', source)
 
     def _assert_fixed(self, call):
         with self.assertRaises(broker_auth_check.BrokerAuthLibraryUnavailable) as caught:
@@ -171,6 +192,21 @@ class BrokerAuthCheckTests(unittest.TestCase):
         self.assertNotIn('google', str(error).lower())
         self.assertNotIn('Malformed', str(error))
         self.assertNotIn('Token', str(error))
+
+
+def _self_signed_certificate(key):
+    from datetime import datetime, timezone
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import NameOID
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'other-key')])
+    certificate = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name)
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(datetime(2023, 1, 1, tzinfo=timezone.utc))
+        .not_valid_after(datetime(2100, 1, 1, tzinfo=timezone.utc))
+        .sign(key, hashes.SHA256()))
+    return certificate.public_bytes(serialization.Encoding.PEM).decode()
 
 
 def _from_line(text):
