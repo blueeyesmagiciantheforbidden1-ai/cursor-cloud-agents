@@ -10,9 +10,10 @@ no library text.
 
 Production verification is google.oauth2.id_token.verify_oauth2_token. That
 loads a {kid: x509 certificate} map through the request callable
-GoogleIDAuthenticator passes, then checks the issuer. The certificate below
-is self-signed and public. The private key was used once to sign TOKEN and
-was not written into this tree.
+GoogleIDAuthenticator passes, then checks the issuer. The request stub mirrors
+production's URL/method/body gate. The certificate below is self-signed and
+public. The private key was used once to sign TOKEN and was not written into
+this tree.
 """
 from __future__ import annotations
 
@@ -24,6 +25,8 @@ AUDIENCE = 'https://runcrew.invalid/broker-auth-probe'
 ISSUER = 'https://accounts.google.com'
 CLAIM_NAME = 'probe'
 CLAIM_VALUE = 'broker_auth_ok'
+# Must equal credential_broker_service.GOOGLE_CERTS_URL (pinned by a test).
+CERTS_URL = 'https://www.googleapis.com/oauth2/v1/certs'
 # 2100-01-01T00:00:00Z. iat is 2023-11-14T22:13:20Z.
 ISSUED = 1700000000
 EXPIRES = 4102444800
@@ -73,7 +76,9 @@ def _verify():
     if not callable(getattr(id_token, 'verify_oauth2_token', None)):
         raise BrokerAuthLibraryUnavailable()
 
-    def stub(url, method='GET', **kwargs):
+    def stub(url, method='GET', body=None, headers=None, **kwargs):
+        if not (url == CERTS_URL and method == 'GET' and body is None):
+            raise BrokerAuthLibraryUnavailable()
         return SimpleNamespace(status=200, data=json.dumps({'k': CERT_PEM}).encode())
 
     claims = id_token.verify_oauth2_token(TOKEN, stub, audience=AUDIENCE)

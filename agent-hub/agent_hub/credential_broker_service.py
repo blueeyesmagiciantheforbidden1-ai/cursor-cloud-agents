@@ -41,6 +41,7 @@ ACTIONS = frozenset(('bootstrap', 'acquire', 'assert-current', 'renew', 'commit'
 # ID-token certificate fetch only. Transport, timeout and these 5xx statuses
 # become UpstreamUnavailable. A 429 or a rejected token stays authentication_required.
 CERTIFICATE_UPSTREAM_STATUSES = frozenset((500, 502, 503, 504))
+GOOGLE_CERTS_URL = 'https://www.googleapis.com/oauth2/v1/certs'
 SHA = re.compile(r'[a-f0-9]{64}')
 UID = re.compile(r'(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})')
 ID = re.compile(r'[a-f0-9]{32}')
@@ -167,7 +168,7 @@ class GoogleIDAuthenticator:
         self._lock = threading.Lock()
 
     def _certificate_request(self, url, method='GET', body=None, headers=None, **kwargs):
-        require(url == 'https://www.googleapis.com/oauth2/v1/certs' and method == 'GET' and body is None,
+        require(url == GOOGLE_CERTS_URL and method == 'GET' and body is None,
                 'authentication_required')
         with self._lock:
             if self._certificates is None or self.clock() >= self._certificates_until:

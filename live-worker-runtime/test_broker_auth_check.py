@@ -44,6 +44,21 @@ class BrokerAuthCheckTests(unittest.TestCase):
     def test_check_passes_with_google_auth_installed(self):
         broker_auth_check.check()
 
+    def test_certs_url_matches_production(self):
+        try:
+            from agent_hub import credential_broker_service
+        except ImportError:
+            self.skipTest('agent_hub not importable')
+        self.assertEqual(
+            broker_auth_check.CERTS_URL, credential_broker_service.GOOGLE_CERTS_URL)
+
+    def test_library_certs_url_drift_fails_closed(self):
+        import google.oauth2.id_token as id_token
+        with patch.object(
+                id_token, '_GOOGLE_OAUTH2_CERTS_URL',
+                'https://www.googleapis.com/oauth2/v3/certs'):
+            self._assert_fixed(broker_auth_check.check)
+
     def test_tampered_token_fails_with_fixed_code(self):
         signature = broker_auth_check.TOKEN.rsplit('.', 1)[1]
         flipped = ('A' if signature[:1] != 'A' else 'B') + signature[1:]
