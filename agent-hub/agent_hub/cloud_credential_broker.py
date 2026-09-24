@@ -512,6 +512,10 @@ class CloudCredentialBroker:
         observed = self._execution_status(execution)
         _require(not observed.get('completionTime') and not observed.get('deleteTime'), 'execution_already_terminal')
         state, stamp = self._read()
+        # Abort applies only to a lease this call just wrote. An idempotent
+        # re-entry already returned credential bytes to a caller; idling it
+        # would strand that caller.
+        fresh = False
         if (state['phase'] == 'leased' and state['lease_id'] == request_id
                 and state['execution'] == execution and state['execution_uid'] == observed['uid']):
             _require(state['lease_until_ms'] > self._now(), 'lease_expired_reconciliation_required')
@@ -530,6 +534,7 @@ class CloudCredentialBroker:
                      'lease_until_ms': self._now() + self.lease_seconds * 1000,
                      'intent_id': '', 'intent_digest': '', 'commit_version': '', 'quarantine_reason': ''}
             self._write(state, stamp)
+            fresh = True
         lease = Lease(self.config.profile, self.config.account_ref, self.config.canonical_account_ref,
                       state['fence'], state['version'], request_id, execution, observed['uid'], b'')
         # _access and assert_current run after the lease write. Keep the
@@ -543,7 +548,10 @@ class CloudCredentialBroker:
                 # No bytes were returned and no native process can have started.
                 # Idle this exact lease so the controller can relaunch. Quarantine
                 # only when that abort cannot be confirmed, or the lease is no
-                # longer exactly the one just written.
+                # longer exactly the one just written. A lease this call did not
+                # write already served its bytes; leave it leased.
+                if not fresh:
+                    raise
                 if not self._release_unserved_lease(lease):
                     self._best_quarantine(lease, 'credential_read_failed')
                     raise BrokerError('credential_acquisition_unavailable') from None

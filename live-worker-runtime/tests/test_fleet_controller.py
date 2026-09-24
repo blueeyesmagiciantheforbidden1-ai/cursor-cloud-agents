@@ -777,6 +777,179 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
         self.assertEqual(cloud.run_count, 2)
 
+    def _broker_for(self, execution_name, execution_uid):
+        import importlib.util
+        from agent_hub.cloud_credential_broker import CloudCredentialBroker
+        # live-worker-runtime/tests shadows agent-hub/tests on sys.path.
+        path = ROOT.parent / 'agent-hub' / 'tests' / 'test_cloud_credential_broker.py'
+        spec = importlib.util.spec_from_file_location('credential_broker_google_wire', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        wire = module.GoogleWire(POLICY.profile)
+        wire.execution = {'name': execution_name, 'uid': execution_uid, 'taskCount': 1,
+                          'runningCount': 1, 'reconciling': False}
+        broker = CloudCredentialBroker(POLICY.profile, rest=wire, clock=lambda: 1000, lease_seconds=30)
+        return broker, wire
+
+    def _stall(self, wire, mode):
+        from agent_hub.cloud_credential_broker import MutationUncertain, UpstreamUnavailable
+
+        class Rest:
+            def __init__(self):
+                self.posts = 0
+                self.gets = 0
+
+            def request(self, method, host, path, value=None):
+                if method == 'GET' and host == 'secretmanager.googleapis.com' and mode in ('access', 'uncertain'):
+                    raise UpstreamUnavailable('google_upstream_unavailable')
+                if host == 'firestore.googleapis.com' and method == 'GET':
+                    self.gets += 1
+                    if mode == 'assert' and self.gets == 2:
+                        raise UpstreamUnavailable('google_upstream_unavailable')
+                if host == 'firestore.googleapis.com' and method == 'POST':
+                    self.posts += 1
+                    if mode == 'uncertain' and self.posts == 2:
+                        raise MutationUncertain('injected_lost_ack')
+                return wire.request(method, host, path, value)
+
+        return Rest()
+
+    def test_acquire_post_write_abort_is_a_clean_release_for_a_failed_execution(self):
+        """The document an unserved acquire abort writes is a clean release.
+
+        Controller.idle_credential and current_terminal accept it, and a tick
+        of that failed terminal execution takes one strike with backoff.
+        """
+        from agent_hub.cloud_credential_broker import BrokerError, MutationUncertain, UpstreamUnavailable
+        broker, wire = self._broker_for(NEXT, NEXT_UID)
+        aborts = []
+        release = broker._release_unserved_lease
+
+        def spy(lease):
+            aborts.append(lease.lease_id)
+            return release(lease)
+
+        broker._release_unserved_lease = spy
+        broker.rest = self._stall(wire, 'access')
+        with self.assertRaisesRegex(UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            broker.acquire(NEXT, '1' * 32)
+        self.assertEqual(aborts, ['1' * 32])
+        document = deepcopy(wire.state)
+        version = POLICY.profile.secret_name + '/versions/1'
+        self.assertEqual(document['phase'], 'idle')
+        self.assertEqual(document['quarantine_reason'], '')
+        self.assertEqual(document['version'], document['last_release_version'])
+        self.assertEqual(document['last_release_version'], version)
+        self.assertEqual(document['fence'], document['last_release_fence'])
+        self.assertEqual(document['fence'], 1)
+        self.assertEqual(document['execution_uid'], NEXT_UID)
+        self.assertEqual(document['execution'], NEXT)
+        self.assertEqual(document['lease_until_ms'], 0)
+        self.assertEqual(document['last_release_id'], '1' * 32)
+
+        controller, store, cloud, fleet_broker, _, _ = self.make()
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(store.state['phase'], 'active')
+        self.assertEqual(store.state['execution_uid'], NEXT_UID)
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        fleet_broker.state = document
+        execution = cloud.executions_by_name[NEXT]
+        released = controller.idle_credential(execution)
+        self.assertEqual(released['phase'], 'idle')
+        self.assertEqual(released['quarantine_reason'], '')
+        self.assertEqual(released['version'], released['last_release_version'])
+        self.assertEqual(released['fence'], released['last_release_fence'])
+        self.assertEqual(released['execution_uid'], NEXT_UID)
+        self.assertEqual(controller.current_terminal(cloud.job, store.state)['uid'], NEXT_UID)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'replacement_after_failure')
+        self.assertEqual(result['consecutive_failures'], 1)
+        self.assertEqual(result['next_launch_at'], 1000 + 120)
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertEqual(store.state['next_launch_at'], 1000 + 120)
+        self.assertNotEqual(store.state.get('error'), 'worker_failed_credential_unreleased')
+        self.assertNotIn('error', store.state)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        self.assertEqual(cloud.run_count, 1)
+        controller.clock = lambda: 1200
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+        # assert_current is still pending: the secret was read, but acquire has
+        # not returned bytes, so the same abort runs.
+        broker, wire = self._broker_for(NEXT, NEXT_UID)
+        broker.rest = self._stall(wire, 'assert')
+        with self.assertRaisesRegex(UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            broker.acquire(NEXT, '2' * 32)
+        self.assertEqual(wire.state['phase'], 'idle')
+        self.assertEqual(wire.state['execution_uid'], NEXT_UID)
+        self.assertEqual(wire.state['last_release_version'], wire.state['version'])
+        self.assertEqual(wire.secret_reads, 1)
+
+        # Bytes already returned. A later stall, including a repeat acquire of
+        # this lease, must not idle it.
+        broker, wire = self._broker_for(NEXT, NEXT_UID)
+        aborts.clear()
+        release = broker._release_unserved_lease
+
+        def spy(lease):
+            aborts.append(lease.lease_id)
+            return release(lease)
+
+        broker._release_unserved_lease = spy
+        served = broker.acquire(NEXT, '3' * 32)
+        self.assertEqual(served.auth_bytes, b'opaque-first-credential')
+        self.assertEqual(aborts, [])
+        self.assertEqual(wire.state['phase'], 'leased')
+        original = wire.request
+
+        def later(method, host, path, value=None):
+            if method == 'GET' and host == 'firestore.googleapis.com':
+                raise UpstreamUnavailable('google_upstream_unavailable')
+            return original(method, host, path, value)
+
+        broker.rest.request = later
+        with self.assertRaisesRegex(UpstreamUnavailable, '^google_upstream_unavailable$'):
+            broker.assert_current(served)
+        self.assertEqual(aborts, [])
+        self.assertEqual(wire.state['phase'], 'leased')
+        self.assertEqual(wire.state['last_release_id'], '')
+        wire.request = original
+        broker.rest = self._stall(wire, 'access')
+        with self.assertRaisesRegex(UpstreamUnavailable, '^google_upstream_unavailable$') as caught:
+            broker.acquire(NEXT, '3' * 32)
+        self.assertNotEqual(str(caught.exception), 'credential_acquisition_upstream_unavailable')
+        self.assertEqual(aborts, [])
+        self.assertEqual(wire.state['phase'], 'leased')
+        self.assertEqual(wire.state['lease_id'], '3' * 32)
+        broker.rest = wire
+        again = broker.acquire(NEXT, '3' * 32)
+        self.assertEqual(again.auth_bytes, served.auth_bytes)
+        self.assertEqual(again.fence, served.fence)
+        self.assertEqual(wire.state['phase'], 'leased')
+
+        # An uncertain abort write falls back to quarantine, which idle_credential rejects.
+        broker, wire = self._broker_for(NEXT, NEXT_UID)
+        broker.rest = self._stall(wire, 'uncertain')
+        with self.assertRaisesRegex(BrokerError, '^credential_acquisition_unavailable$') as caught:
+            broker.acquire(NEXT, '4' * 32)
+        self.assertNotIsInstance(caught.exception, UpstreamUnavailable)
+        self.assertNotIsInstance(caught.exception, MutationUncertain)
+        self.assertEqual(wire.state['phase'], 'quarantined')
+        self.assertEqual(wire.state['quarantine_reason'], 'credential_read_failed')
+        controller, store, cloud, fleet_broker, _, _ = self.make()
+        controller.tick()
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, failedCount=1, succeededCount=0)
+        fleet_broker.state = deepcopy(wire.state)
+        with self.assertRaisesRegex(ControllerError, '^credential_not_cleanly_released$'):
+            controller.idle_credential(cloud.executions_by_name[NEXT])
+        blocked = controller.tick()
+        self.assertEqual(blocked['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(cloud.run_count, 1)
+
 
 class CloudTaskNameTests(unittest.TestCase):
     def test_name_pattern_allows_tasks_and_refuses_anything_wider(self):
