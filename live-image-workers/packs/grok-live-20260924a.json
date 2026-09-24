@@ -1,0 +1,147 @@
+{
+ "pack": "live-image-grok-live-20260924a-source",
+ "tree_sha256": null,
+ "files": [
+  {
+   "path": ".dockerignore",
+   "sha256": "14028132800c714bb124eeb6e543172676686c1991c2be5b5b6f514424841c85",
+   "inline_b64": "LmdpdApfX3B5Y2FjaGVfXwoqLnB5Ywo="
+  },
+  {
+   "path": ".gcloudignore",
+   "sha256": "14028132800c714bb124eeb6e543172676686c1991c2be5b5b6f514424841c85",
+   "inline_b64": "LmdpdApfX3B5Y2FjaGVfXwoqLnB5Ywo="
+  },
+  {
+   "path": "agent_hub/__init__.py",
+   "sha256": "5ec682a4ae99d3326888367b8f3cd707625594d31abde198903f7c2834c3097b",
+   "git": "18e556a:agent-hub/agent_hub/__init__.py"
+  },
+  {
+   "path": "agent_hub/adapters.py",
+   "sha256": "864cff4a922154f3201b6895cb878721042107e39527916449782f0252b44c98",
+   "git": "18e556a:agent-hub/agent_hub/adapters.py"
+  },
+  {
+   "path": "agent_hub/billing_policy.py",
+   "sha256": "f29b62865ad8b388ff494720a3bb44da04b8806c0d12e966070589142cbc397d",
+   "git": "18e556a:agent-hub/agent_hub/billing_policy.py"
+  },
+  {
+   "path": "agent_hub/claude_runtime.py",
+   "sha256": "7d1171f029b824f5785c85988e26d399e7768fbc374633c3448a64d571ebe21f",
+   "git": "18e556a:agent-hub/agent_hub/claude_runtime.py"
+  },
+  {
+   "path": "agent_hub/cloud_credential_broker.py",
+   "sha256": "31a6af3e26da6d9aed8e9b7d1c62d948e9e7c7d79adc071bfb05ff69e22150a5",
+   "git": "18e556a:agent-hub/agent_hub/cloud_credential_broker.py"
+  },
+  {
+   "path": "agent_hub/core.py",
+   "sha256": "13ff890e3acc422513ae0548d826d383fe9ef496ff876d990c3c951c9fc372e6",
+   "git": "18e556a:agent-hub/agent_hub/core.py"
+  },
+  {
+   "path": "agent_hub/credential_broker_service.py",
+   "sha256": "d382c7de37d4e4292b7bc812cfefdcfe5f925ec178474595c70a171623306e06",
+   "git": "18e556a:agent-hub/agent_hub/credential_broker_service.py"
+  },
+  {
+   "path": "agent_hub/learning.py",
+   "sha256": "f629a6055e8ce0c96f29ecd4ba80f897b6d8dda5c216419cbbc144769a19f17f",
+   "git": "18e556a:agent-hub/agent_hub/learning.py"
+  },
+  {
+   "path": "agent_hub/model_policy.py",
+   "sha256": "1aaae94b6c9832b734816807d7a5f1992d930506566a85ffe85a63ae0e51235c",
+   "git": "18e556a:agent-hub/agent_hub/model_policy.py"
+  },
+  {
+   "path": "agent_hub/model_runtime.py",
+   "sha256": "77d11f2a672f1f32f2a2db33a20fe2de083e917c29934346ae01b15d62cc4fa0",
+   "git": "18e556a:agent-hub/agent_hub/model_runtime.py"
+  },
+  {
+   "path": "agent_hub/subscription_auth.py",
+   "sha256": "1afbfc062488b3748e3c48af2704ea7fa474ed2a1ea27c2878ad81fd7dd9fd00",
+   "git": "18e556a:agent-hub/agent_hub/subscription_auth.py"
+  },
+  {
+   "path": "agent_hub/worker.py",
+   "sha256": "c5991466e14244db3d3152f50ffec1d54741449aac600a6d8d48d2e7bfb9c482",
+   "git": "18e556a:agent-hub/agent_hub/worker.py"
+  },
+  {
+   "path": "cloudbuild.json",
+   "sha256": "038ff5428497886b65cf2cb8c27a9ac8cf266693a2882237b8a8c6914b419834",
+   "inline_b64": "eyJpbWFnZXMiOlsidXMtY2VudHJhbDEtZG9ja2VyLnBrZy5kZXYvcHJvamVjdC0wYzZkMzFmYS01MDllLTQxMTYtYTJjL3J1bmNyZXctaHViL2dyb2std29ya2VyOmxpdmUtMjAyNjA5MjRhIl0sIm9wdGlvbnMiOnsibG9nZ2luZyI6IkNMT1VEX0xPR0dJTkdfT05MWSJ9LCJzdGVwcyI6W3siYXJncyI6WyJidWlsZCIsIi0tcGxhdGZvcm09bGludXgvYW1kNjQiLCItdCIsInVzLWNlbnRyYWwxLWRvY2tlci5wa2cuZGV2L3Byb2plY3QtMGM2ZDMxZmEtNTA5ZS00MTE2LWEyYy9ydW5jcmV3LWh1Yi9ncm9rLXdvcmtlcjpsaXZlLTIwMjYwOTI0YSIsIi4iXSwibmFtZSI6Imdjci5pby9jbG91ZC1idWlsZGVycy9kb2NrZXIiLCJ0aW1lb3V0IjoiNjAwcyJ9XSwidGltZW91dCI6IjcyMHMifQo="
+  },
+  {
+   "path": "Dockerfile",
+   "sha256": "333d6f0b4dfb12e5f7b8403888a51dd969a7df6d5e0cdfc2e75b82e781f01ccb",
+   "inline_b64": "IyBMaXZlIGdyb2sgd29ya2VyOiB2ZXJpZmllZCBiYXNlICsgcmVhZC1vbmx5IGxpdmUgcnVudGltZS4gTm8gY3JlZGVudGlhbCBpcyBhIGJ1aWxkIGlucHV0LgpGUk9NIHVzLWNlbnRyYWwxLWRvY2tlci5wa2cuZGV2L3Byb2plY3QtMGM2ZDMxZmEtNTA5ZS00MTE2LWEyYy9ydW5jcmV3LWh1Yi9ncm9rLXdvcmtlckBzaGEyNTY6NWM4NzQ4NzJmZmNkZWQ0OTYzNmM1ZTAyNjFjYWQ0NzYxNmFjYTg1NTEwZDZhM2M3ZDM3ZWY0NTJkNmQ2NjVlZApVU0VSIDA6MApDT1BZIC0tY2hvd249MDowIGFnZW50X2h1Yi8gL29wdC9ydW5jcmV3L2FwcC9hZ2VudF9odWIvCkNPUFkgLS1jaG93bj0wOjAgbGl2ZS8gL29wdC9ydW5jcmV3L2FwcC8KUlVOIGNobW9kIC1SIGEtdyAvb3B0L3J1bmNyZXcvYXBwICYmIGZpbmQgL29wdC9ydW5jcmV3L2FwcCAtbmFtZSBfX3B5Y2FjaGVfXyAtcHJ1bmUgLWV4ZWMgcm0gLXJmIHt9ICsKRU5WIFBZVEhPTkRPTlRXUklURUJZVEVDT0RFPTEgUFlUSE9OVU5CVUZGRVJFRD0xIFJVTkNSRVdfTElWRV9QUk9WSURFUj1ncm9rCldPUktESVIgL29wdC9ydW5jcmV3L2FwcApVU0VSIDEwMDAxOjEwMDAxClJVTiBweXRob24gLUkgLUIgLW0gdW5pdHRlc3QgZGlzY292ZXIgLXMgL29wdC9ydW5jcmV3L2FwcC90ZXN0cyAtdCAvb3B0L3J1bmNyZXcvYXBwIC1wICJ0ZXN0X2dyb2sucHkiIC1xClJVTiBweXRob24gLUkgLUIgLW0gdW5pdHRlc3QgZGlzY292ZXIgLXMgL29wdC9ydW5jcmV3L2FwcCAtdCAvb3B0L3J1bmNyZXcvYXBwIC1wICJ0ZXN0X2xpdmVfbG9vcC5weSIgLXEKUlVOIHB5dGhvbiAtSSAtQiAtbSB1bml0dGVzdCBkaXNjb3ZlciAtcyAvb3B0L3J1bmNyZXcvYXBwIC10IC9vcHQvcnVuY3Jldy9hcHAgLXAgInRlc3RfZHluYW1pY19icm9rZXIucHkiIC1xClJVTiBweXRob24gLUkgLUIgL29wdC9ydW5jcmV3L2FwcC9lbnRyeXBvaW50LnB5IC0tY2hlY2sKRU5UUllQT0lOVCBbInB5dGhvbiIsIi1JIiwiLUIiLCIvb3B0L3J1bmNyZXcvYXBwL2VudHJ5cG9pbnQucHkiXQo="
+  },
+  {
+   "path": "live/broker_renew.py",
+   "sha256": "1196635bf943d5b000bff43f75b57498a41c07210e3f2b800ec7f2d343540cdb",
+   "git": "18e556a:live-worker-runtime/broker_renew.py"
+  },
+  {
+   "path": "live/dynamic_broker.py",
+   "sha256": "40179b30f389fcb194e0ac09b636075323b5d6b4a8ed5c382bb2c2bc63d074a1",
+   "git": "18e556a:live-worker-runtime/dynamic_broker.py"
+  },
+  {
+   "path": "live/entrypoint.py",
+   "sha256": "c413798324a83fceb353ac5ea47198f8d86f70c8c80ad016cfeba14486017a0e",
+   "git": "18e556a:live-worker-runtime/entrypoint.py"
+  },
+  {
+   "path": "live/live_loop.py",
+   "sha256": "32d230fdd026f6d00d900e7d93190f8b064ebc593b51bcad9ac2f70e9d3cf154",
+   "git": "18e556a:live-worker-runtime/live_loop.py"
+  },
+  {
+   "path": "live/provider_errors.py",
+   "sha256": "6e59c6e43fe789674242716ca239392a11471c34011206039f266bd4ec6a5da3",
+   "git": "18e556a:live-worker-runtime/provider_errors.py"
+  },
+  {
+   "path": "live/providers/__init__.py",
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "git": "18e556a:live-worker-runtime/providers/__init__.py"
+  },
+  {
+   "path": "live/providers/_grok_protocol.py",
+   "sha256": "db06aa1cb5124802622884d701c6e9da1f9198696830d269bfaae1fdd5df0dec",
+   "git": "18e556a:live-worker-runtime/providers/_grok_protocol.py"
+  },
+  {
+   "path": "live/providers/grok.py",
+   "git": "18e556a:live-worker-runtime/providers/grok.py",
+   "owner_pin": true,
+   "placeholder_sha256": "2b630ab512a51c1f69ccb1801d53835bf764b212b6d3548d1ebab3e0790b33d4"
+  },
+  {
+   "path": "live/test_dynamic_broker.py",
+   "sha256": "fe14b16713a57da2de82f17773170cdf25a3003590e133f5fd3d6f1aff77f364",
+   "git": "18e556a:live-worker-runtime/test_dynamic_broker.py"
+  },
+  {
+   "path": "live/test_live_loop.py",
+   "sha256": "ebfb9b664c2cbe57aa64e98fb02b7174620d75a9f0db59dbc1c51b5f3b65a2be",
+   "git": "18e556a:live-worker-runtime/test_live_loop.py"
+  },
+  {
+   "path": "live/tests/__init__.py",
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "git": "18e556a:live-worker-runtime/tests/__init__.py"
+  },
+  {
+   "path": "live/tests/test_grok.py",
+   "sha256": "c06dd17e5fa057c22bb5c1940a6632d5ff09e034b2cf704947a5a9e1aa057645",
+   "git": "18e556a:live-worker-runtime/tests/test_grok.py"
+  }
+ ]
+}
