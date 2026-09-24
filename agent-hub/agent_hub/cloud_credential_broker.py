@@ -464,7 +464,6 @@ class CloudCredentialBroker:
         return state, raw['updateTime']
 
     def _write(self, state, update_time):
-        require_pre_mutation_write_budget()
         write = {'update': {'name': self.config.document_name, 'fields': _fields(state)},
                  'currentDocument': {'updateTime': update_time} if update_time else {'exists': False}}
         try:
@@ -568,6 +567,12 @@ class CloudCredentialBroker:
                      'execution': execution, 'execution_uid': observed['uid'],
                      'lease_until_ms': self._now() + self.lease_seconds * 1000,
                      'intent_id': '', 'intent_digest': '', 'commit_version': '', 'quarantine_reason': ''}
+            # The only write refused for a short budget: nothing is leased yet,
+            # so the controller sees a never-acquired execution and the
+            # worker's same-request_id retry can take over. Release, commit
+            # and the idempotent re-stamp are never refused here: refusing
+            # them after a good turn would quarantine or strand the lease.
+            require_pre_mutation_write_budget()
             stamp = self._write(state, stamp)
             owned_stamp = stamp
         lease = Lease(self.config.profile, self.config.account_ref, self.config.canonical_account_ref,

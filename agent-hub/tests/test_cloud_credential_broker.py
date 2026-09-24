@@ -639,29 +639,52 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(seen['conditions'][1], seen['after_restamp'])
         self.assertNotEqual(seen['conditions'][0], seen['conditions'][1])
 
-    def test_pre_mutation_write_refuses_when_under_eight_seconds_remain(self):
+    def _with_seven_seconds_left(self, operation):
+        """Run one broker call as if slow reads had already spent 5 of the 12 s."""
         token = cb.begin_upstream_request()
         try:
             cb._request_deadline.set(time.monotonic() + 7)
-            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
-                self.acquire()
+            return operation()
         finally:
             cb.end_upstream_request(token)
+
+    def test_fresh_acquire_write_refuses_when_under_eight_seconds_remain(self):
+        # The only write refused for a short budget: nothing gets leased, and
+        # the worker's same-request_id retry can take over.
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
+            self._with_seven_seconds_left(self.acquire)
         self.assertEqual(self.wire.state['phase'], 'idle')
         self.assertEqual(self.wire.revision, 1)
         self.assertEqual(self.wire.state['fence'], 0)
+        self.assertEqual(self.acquire().fence, 1)
+
+    def test_commit_and_release_still_succeed_with_seven_seconds_left(self):
+        # Light's N3 probes: refusing these after a good turn would make the
+        # worker quarantine (writeback_uncertain) and block the slot.
         lease = self.acquire()
-        self.assertEqual(self.wire.state['phase'], 'leased')
-        token = cb.begin_upstream_request()
-        try:
-            cb._request_deadline.set(time.monotonic() + 7)
-            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
-                self.broker.commit(lease, b'opaque-refreshed-credential')
-        finally:
-            cb.end_upstream_request(token)
-        self.assertEqual(self.wire.state['phase'], 'leased')
-        self.assertEqual(self.wire.state['intent_id'], '')
+        version = self._with_seven_seconds_left(
+            lambda: self.broker.commit(lease, b'opaque-refreshed-credential'))
+        self.assertEqual(self.wire.state['phase'], 'committed')
+        self._with_seven_seconds_left(lambda: self.broker.release(lease, version))
+        self.assertEqual(self.wire.state['phase'], 'idle')
         self.assertEqual(self.wire.state['quarantine_reason'], '')
+
+    def test_renew_still_succeeds_with_seven_seconds_left(self):
+        lease = self.acquire()
+        before = self.wire.state['lease_until_ms']
+        self.now += 10
+        self._with_seven_seconds_left(lambda: self.broker.renew(lease))
+        self.assertGreater(self.wire.state['lease_until_ms'], before)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+
+    def test_idempotent_restamp_still_delivers_with_seven_seconds_left(self):
+        # Refusing the re-stamp would strand request 1's lease as leased and
+        # end in worker_failed_credential_unreleased.
+        self.acquire()
+        delivered = self._with_seven_seconds_left(self.acquire)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(delivered.lease_id, '1' * 32)
+        self.assertTrue(delivered.auth_bytes)
 
     def test_pre_mutation_reads_stop_when_the_request_budget_is_spent(self):
         original = self.broker.rest.request

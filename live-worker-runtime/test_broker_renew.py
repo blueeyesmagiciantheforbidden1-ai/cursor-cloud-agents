@@ -232,6 +232,37 @@ class BrokerRenewTests(unittest.TestCase):
         self.assertEqual(ACQUIRE_RETRY_AFTER_SECONDS, 2)
         self.assertIn('sleeper(ACQUIRE_RETRY_AFTER_SECONDS)', acquire)
 
+    def test_acquire_lease_never_calls_again_once_a_lease_was_returned(self):
+        # The broker's idempotent re-stamp assumes a same-id retry only follows
+        # a response that never arrived. Pin that contract here.
+        from entrypoint import acquire_lease
+        calls = []
+        lease = object()
+
+        class Delivers:
+            execution = 'e'
+
+            def acquire(self, observed, request):
+                calls.append(request)
+                return lease
+
+        self.assertIs(acquire_lease(Delivers(), '1' * 32, started=0, clock=lambda: 1,
+                                    sleeper=lambda _: self.fail('must not sleep')), lease)
+        self.assertEqual(calls, ['1' * 32])
+
+        class Refuses:
+            execution = 'e'
+
+            def acquire(self, observed, request):
+                calls.append(request)
+                raise Conflict('broker_operation_rejected')
+
+        calls.clear()
+        with self.assertRaises(Conflict):
+            acquire_lease(Refuses(), '1' * 32, started=0, clock=lambda: 1,
+                          sleeper=lambda _: self.fail('must not sleep'))
+        self.assertEqual(calls, ['1' * 32])
+
     def test_entrypoint_retries_acquire_once_with_the_same_request_id(self):
         from entrypoint import ACQUIRE_RETRY_SECONDS, acquire_lease
         self.assertEqual(ACQUIRE_RETRY_SECONDS, 20)
