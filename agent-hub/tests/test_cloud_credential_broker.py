@@ -5,9 +5,11 @@ from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -460,11 +462,14 @@ class TransportTests(unittest.TestCase):
             def close(self):
                 pass
         with patch.object(cb.http.client, 'HTTPSConnection', Connection):
-            with self.assertRaisesRegex(cb.BrokerError, '^google_read_failed$'):
+            with self.assertRaisesRegex(cb.BrokerError, '^google_read_failed$') as caught:
                 self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
-            with self.assertRaisesRegex(cb.MutationUncertain, '^google_mutation_uncertain$'):
+            self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
+            with self.assertRaisesRegex(cb.MutationUncertain, '^google_mutation_uncertain$') as caught:
                 self.rest._exchange('secretmanager.googleapis.com', '/v1/known:addVersion', 'POST')
+            self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
         self.assertEqual(len(Connection.calls), 2)
+        self.assertEqual({timeout for _host, timeout in Connection.calls}, {8})
 
     def test_duplicate_json_keys_and_email_only_binding_rejected(self):
         with self.assertRaisesRegex(cb.BrokerError, '^invalid_google_response$'):
@@ -499,9 +504,122 @@ class TransportTests(unittest.TestCase):
             def close(self):
                 pass
         with patch.object(cb.http.client, 'HTTPSConnection', Connection):
-            with self.assertRaisesRegex(cb.BrokerError, '^google_response_limit$'):
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^google_response_limit$') as caught:
                 self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+            self.assertNotIsInstance(caught.exception, cb.Conflict)
+            self.assertNotIsInstance(caught.exception, cb.MutationUncertain)
         self.assertEqual(response.limit, cb.MAX_RESPONSE_BYTES + 1)
+
+    def _connection(self, status, body, *, fail=None):
+        class Response:
+            def __init__(self):
+                self.status = status
+
+            def read(self, limit):
+                return body
+
+            def getheader(self, name):
+                return None
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                self.timeout = timeout
+
+            def request(self, *args, **kwargs):
+                if fail is not None:
+                    raise fail
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        return Connection
+
+    def test_read_stall_is_upstream_unavailable_inside_eight_second_budget(self):
+        self.assertEqual(cb.UPSTREAM_BUDGET_SECONDS, 8)
+        self.assertLess(cb.UPSTREAM_BUDGET_SECONDS, 15)
+        seen = {}
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                seen['timeout'] = timeout
+                self.ready = threading.Event()
+
+            def request(self, *args, **kwargs):
+                if not self.ready.wait(2):
+                    raise AssertionError('watchdog did not stop the stalled read')
+                raise socket.timeout('private stall detail')
+
+            def getresponse(self):
+                raise AssertionError('stalled read was parsed')
+
+            def close(self):
+                self.ready.set()
+
+        class Timer:
+            def __init__(self, interval, function):
+                seen['budget'] = interval
+                self.function = function
+                self.daemon = False
+
+            def start(self):
+                self.function()
+
+            def cancel(self):
+                pass
+
+        with patch.object(cb.http.client, 'HTTPSConnection', Connection), patch.object(cb.threading, 'Timer', Timer):
+            started = time.monotonic()
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^google_upstream_unavailable$') as caught:
+                self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+            self.assertLess(time.monotonic() - started, 2)
+            with self.assertRaisesRegex(cb.MutationUncertain, '^google_mutation_uncertain$'):
+                self.rest._exchange('secretmanager.googleapis.com', '/v1/known:addVersion', 'POST')
+        self.assertEqual(seen, {'timeout': 8, 'budget': 8})
+        self.assertNotIn('private stall', str(caught.exception))
+        self.assertNotIsInstance(caught.exception, cb.Conflict)
+        self.assertNotIsInstance(caught.exception, cb.MutationUncertain)
+        with patch.object(cb.http.client, 'HTTPSConnection', self._connection(200, b'{}', fail=ConnectionError('refused'))):
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^google_upstream_unavailable$') as caught:
+                self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+        self.assertNotIn('refused', str(caught.exception))
+
+    def test_upstream_http_and_unparsable_reads_are_unavailable_not_conflict(self):
+        secret = b'{"error":{"status":"UNAVAILABLE"},"secret":"synthetic-do-not-log"}'
+        for status in (429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                with patch.object(cb.http.client, 'HTTPSConnection', self._connection(status, secret)):
+                    with self.assertRaisesRegex(cb.UpstreamUnavailable, '^google_upstream_unavailable$') as caught:
+                        self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+                    self.assertNotIn(b'synthetic-do-not-log', str(caught.exception).encode())
+                    with self.assertRaisesRegex(cb.MutationUncertain, '^google_mutation_uncertain$'):
+                        self.rest._exchange('secretmanager.googleapis.com', '/v1/known:addVersion', 'POST')
+        for status in (409, 412):
+            with self.subTest(status=status):
+                with patch.object(cb.http.client, 'HTTPSConnection', self._connection(status, secret)):
+                    with self.assertRaisesRegex(cb.Conflict, '^control_compare_and_swap_conflict$') as caught:
+                        self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+                    self.assertNotIn('synthetic-do-not-log', str(caught.exception))
+        denied = b'{"error":{"status":"PERMISSION_DENIED"},"secret":"synthetic-do-not-log"}'
+        with patch.object(cb.http.client, 'HTTPSConnection', self._connection(403, denied)):
+            with self.assertRaisesRegex(cb.BrokerError, '^google_resource_denied_or_missing$') as caught:
+                self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+            self.assertNotIsInstance(caught.exception, (cb.UpstreamUnavailable, cb.Conflict))
+        cas = b'{"error":{"status":"FAILED_PRECONDITION"}}'
+        with patch.object(cb.http.client, 'HTTPSConnection', self._connection(400, cas)):
+            with self.assertRaisesRegex(cb.Conflict, '^control_compare_and_swap_conflict$'):
+                self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+        with patch.object(cb.http.client, 'HTTPSConnection', self._connection(200, b'{')):
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^invalid_google_response$'):
+                self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET')
+            with self.assertRaisesRegex(cb.MutationUncertain, '^google_mutation_uncertain$'):
+                self.rest._exchange('secretmanager.googleapis.com', '/v1/known:addVersion', 'POST')
 
 
 if __name__ == '__main__':

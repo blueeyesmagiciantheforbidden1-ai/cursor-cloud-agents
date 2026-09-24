@@ -28,7 +28,8 @@ from urllib.parse import quote, urlsplit
 
 from .cloud_credential_broker import (
     BrokerError, CloudCredentialBroker, Conflict, Lease, MAX_CREDENTIAL_BYTES,
-    MutationUncertain, ProfileConfig, GoogleREST, _execution, _version, _fields, _decode_fields,
+    MutationUncertain, ProfileConfig, GoogleREST, UpstreamUnavailable, UPSTREAM_BUDGET_SECONDS,
+    UPSTREAM_HTTP_STATUSES, _execution, _version, _fields, _decode_fields,
 )
 from . import cloud_credential_broker as backend
 
@@ -234,17 +235,22 @@ class ExecutionGrantStore:
         body = None if value is None else encode(value)
         try:
             status, _, raw = exchange('firestore.googleapis.com', path, method=method, body=body,
-                headers={'Authorization': 'Bearer ' + self.rest._token(), 'Content-Type': 'application/json'})
+                headers={'Authorization': 'Bearer ' + self.rest._token(), 'Content-Type': 'application/json'},
+                timeout_seconds=UPSTREAM_BUDGET_SECONDS)
         except Exception:
             if method == 'POST':
                 raise MutationUncertain('execution_grant_publish_uncertain') from None
-            raise BrokerError('execution_grant_read_unavailable') from None
+            raise UpstreamUnavailable('execution_grant_read_unavailable') from None
         if method == 'GET' and status == 404:
             return None  # 403 is NOT treated as a not-yet-published grant.
-        if status == 409:
+        if status in (409, 412):
             raise Conflict('execution_grant_already_published')
         if status in (401, 403):
             raise BrokerError('execution_grant_access_denied')
+        if status in UPSTREAM_HTTP_STATUSES:
+            if method == 'POST':
+                raise MutationUncertain('execution_grant_publish_uncertain')
+            raise UpstreamUnavailable('execution_grant_read_unavailable')
         if not 200 <= status < 300:
             if method == 'POST':
                 raise MutationUncertain('execution_grant_publish_uncertain')
@@ -254,7 +260,7 @@ class ExecutionGrantStore:
         except BrokerError:
             if method == 'POST':
                 raise MutationUncertain('execution_grant_publish_uncertain') from None
-            raise BrokerError('execution_grant_read_unavailable') from None
+            raise UpstreamUnavailable('execution_grant_read_unavailable') from None
 
     def _record(self, execution, execution_uid):
         b = self.binding
@@ -424,21 +430,50 @@ class BrokerService:
         return {'ok': True}
 
 
+LOG_CODES = frozenset((
+    'ok', 'authentication_required', 'execution_not_authorized', 'request_invalid',
+    'broker_conflict', 'broker_mutation_uncertain', 'broker_operation_rejected',
+    'broker_upstream_unavailable', 'broker_unavailable', 'method_not_allowed',
+))
+
+
 def error_reply(error):
+    """Status, fixed JSON body, and extra headers. Messages never leave this map."""
     if isinstance(error, BoundaryError):
         code = str(error)
         if code == 'authentication_required':
-            return 401, {'error': 'authentication_required'}
+            return 401, {'error': 'authentication_required'}, None
         if code in ('execution_not_authorized', 'execution_grant_expired'):
-            return 403, {'error': 'execution_not_authorized'}
-        return 400, {'error': 'request_invalid'}
+            return 403, {'error': 'execution_not_authorized'}, None
+        return 400, {'error': 'request_invalid'}, None
     if isinstance(error, Conflict):
-        return 409, {'error': 'broker_conflict'}
+        return 409, {'error': 'broker_conflict'}, None
     if isinstance(error, MutationUncertain):
-        return 503, {'error': 'broker_mutation_uncertain'}
+        return 503, {'error': 'broker_mutation_uncertain'}, None
+    if isinstance(error, UpstreamUnavailable):
+        return 503, {'error': 'broker_upstream_unavailable'}, {'Retry-After': '2'}
     if isinstance(error, BrokerError):
-        return 409, {'error': 'broker_operation_rejected'}
-    return 503, {'error': 'broker_unavailable'}
+        return 409, {'error': 'broker_operation_rejected'}, None
+    return 503, {'error': 'broker_unavailable'}, None
+
+
+def log_broker_request(action, status, code, started):
+    """One fixed JSON line. Callers must not pass tokens, grants, or bodies."""
+    if action not in ACTIONS:
+        action = 'unknown'
+    if code not in LOG_CODES:
+        code = 'broker_unavailable'
+    if type(status) is not int:
+        status = 500
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if duration_ms < 0:
+        duration_ms = 0
+    line = json.dumps({'kind': 'runcrew_broker_request', 'action': action, 'status': status,
+                       'code': code, 'duration_ms': duration_ms}, separators=(',', ':'))
+    try:
+        print(line, flush=True)
+    except OSError:
+        pass
 
 
 def handler_for(service):
@@ -455,22 +490,32 @@ def handler_for(service):
             pass  # Request paths, headers, credentials and errors are never logged.
 
         def send_error(self, *_args, **_kwargs):
-            self._reply(400, {'error': 'request_invalid'})
+            started = time.monotonic()
+            try:
+                self._reply(400, {'error': 'request_invalid'})
+            finally:
+                log_broker_request('unknown', 400, 'request_invalid', started)
 
-        def _reply(self, status, value):
+        def _reply(self, status, value, headers=None):
             raw = encode(value)
             self.close_connection = True
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('Content-Length', str(len(raw)))
+            if headers:
+                for key, item in headers.items():
+                    self.send_header(key, item)
             self.send_header('Connection', 'close')
             self.end_headers()
             self.wfile.write(raw)
 
         def do_POST(self):
+            started = time.monotonic()
+            action, status, code = 'unknown', 500, 'broker_unavailable'
             try:
                 require(self.path.startswith(PREFIX) and self.path[len(PREFIX):] in ACTIONS)
+                action = self.path[len(PREFIX):]
                 # Reject ambiguity, compression, chunking and duplicate auth headers.
                 for key in ('Content-Length', 'Content-Type', 'Authorization', 'X-RunCrew-Execution-Grant'):
                     require(len(self.headers.get_all(key, [])) == 1)
@@ -481,17 +526,27 @@ def handler_for(service):
                 require(re.fullmatch(r'[1-9][0-9]{0,6}', length) and int(length) <= MAX_BODY)
                 raw = self.rfile.read(int(length))
                 require(len(raw) == int(length))
-                value = service.dispatch(self.path[len(PREFIX):], self.headers['Authorization'],
+                value = service.dispatch(action, self.headers['Authorization'],
                                          self.headers['X-RunCrew-Execution-Grant'], decode(raw))
-                self._reply(202 if value == {'ready': False} else 200, value)
+                status, code = (202, 'ok') if value == {'ready': False} else (200, 'ok')
+                self._reply(status, value)
             except Exception as error:
                 try:
-                    self._reply(*error_reply(error))
+                    reply = error_reply(error)
+                    status, body = reply[0], reply[1]
+                    code = body.get('error') if isinstance(body, dict) else 'broker_unavailable'
+                    self._reply(*reply)
                 except (OSError, ValueError):
                     pass
+            finally:
+                log_broker_request(action, status, code, started)
 
         def do_GET(self):
-            self._reply(405, {'error': 'method_not_allowed'})
+            started = time.monotonic()
+            try:
+                self._reply(405, {'error': 'method_not_allowed'})
+            finally:
+                log_broker_request('unknown', 405, 'method_not_allowed', started)
 
     return Handler
 
@@ -600,6 +655,10 @@ class BrokerHTTPClient:
             raise BrokerError('broker_request_denied')
         if status == 409:
             raise Conflict('broker_operation_rejected')
+        # 503 and every other non-definitive result stay uncertain. Acquire may
+        # be retried only with the same request_id and only before a native
+        # process starts. Renew surfaces MutationUncertain, which the worker
+        # tolerates. A 503 is never a compare-and-swap Conflict.
         raise MutationUncertain('broker_http_outcome_uncertain')
 
     def _lease(self, lease):

@@ -1,10 +1,12 @@
 """Offline real HTTP/signature checks; Google wire state is fault injected."""
 import base64
 import copy
+from contextlib import redirect_stdout
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import http.client
+import io
 import json
 import threading
 import time
@@ -200,8 +202,17 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(response.status, 400)
             self.assertEqual(json.loads(raw), {'error':'request_invalid'})
             self.assertEqual(self.wire.secret_reads, 0)
-            for error in (Exception('raw secret'),backend.BrokerError('raw secret'),backend.MutationUncertain('raw secret')):
+            for error in (Exception('raw secret'),backend.BrokerError('raw secret'),backend.MutationUncertain('raw secret'),
+                          backend.UpstreamUnavailable('raw secret'), backend.Conflict('raw secret')):
                 self.assertNotIn('raw secret', json.dumps(service.error_reply(error)))
+            status, body, headers = service.error_reply(backend.UpstreamUnavailable('raw secret'))
+            self.assertEqual((status, body, headers), (503, {'error': 'broker_upstream_unavailable'}, {'Retry-After': '2'}))
+            status, body, headers = service.error_reply(backend.BrokerError('credential_lease_not_active'))
+            self.assertEqual((status, body), (409, {'error': 'broker_operation_rejected'}))
+            self.assertFalse(headers)
+            status, body, headers = service.error_reply(backend.Conflict('control_compare_and_swap_conflict'))
+            self.assertEqual((status, body), (409, {'error': 'broker_conflict'}))
+            self.assertFalse(headers)
         finally:
             connection.close()
             server.shutdown()
@@ -319,6 +330,155 @@ class ServiceTests(unittest.TestCase):
             client = service.load_client_config('/run/config/client.json')
         self.assertEqual(client.execution,self.execution)
         bootstrap.assert_called_once_with(timeout_seconds=120)
+
+    def _client(self, resolved=False):
+        return service.BrokerHTTPClient(self.profile, endpoint=ENDPOINT, execution=self.execution,
+            execution_uid=self.execution_uid if resolved else None, grant=GRANT)
+
+    def _lease(self):
+        return backend.Lease(self.profile.profile, self.profile.account_ref, self.profile.canonical_account_ref,
+            1, self.profile.secret_name + '/versions/1', '1' * 32, self.execution, self.execution_uid, b'')
+
+    def test_worker_treats_503_as_transient_and_never_as_conflict(self):
+        self.assertEqual(service.exchange.__kwdefaults__['timeout_seconds'], 15)
+        self.assertEqual(backend.UPSTREAM_BUDGET_SECONDS, 8)
+        unavailable = (503, {'Retry-After': '2'}, b'{"error":"broker_upstream_unavailable"}')
+        polling = service.BrokerHTTPClient(self.profile, endpoint=ENDPOINT, execution=self.execution, grant=GRANT)
+        ready = (200, {}, service.encode({'ready': True, 'execution': self.execution, 'execution_uid': self.execution_uid}))
+        with patch.object(polling, '_id_token', return_value='synthetic.jwt.signature'), patch.object(
+                service, 'exchange', side_effect=[unavailable, ready]) as transport, patch.object(service.time, 'sleep'):
+            polling.bootstrap(timeout_seconds=3)
+        self.assertEqual(polling.execution_uid, self.execution_uid)
+        self.assertEqual(transport.call_count, 2)
+        client = self._client(resolved=True)
+        lease = self._lease()
+        bodies = []
+        def transport(*args, **kwargs):
+            bodies.append(kwargs.get('body'))
+            return unavailable
+        with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), patch.object(
+                service, 'exchange', side_effect=transport) as calls:
+            with self.assertRaises(backend.MutationUncertain) as caught:
+                client.renew(lease)
+            self.assertNotIsInstance(caught.exception, backend.Conflict)
+            with self.assertRaises(backend.MutationUncertain) as caught:
+                client.acquire(client.execution, '1' * 32)
+            self.assertNotIsInstance(caught.exception, backend.Conflict)
+        self.assertEqual(calls.call_count, 2)
+        self.assertEqual(bodies[1], service.encode({'request_id': '1' * 32}))
+        self.assertEqual(bodies[1].count(b'request_id'), 1)
+        with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), patch.object(
+                service, 'exchange', return_value=(503, {}, b'<html>raw secret</html>')):
+            with self.assertRaisesRegex(backend.MutationUncertain, '^broker_http_outcome_uncertain$') as caught:
+                client.renew(lease)
+            self.assertNotIn('raw secret', str(caught.exception))
+            self.assertNotIsInstance(caught.exception, backend.Conflict)
+        denied = service.BrokerHTTPClient(self.profile, endpoint=ENDPOINT, execution=self.execution, grant=GRANT)
+        with patch.object(denied, '_id_token', return_value='synthetic.jwt.signature'), patch.object(
+                service, 'exchange', return_value=(409, {}, b'{"error":"broker_operation_rejected"}')) as transport, \
+                patch.object(service.time, 'sleep'):
+            with self.assertRaisesRegex(backend.BrokerError, '^bootstrap_not_authorized$'):
+                denied.bootstrap(timeout_seconds=3)
+        self.assertEqual(transport.call_count, 1)
+        self.assertIsNone(denied.execution_uid)
+
+    def test_grant_read_stall_is_upstream_unavailable_within_budget(self):
+        rest = SimpleNamespace(_token=lambda: 'synthetic-access-token')
+        store = service.ExecutionGrantStore(self.binding, rest=rest, clock=lambda: self.now)
+        with patch.object(service, 'exchange', return_value=(503, {}, b'raw secret')) as transport:
+            with self.assertRaisesRegex(backend.UpstreamUnavailable, '^execution_grant_read_unavailable$') as caught:
+                store.read()
+            self.assertNotIn('raw secret', str(caught.exception))
+            self.assertNotIsInstance(caught.exception, backend.Conflict)
+            self.assertEqual(transport.call_args.kwargs['timeout_seconds'], backend.UPSTREAM_BUDGET_SECONDS)
+        with patch.object(service, 'exchange', side_effect=TimeoutError('stalled raw secret')):
+            with self.assertRaises(backend.UpstreamUnavailable) as caught:
+                store.read()
+            self.assertNotIn('stalled', str(caught.exception))
+            self.assertNotIn('raw secret', str(caught.exception))
+        with patch.object(service, 'exchange', return_value=(409, {}, b'{}')):
+            with self.assertRaises(backend.Conflict):
+                store.read()
+        with patch.object(service, 'exchange', return_value=(200, {}, b'{')):
+            with self.assertRaises(backend.UpstreamUnavailable):
+                store.read()
+
+    def test_http_stall_is_503_and_log_has_no_secret_material(self):
+        email = 'person@example.com'
+        canary = 'do-not-log-canary-secret'
+        version = self.profile.secret_name + '/versions/1'
+        lease_id = '1' * 32
+        server = service.BrokerServer(('127.0.0.1', 0), self.service)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        buffer = io.StringIO()
+
+        def post(kind):
+            connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+            try:
+                if kind == 'get':
+                    connection.request('GET', service.PREFIX + 'bootstrap')
+                else:
+                    connection.request('POST', service.PREFIX + 'bootstrap', body=b'{}', headers={
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer synthetic.jwt.signature',
+                        'X-RunCrew-Execution-Grant': GRANT,
+                        'X-Email': email,
+                        'X-Lease-Id': lease_id,
+                        'X-Version': version,
+                    })
+                response = connection.getresponse()
+                return response.status, response.getheader('Retry-After'), response.read()
+            finally:
+                connection.close()
+
+        try:
+            with redirect_stdout(buffer):
+                self.grant_store.read = lambda: (_ for _ in ()).throw(backend.UpstreamUnavailable(canary))
+                stall = post('bootstrap')
+                self.grant_store.read = lambda: (_ for _ in ()).throw(backend.Conflict(canary))
+                conflict = post('bootstrap')
+                self.grant_store.read = lambda: (_ for _ in ()).throw(backend.BrokerError(canary))
+                rejected = post('bootstrap')
+                self.grant_store.read = lambda: self.active
+                ready = post('bootstrap')
+                other = post('get')
+                deadline = time.monotonic() + 2
+                while buffer.getvalue().count('\n') < 5 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+        self.assertEqual(stall, (503, '2', b'{"error":"broker_upstream_unavailable"}'))
+        self.assertEqual(conflict[0], 409)
+        self.assertIsNone(conflict[1])
+        self.assertEqual(json.loads(conflict[2]), {'error': 'broker_conflict'})
+        self.assertEqual(rejected[0], 409)
+        self.assertIsNone(rejected[1])
+        self.assertEqual(json.loads(rejected[2]), {'error': 'broker_operation_rejected'})
+        self.assertEqual(ready[0], 200)
+        self.assertIn(self.execution_uid.encode(), ready[2])
+        self.assertEqual(other[0], 405)
+        text = buffer.getvalue()
+        for secret in (GRANT, 'synthetic.jwt.signature', email, canary, version, lease_id, self.execution_uid):
+            self.assertNotIn(secret, text)
+        lines = [json.loads(line) for line in text.splitlines() if line]
+        self.assertEqual(len(lines), 5)
+        expected = [
+            ('bootstrap', 503, 'broker_upstream_unavailable'),
+            ('bootstrap', 409, 'broker_conflict'),
+            ('bootstrap', 409, 'broker_operation_rejected'),
+            ('bootstrap', 200, 'ok'),
+            ('unknown', 405, 'method_not_allowed'),
+        ]
+        for line, (action, status, code) in zip(lines, expected):
+            self.assertEqual(list(line), ['kind', 'action', 'status', 'code', 'duration_ms'])
+            self.assertEqual(line['kind'], 'runcrew_broker_request')
+            self.assertEqual((line['action'], line['status'], line['code']), (action, status, code))
+            self.assertIs(type(line['status']), int)
+            self.assertIs(type(line['duration_ms']), int)
+            self.assertGreaterEqual(line['duration_ms'], 0)
 
 
 class SignedIdentityTests(unittest.TestCase):

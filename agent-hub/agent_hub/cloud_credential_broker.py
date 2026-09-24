@@ -26,6 +26,10 @@ COLLECTION = 'runcrew_provider_credentials'
 MAX_CREDENTIAL_BYTES = 64 * 1024  # Secret Manager's actual per-version limit.
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_CONTROL_BYTES = 16 * 1024
+# Below the worker client's 15s exchange budget so a stalled upstream read is
+# answered before that client gives up.
+UPSTREAM_BUDGET_SECONDS = 8
+UPSTREAM_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
 _DIGEST = re.compile(r'[a-f0-9]{64}')
 _ID = re.compile(r'[a-f0-9]{32}')
 _STAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z')
@@ -45,6 +49,15 @@ class Conflict(BrokerError):
 
 class MutationUncertain(BrokerError):
     pass
+
+
+class UpstreamUnavailable(BrokerError):
+    """Transient upstream transport or capacity failure.
+
+    Distinct from a definitive policy rejection, a compare-and-swap Conflict,
+    and MutationUncertain (a lost mutation acknowledgement, which still uses
+    strong-read recovery). A read that raises this can be retried.
+    """
 
 
 def _require(condition, code):
@@ -216,8 +229,9 @@ def _decode_fields(value):
 class GoogleREST:
     """Actual Google REST transport, without ADC discovery, proxies or redirects.
 
-    Socket timeout is 10 seconds; response bytes are bounded. A 15-second
-    watchdog shuts down the socket (including a Connection: close response).
+    Each call's socket timeout and watchdog share UPSTREAM_BUDGET_SECONDS (8),
+    under the worker client's 15-second budget. Response bytes are bounded.
+    The watchdog shuts down the socket, including a Connection: close response.
     Hostname resolution still uses the platform resolver. There
     are no automatic HTTP retries, especially on non-idempotent addVersion.
     """
@@ -232,7 +246,8 @@ class GoogleREST:
         timer = None
         active_socket = None
         try:
-            connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(host, timeout=10)
+            connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(
+                host, timeout=UPSTREAM_BUDGET_SECONDS)
             def stop():
                 expired.set()
                 sock = active_socket or connection.sock
@@ -242,14 +257,26 @@ class GoogleREST:
                     except OSError:
                         pass
                 connection.close()
-            timer = threading.Timer(15, stop)
+            timer = threading.Timer(UPSTREAM_BUDGET_SECONDS, stop)
             timer.daemon = True
             timer.start()
             connection.request(method, path, body=body, headers=headers or {})
             active_socket = connection.sock
             response = connection.getresponse()
             raw = response.read(MAX_RESPONSE_BYTES + 1)
-            _require(not expired.is_set() and len(raw) <= MAX_RESPONSE_BYTES, 'google_response_limit')
+            # A read cannot have applied a mutation. The same transport failure
+            # on a write is a lost acknowledgement (MutationUncertain) so the
+            # existing strong-read recovery still runs.
+            if expired.is_set() or len(raw) > MAX_RESPONSE_BYTES:
+                if method == 'GET':
+                    raise UpstreamUnavailable('google_response_limit')
+                _require(False, 'google_response_limit')
+            if response.status in (409, 412):
+                raise Conflict('control_compare_and_swap_conflict')
+            if response.status in UPSTREAM_HTTP_STATUSES:
+                if method == 'GET':
+                    raise UpstreamUnavailable('google_upstream_unavailable')
+                raise MutationUncertain('google_mutation_uncertain')
             if metadata:
                 _require(response.status == 200 and response.getheader('Metadata-Flavor') == 'Google',
                          'metadata_unavailable')
@@ -268,16 +295,18 @@ class GoogleREST:
                     raise MutationUncertain('google_mutation_uncertain')
                 raise BrokerError('google_read_failed')
             return _json(raw)
-        except (Conflict, MutationUncertain):
+        except (Conflict, MutationUncertain, UpstreamUnavailable):
             raise
-        except BrokerError:
+        except BrokerError as error:
             if method != 'GET':
                 raise MutationUncertain('google_mutation_uncertain') from None
+            if str(error) == 'invalid_google_response':
+                raise UpstreamUnavailable('invalid_google_response') from None
             raise
         except (OSError, http.client.HTTPException, ValueError):
             if method != 'GET':
                 raise MutationUncertain('google_mutation_uncertain') from None
-            raise BrokerError('google_read_failed') from None
+            raise UpstreamUnavailable('google_upstream_unavailable') from None
         finally:
             if timer:
                 timer.cancel()

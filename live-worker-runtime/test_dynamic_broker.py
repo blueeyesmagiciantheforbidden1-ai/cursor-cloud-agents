@@ -1,9 +1,11 @@
 from dataclasses import asdict
 import hashlib
 import unittest
+from unittest.mock import patch
 
 from agent_hub import credential_broker_service as base
-from agent_hub.cloud_credential_broker import ProfileConfig, MutationUncertain
+from agent_hub.cloud_credential_broker import (ProfileConfig, MutationUncertain, UpstreamUnavailable,
+                                              Conflict, BrokerError, UPSTREAM_BUDGET_SECONDS)
 from dynamic_broker import Policy, BindingStore, LiveBrokerService, parse_config
 
 
@@ -91,6 +93,37 @@ class DynamicTests(unittest.TestCase):
         store = MemoryStore(); store.publish(BINDING)
         with self.assertRaises(MutationUncertain): store.publish(POLICY.binding(DIGEST, 2100))
         self.assertEqual(store.read(DIGEST), BINDING)
+
+    def test_binding_read_stall_is_upstream_unavailable_not_conflict(self):
+        store = BindingStore(POLICY, rest=type('Rest', (), {'_token': staticmethod(lambda: 'offline-token')})(),
+                             clock=lambda: 1000)
+        with patch.object(base, 'exchange', side_effect=TimeoutError('stalled raw secret')) as transport:
+            with self.assertRaises(UpstreamUnavailable) as caught:
+                store.read(DIGEST)
+            self.assertNotIsInstance(caught.exception, Conflict)
+            self.assertNotIn('raw secret', str(caught.exception))
+            self.assertNotIn('stalled', str(caught.exception))
+            self.assertEqual(transport.call_args.kwargs['timeout_seconds'], UPSTREAM_BUDGET_SECONDS)
+            self.assertEqual(UPSTREAM_BUDGET_SECONDS, 8)
+        with patch.object(base, 'exchange', return_value=(503, {'Retry-After': '2'}, b'{"secret":"raw"}')):
+            with self.assertRaisesRegex(UpstreamUnavailable, '^live_binding_read_unavailable$'):
+                store.read(DIGEST)
+        with patch.object(base, 'exchange', return_value=(409, {}, b'{}')):
+            with self.assertRaises(Conflict):
+                store.read(DIGEST)
+        with patch.object(base, 'exchange', return_value=(403, {}, b'{}')):
+            with self.assertRaises(BrokerError) as caught:
+                store.read(DIGEST)
+            self.assertNotIsInstance(caught.exception, (UpstreamUnavailable, Conflict))
+        with patch.object(base, 'exchange', return_value=(200, {}, b'{')):
+            with self.assertRaises(UpstreamUnavailable):
+                store.read(DIGEST)
+        with patch.object(base, 'exchange', side_effect=OSError('lost raw secret')) as transport:
+            with self.assertRaises(MutationUncertain) as caught:
+                store.exchange('POST', 'documents:commit', {'writes': []})
+            self.assertNotIsInstance(caught.exception, UpstreamUnavailable)
+            self.assertNotIn('raw secret', str(caught.exception))
+            self.assertEqual(transport.call_args.kwargs['timeout_seconds'], 8)
 
     def test_config_unique_known_identity_and_no_opaque_credentials(self):
         config = {'schema_version': 1, 'audience': ENDPOINT, 'policies': [asdict(POLICY)]}

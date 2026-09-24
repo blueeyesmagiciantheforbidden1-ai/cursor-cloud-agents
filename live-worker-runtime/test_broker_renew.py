@@ -2,12 +2,14 @@
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import broker_renew
 import dynamic_broker
 import provider_errors
-from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
-from agent_hub.credential_broker_service import BoundaryError
+from agent_hub.cloud_credential_broker import BrokerError, Conflict, Lease, MutationUncertain, ProfileConfig
+from agent_hub.credential_broker_service import BoundaryError, BrokerHTTPClient
+import agent_hub.credential_broker_service as broker_service
 
 
 class CodeError(provider_errors.ProviderCodeError, RuntimeError):
@@ -181,6 +183,37 @@ class BrokerRenewTests(unittest.TestCase):
         self.assertEqual(broker_renew.TOLERANCE_SECONDS, broker_renew.LEASE_SECONDS - broker_renew.CLOSE_RESERVE_SECONDS)
         self.assertEqual(broker_renew.TOLERANCE_SECONDS, 180)
         self.assertEqual(broker_renew.RETRY_SECONDS, 10)
+
+    def test_renew_tolerates_http_503_and_does_not_treat_it_as_conflict(self):
+        profile = ProfileConfig('grok', 'blueeyes', 'a' * 64, 'b' * 64,
+                                'runcrew-credential-grok-blueeyes', 'runcrew-worker-grok')
+        execution = profile.job_name + '/executions/' + profile.job_id + '-abcde'
+        uid = 'e93aecda-13b2-46d3-af37-f834d5bff100'
+        client = BrokerHTTPClient(profile, endpoint='https://broker.run.app', execution=execution,
+                                   execution_uid=uid, grant='g' * 43)
+        lease = Lease(profile.profile, profile.account_ref, profile.canonical_account_ref, 1,
+                      profile.secret_name + '/versions/1', 'ab' * 16, execution, uid, b'')
+
+        def exchange(*_args, **_kwargs):
+            return 503, {'Retry-After': '2'}, b'{"error":"broker_upstream_unavailable","token":"raw-secret"}'
+
+        with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), \
+                patch.object(broker_service, 'exchange', side_effect=exchange) as transport:
+            with self.assertRaises(MutationUncertain) as caught:
+                client.renew(lease)
+            self.assertNotIsInstance(caught.exception, Conflict)
+            self.assertNotIn('raw-secret', str(caught.exception))
+            self.assertEqual(transport.call_count, 1)
+        self.assertTrue(broker_renew.transient(caught.exception))
+        lease_clock, _clock = self.clock_for(anchor=0, now=1)
+
+        def fail():
+            raise caught.exception
+
+        self.assertIs(lease_clock.renew(broker(fail), lease), False)
+        self.assertEqual(lease_clock.renewed_at, 0)
+        self.assertEqual(lease_clock.failures, 1)
+        self.assertTrue(lease_clock.degraded)
 
     def test_entrypoint_stamps_acquire_start(self):
         source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')

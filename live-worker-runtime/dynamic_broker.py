@@ -15,7 +15,8 @@ import time
 
 from agent_hub import credential_broker_service as base
 from agent_hub.cloud_credential_broker import (CloudCredentialBroker, ProfileConfig, GoogleREST,
-    BrokerError, MutationUncertain, DATABASE)
+    BrokerError, Conflict, MutationUncertain, UpstreamUnavailable, UPSTREAM_BUDGET_SECONDS,
+    UPSTREAM_HTTP_STATUSES, DATABASE)
 
 
 @dataclass(frozen=True)
@@ -66,13 +67,24 @@ class BindingStore:
         try:
             status, _, raw = base.exchange('firestore.googleapis.com', '/v1/' + path,
                 method=method, body=None if value is None else base.encode(value),
-                headers={'Authorization': 'Bearer ' + self.rest._token(), 'Content-Type': 'application/json'})
+                headers={'Authorization': 'Bearer ' + self.rest._token(), 'Content-Type': 'application/json'},
+                timeout_seconds=UPSTREAM_BUDGET_SECONDS)
         except Exception:
             if method == 'POST':
                 raise MutationUncertain('live_binding_publish_uncertain') from None
-            raise BrokerError('live_binding_read_unavailable') from None
+            raise UpstreamUnavailable('live_binding_read_unavailable') from None
         if status == 404 and method == 'GET':
             return None
+        if status in (409, 412):
+            if method == 'POST':
+                # Lost acknowledgement of a create-only publish still resolves
+                # by the existing strong read. A 409/412 is not transport loss.
+                raise MutationUncertain('live_binding_publish_uncertain')
+            raise Conflict('live_binding_compare_and_swap_conflict')
+        if status in UPSTREAM_HTTP_STATUSES:
+            if method == 'POST':
+                raise MutationUncertain('live_binding_publish_uncertain')
+            raise UpstreamUnavailable('live_binding_read_unavailable')
         if not 200 <= status < 300:
             if method == 'POST':
                 raise MutationUncertain('live_binding_publish_uncertain')
@@ -82,7 +94,7 @@ class BindingStore:
         except BrokerError:
             if method == 'POST':
                 raise MutationUncertain('live_binding_publish_uncertain') from None
-            raise BrokerError('live_binding_read_unavailable') from None
+            raise UpstreamUnavailable('live_binding_read_unavailable') from None
 
     def read(self, digest):
         document = self.name(digest)
