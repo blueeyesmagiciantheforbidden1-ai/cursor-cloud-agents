@@ -281,6 +281,87 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.wire.state['phase'], 'quarantined')
         self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
 
+    def _uncertain_abort(self, *, fail_strong_read=False, restamp=False, apply_abort=False):
+        """Stall the secret read, then lose the abort acknowledgement.
+
+        ``fail_strong_read`` makes _write's recovery read fail. ``restamp``
+        advances the lease during that failed read, as a delivering retry would.
+        ``apply_abort`` commits the idle document before dropping the ack.
+        Returns the CAS updateTime of each commit attempt and the stamp from
+        the lease write.
+        """
+        wire = self.wire
+        original = wire.request
+        seen = {'posts': 0, 'gets': 0, 'conditions': [], 'leased_stamp': None}
+
+        def request(method, host, path, value=None):
+            if method == 'GET' and host == 'secretmanager.googleapis.com':
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            if host == 'firestore.googleapis.com' and method == 'GET':
+                seen['gets'] += 1
+                if seen['gets'] == 3 and (fail_strong_read or restamp):
+                    if restamp:
+                        with wire.lock:
+                            wire.state['lease_until_ms'] += 5000
+                            wire.revision += 1
+                    if fail_strong_read:
+                        raise cb.BrokerError('injected_read_failure')
+                return original(method, host, path, value)
+            if host == 'firestore.googleapis.com' and method == 'POST':
+                seen['posts'] += 1
+                seen['conditions'].append(value['writes'][0]['currentDocument'].get('updateTime'))
+                if seen['posts'] == 1:
+                    result = original(method, host, path, value)
+                    seen['leased_stamp'] = wire.stamp
+                    return result
+                if seen['posts'] == 2 and apply_abort:
+                    original(method, host, path, value)
+                    raise cb.MutationUncertain('injected_lost_ack')
+                if seen['posts'] == 2:
+                    raise cb.MutationUncertain('injected_lost_ack')
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+        return seen
+
+    def test_uncertain_abort_with_a_failed_strong_read_quarantines_on_the_original_stamp(self):
+        seen = self._uncertain_abort(fail_strong_read=True)
+        with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
+            self.acquire()
+        self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
+        self.assertEqual(self.wire.state['phase'], 'quarantined')
+        self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
+        self.assertEqual(seen['conditions'][1], seen['leased_stamp'])
+        self.assertEqual(seen['conditions'][2], seen['leased_stamp'])
+        self.assertNotEqual(seen['conditions'][0], seen['leased_stamp'])
+
+    def test_uncertain_abort_strong_read_failure_does_not_quarantine_a_restamp(self):
+        seen = self._uncertain_abort(fail_strong_read=True, restamp=True)
+        before = seen  # populated as the call runs
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$') as caught:
+            self.acquire()
+        self.assertNotIsInstance(caught.exception, cb.Conflict)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(before['conditions'][-1], before['leased_stamp'])
+        self.assertGreater(self.wire.state['lease_until_ms'], 1000 * 1000 + 30 * 1000)
+        self.assertEqual(self.wire.revision, 3)
+
+    def test_strong_read_of_a_landed_abort_or_a_restamp_answers_503(self):
+        seen = self._uncertain_abort(apply_abort=True)
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self._assert_clean_release()
+        self.assertEqual(seen['posts'], 2)
+        self.setUp()
+        seen = self._uncertain_abort(restamp=True)
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(seen['posts'], 2)
+        self.assertGreater(self.wire.state['lease_until_ms'], 1000 * 1000 + 30 * 1000)
+
     def test_definitive_fence_or_version_loss_still_quarantines(self):
         self._stall_rest('fence')
         with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
