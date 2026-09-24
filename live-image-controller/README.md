@@ -1,6 +1,17 @@
-# Controller image from this checkout
+# Controller images from this checkout
 
-Same image as the `live-image-controller-live-20260922c` pack (Dockerfile layout, base `python:3.12-slim-bookworm`, non-root uid 10001, build-time test lines), with sources taken from this repository instead of a copied pack. The build context is the repository root.
+Two images share the pinned `python:3.12-slim-bookworm` digest, uid 10001, and the in-image unittest lines. Sources come from this repository. The build context is the repository root.
+
+| Image | Dockerfile | What it installs | Cloud Run service |
+| --- | --- | --- | --- |
+| Fleet controller | `Dockerfile` | standard library only; no pip | `runcrew-live-fleet` (`RUNCREW_ROLE=fleet`) |
+| Live broker | `Dockerfile.broker` | the six pinned distributions in `requirements-broker.txt` | `runcrew-live-broker` (`RUNCREW_ROLE=broker`) |
+
+The fleet controller does not verify ID tokens. Only the broker image installs google-auth. `Dockerfile.broker` runs `serve.py --check-broker` at build time, and `dynamic_broker.main` runs the same offline RS256 check before it listens. A broker image without the library exits at startup, so Cloud Run keeps the previous revision, instead of answering `401 authentication_required` to every worker. `serve.py --check` does not import google-auth; the fleet image must still pass it. Do not deploy `Dockerfile.broker` to `runcrew-live-fleet`, and do not deploy the fleet `Dockerfile` to `runcrew-live-broker`.
+
+## Fleet image
+
+Same layout as the `live-image-controller-live-20260922c` pack, with sources taken from this repository.
 
 Build (from the repository root, under the deployer identity, never the shared human account):
 
@@ -10,7 +21,18 @@ The config runs the build as `runcrew-op-deploy` (`serviceAccount` in `cloudbuil
 
 The build fails if `test_fleet_controller.py` (14 tests, including the reset checks), `test_dynamic_broker_review.py`, `test_dynamic_broker.py` or `serve.py --check` fail, so a build status of `SUCCESS` from `gcloud builds describe <id>` is the gate: Docker does not produce an image if any RUN line fails. Build logs go to Cloud Logging only (as in the pack); reading them is optional. The base image is the tag `python:3.12-slim-bookworm`, as in the pack; after the first build, pin the digest it resolved (from the build's pull line) in the Dockerfile for reproducibility.
 
-Deploy as a new revision of the service `runcrew-live-fleet`, keeping every existing environment variable name, the `/run/config/fleet.json` mount, the service account and `RUNCREW_ROLE=fleet`; only the image changes:
+## Broker image
+
+Build with `cloudbuild.broker.json`. It uses `Dockerfile.broker` and the same `runcrew-op-deploy` service account pin as `cloudbuild.json`. The image tag is `controller-worker:live-20260924a-broker`.
+
+    gcloud builds submit --config live-image-controller/cloudbuild.broker.json \
+      --gcs-source-staging-dir=gs://project-0c6d31fa-509e-4116-a2c_cloudbuild/source .
+
+Deploy that image only as a new revision of `runcrew-live-broker`, keeping the existing environment variable names, the `/run/config/live-broker.json` mount, the service account and `RUNCREW_ROLE=broker`. The build also runs the fleet image's `--check`, then `--check-broker`.
+
+## Fleet deploy
+
+Deploy the fleet image (not the broker tag) as a new revision of the service `runcrew-live-fleet`, keeping every existing environment variable name, the `/run/config/fleet.json` mount, the service account and `RUNCREW_ROLE=fleet`; only the image changes:
 
     gcloud run services update runcrew-live-fleet --region us-central1 \
       --image us-central1-docker.pkg.dev/project-0c6d31fa-509e-4116-a2c/runcrew-hub/controller-worker:live-20260923a

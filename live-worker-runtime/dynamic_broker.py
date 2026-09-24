@@ -201,6 +201,11 @@ def load_client(path):
 
 
 def main():
+    # Before listen. A missing google-auth install must exit so Cloud Run keeps
+    # the previous revision. Reaching HTTP would turn that ImportError into
+    # authentication_required and 401 every worker.
+    import broker_auth_check
+    broker_auth_check.check()
     base.require(os.name == 'posix' and os.geteuid() != 0 and os.environ.get('K_SERVICE')
                  and os.environ.get('K_REVISION'), 'cloud_rootless_service_required')
     audience, policies = parse_config(base.read_protected('/run/config/live-broker.json'))

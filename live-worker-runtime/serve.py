@@ -1,7 +1,9 @@
 """Controller image entrypoint: RUNCREW_ROLE selects the live broker or the fleet controller.
 
 Both read only their root-owned protected config under /run/config and run as the
-rootless service identity. --check verifies imports without any network call.
+rootless service identity. --check verifies imports without any network call and
+does not import google-auth, so the stdlib fleet image stays green. --check-broker
+proves the broker image can verify an RS256 token offline.
 """
 import json
 import os
@@ -19,6 +21,11 @@ def main():
     if sys.argv[1:] == ['--check']:
         import dynamic_broker, cloud_runtime, fleet_controller  # noqa: F401
         print(json.dumps({'status': 'image_ok', 'roles': sorted(ROLES), 'credentials_included': False}), flush=True)
+        return 0
+    if sys.argv[1:] == ['--check-broker']:
+        import broker_auth_check
+        broker_auth_check.check()
+        print(json.dumps({'status': 'broker_auth_ok'}), flush=True)
         return 0
     if sys.argv[1:]:
         raise RuntimeError('unsupported_arguments')

@@ -1,7 +1,7 @@
-# Fleet controller image: standard library only, no native CLI, no credential.
-# The live broker image is Dockerfile.broker. Do not add a package install here.
-# Build context is the repository root:  docker build -f live-image-controller/Dockerfile .
-# Same layout and checks as the live-image-controller-live-20260922c pack; sources come from this checkout.
+# Live broker image: same layout as Dockerfile, plus the pinned google-auth closure.
+# Fleet controller stays on Dockerfile (standard library only). This file is the
+# image for runcrew-live-broker. Build context is the repository root:
+#   docker build -f live-image-controller/Dockerfile.broker .
 # Pinned to the digest the live-20260923a build resolved (revision runcrew-live-fleet-00008-2v8).
 FROM python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
 RUN groupadd --gid 10001 worker && useradd --uid 10001 --gid worker --no-create-home --shell /usr/sbin/nologin worker && install -d -o root -g root -m 0755 /opt/runcrew/app /run/config
@@ -19,9 +19,13 @@ COPY --chown=0:0 live-worker-runtime/tests/__init__.py live-worker-runtime/tests
 RUN chmod -R a-w /opt/runcrew/app && find /opt/runcrew/app -name __pycache__ -prune -exec rm -rf {} +
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/tmp
 WORKDIR /opt/runcrew/app
+COPY live-image-controller/requirements-broker.txt /tmp/requirements-broker.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/requirements-broker.txt
+RUN rm -f /tmp/requirements-broker.txt
 USER 10001:10001
 RUN python -I -B -m unittest discover -s /opt/runcrew/app/tests -t /opt/runcrew/app -p "test_fleet_controller.py" -q
 RUN python -I -B -m unittest discover -s /opt/runcrew/app/tests -t /opt/runcrew/app -p "test_dynamic_broker_review.py" -q
 RUN python -I -B -m unittest discover -s /opt/runcrew/app -t /opt/runcrew/app -p "test_dynamic_broker.py" -q
 RUN python -I -B /opt/runcrew/app/serve.py --check
+RUN python -I -B /opt/runcrew/app/serve.py --check-broker
 ENTRYPOINT ["python","-I","-B","/opt/runcrew/app/serve.py"]
