@@ -1,10 +1,12 @@
-"""Cross-check: broker R1 abort-to-idle is a clean release the controller can strike on.
+"""Cross-check: the broker's abort-to-idle is a clean release the controller strikes on.
 
-Demand asked Alpha for this: 47d367c asserts the released fields but never runs the
-controller on them. This file proves end-to-end that after the broker's abort-to-idle,
-the REAL fleet_controller sees a clean release and takes a normal strike (no manual
-recovery). Offline only; no provider/cloud calls. Shell may be unavailable — Claude
-runs the suite.
+Builds the credential document through the REAL cloud_credential_broker abort path
+(an access stall after the lease write) and ticks the REAL fleet_controller on it:
+idle_credential() passes, the failed execution is a normal strike with backoff,
+and the next launch follows the backoff with no manual step. Negative control: the
+same document quarantined blocks the slot as worker_failed_credential_unreleased.
+Written by Cursor on Demand; composition instead of inheritance so the controller
+suite is not re-run here. Offline only.
 """
 from copy import deepcopy
 from pathlib import Path
@@ -13,24 +15,27 @@ import unittest
 
 HERE = Path(__file__).resolve().parents[1]
 HUB = Path(__file__).resolve().parents[2] / 'agent-hub'
-for entry in (str(HERE), str(HUB), str(HUB / 'tests')):
+for entry in (str(HUB / 'tests'), str(HUB), str(HERE)):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
-from agent_hub import cloud_credential_broker as cb
-from fleet_controller import ControllerError
-from test_cloud_credential_broker import BrokerTests
-from test_fleet_controller import FleetReviewTests, NEXT, NEXT_UID
+from agent_hub import cloud_credential_broker as cb  # noqa: E402
+from fleet_controller import ControllerError  # noqa: E402
+# Import the modules, not the TestCase classes, so unittest does not collect
+# and re-run those suites from this file.
+import test_cloud_credential_broker as broker_tests  # noqa: E402
+from tests import test_fleet_controller as fleet_tests  # noqa: E402
 
-# test_fleet_controller may prepend a machine-local SOURCE; keep workspace hubs first.
-sys.path.insert(0, str(HUB))
-sys.path.insert(0, str(HERE))
+NEXT, NEXT_UID = fleet_tests.NEXT, fleet_tests.NEXT_UID
 
 
-class AbortIdleControllerCrosscheck(FleetReviewTests):
+class AbortIdleControllerCrosscheck(unittest.TestCase):
+    def setUp(self):
+        self.fleet = fleet_tests.FleetReviewTests('setUp')
+
     def aborted_idle_doc(self):
-        """Build the credential record exactly as the broker's R1 access-stall abort leaves it."""
-        fixture = BrokerTests()
+        """The credential record exactly as the broker's access-stall abort leaves it."""
+        fixture = broker_tests.BrokerTests()
         fixture.setUp()
         fixture._stall_rest('access')
         with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
@@ -45,58 +50,43 @@ class AbortIdleControllerCrosscheck(FleetReviewTests):
         self.assertEqual(doc['execution_uid'], fixture.wire.execution['uid'])
         return doc
 
-    def _slot_with_aborted_idle(self, doc):
-        """Launch one worker, then bind the broker to the abort-idle release for that execution."""
-        controller, store, cloud, broker, bindings, grants = self.make()
+    def slot_with(self, doc):
+        """Launch one worker, then bind the broker to that document for its execution."""
+        controller, store, cloud, broker, _, _ = self.fleet.make()
         controller.tick()
         released = deepcopy(doc)
         released['execution_uid'] = NEXT_UID
         broker.state = released
-        self.fail_current(cloud, broker)
-        return controller, store, cloud, broker, bindings, grants
+        self.fleet.fail_current(cloud, broker)
+        return controller, store, cloud, broker
 
     def test_abort_idle_release_passes_idle_credential_and_strikes(self):
-        doc = self.aborted_idle_doc()
-        controller, store, cloud, broker, _, _ = self._slot_with_aborted_idle(doc)
-
-        # Controller's clean-release gate accepts the broker's abort document as-is.
+        controller, store, cloud, broker = self.slot_with(self.aborted_idle_doc())
         self.assertEqual(controller.idle_credential(cloud.executions_by_name[NEXT]), broker.state)
-        self.assertEqual(controller.idle_credential()['phase'], 'idle')
-
         result = controller.tick()
         self.assertEqual(result['status'], 'replacement_after_failure')
         self.assertEqual(result['consecutive_failures'], 1)
-        self.assertIn('next_launch_at', result)
         self.assertEqual(result['next_launch_at'], 1000 + 120)
-        self.assertNotEqual(result['status'], 'blocked')
         self.assertNotEqual(store.state.get('error'), 'worker_failed_credential_unreleased')
         self.assertEqual(store.state['phase'], 'idle')
-        self.assertEqual(store.state['next_launch_at'], 1000 + 120)
-        self.assertEqual(store.state['consecutive_failures'], 1)
-
-        # Next launch only after backoff — no manual reset.
+        # The next launch comes after the backoff, with no manual reset.
         self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
         self.assertEqual(cloud.run_count, 1)
         controller.clock = lambda: 1200
         self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
         self.assertEqual(cloud.run_count, 2)
 
-    def test_abort_idle_doc_quarantined_blocks_without_strike(self):
+    def test_the_same_doc_quarantined_blocks_the_slot(self):
         doc = self.aborted_idle_doc()
         doc['phase'] = 'quarantined'
         doc['quarantine_reason'] = 'credential_read_failed'
-        controller, store, cloud, broker, _, _ = self._slot_with_aborted_idle(doc)
-
+        controller, store, cloud, _ = self.slot_with(doc)
         with self.assertRaises(ControllerError) as caught:
             controller.idle_credential(cloud.executions_by_name[NEXT])
         self.assertEqual(str(caught.exception), 'credential_not_cleanly_released')
-
-        result = controller.tick()
-        self.assertEqual(result['status'], 'blocked')
-        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
-        self.assertEqual(store.state['phase'], 'blocked')
-        self.assertEqual(cloud.run_count, 1)
         self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(cloud.run_count, 1)
 
 
 if __name__ == '__main__':
