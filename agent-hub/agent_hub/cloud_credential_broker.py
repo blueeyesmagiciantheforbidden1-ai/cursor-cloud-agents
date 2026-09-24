@@ -540,15 +540,20 @@ class CloudCredentialBroker:
         state, stamp = self._read()
         # This call has not handed bytes to its caller. An idempotent re-entry
         # is a repeat of a request whose response never arrived: it re-stamps
-        # the lease, and a transient failure before the return aborts that new
-        # stamp. A stale attempt still holds the older stamp and cannot win.
+        # the lease, and both a transient abort and a definitive quarantine use
+        # that new stamp. A stale attempt still holds the older stamp and cannot
+        # win. A branch that never receives its own stamp only raises: the
+        # write's exception propagates and nothing further is written.
+        owned_stamp = None
         if (state['phase'] == 'leased' and state['lease_id'] == request_id
                 and state['execution'] == execution and state['execution_uid'] == observed['uid']):
             _require(state['lease_until_ms'] > self._now(), 'lease_expired_reconciliation_required')
             # Delivery and a stalled attempt's abort compete for one stamp.
             # Bytes are returned only after this CAS.
-            state = {**state, 'lease_until_ms': self._now() + self.lease_seconds * 1000}
-            stamp = self._write(state, stamp)
+            restamped = {**state, 'lease_until_ms': self._now() + self.lease_seconds * 1000}
+            stamp = self._write(restamped, stamp)
+            owned_stamp = stamp
+            state = restamped
         else:
             # A deadline does not fence a provider refresh in an old container.
             # Therefore no expired, quarantined or committing lease is stolen.
@@ -564,6 +569,7 @@ class CloudCredentialBroker:
                      'lease_until_ms': self._now() + self.lease_seconds * 1000,
                      'intent_id': '', 'intent_digest': '', 'commit_version': '', 'quarantine_reason': ''}
             stamp = self._write(state, stamp)
+            owned_stamp = stamp
         lease = Lease(self.config.profile, self.config.account_ref, self.config.canonical_account_ref,
                       state['fence'], state['version'], request_id, execution, observed['uid'], b'')
         # _access and assert_current run after the lease write. Keep the
@@ -577,25 +583,35 @@ class CloudCredentialBroker:
                 # No bytes were returned to this caller. CAS the leased state
                 # this call wrote straight to idle on its own stamp. Never
                 # re-read and never quarantine on whatever stamp is current.
+                # No owned stamp: the failure stands and nothing is written.
+                if owned_stamp is None:
+                    raise
                 try:
-                    released = self._release_unserved_lease(lease, stamp, state)
+                    released = self._release_unserved_lease(lease, owned_stamp, state)
                 except Conflict:
                     # The document moved, often because another attempt
                     # re-stamped and delivered. Do not quarantine that lease.
+                    # A transient failure still answers 503 so the caller may retry.
                     raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
                 if released == 'quarantined':
                     raise BrokerError('credential_acquisition_unavailable') from None
                 raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
-            except BrokerError:
+            except BrokerError as error:
                 # Definitive read failure (checksum, lease no longer active).
-                # Quarantine only by CAS on the stamp this call wrote. A
-                # Conflict means a later attempt already advanced the document
-                # (delivered, committing, or committed): write nothing and 503.
+                # Quarantine only by CAS on the stamp this call wrote.
                 # acquire() never calls quarantine() or _best_quarantine().
+                # No owned stamp: re-raise and write nothing.
+                if owned_stamp is None:
+                    raise
                 try:
-                    quarantined = self._quarantine_on_stamp(lease, stamp, state)
+                    quarantined = self._quarantine_on_stamp(lease, owned_stamp, state)
                 except Conflict:
-                    raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
+                    # The delivered worker already advanced the document
+                    # (leased, committing, or committed). The CAS wrote nothing.
+                    # Re-raise the original definitive error so the service
+                    # answers 409. Do not answer 503: this attempt must not be
+                    # retried as if its lease were still pending.
+                    raise error from None
                 if quarantined == 'quarantined':
                     raise BrokerError('credential_acquisition_unavailable') from None
                 raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None

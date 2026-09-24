@@ -512,9 +512,13 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.wire.state['phase'], 'leased')
         self.assertEqual(self.wire.state['quarantine_reason'], '')
         self.assertEqual(self.wire.state['lease_until_ms'], original_until + 5000)
+        # Lease write, then one rejected abort CAS. That CAS does not commit,
+        # and nothing after it is posted.
         self.assertEqual(seen['phases'], ['leased', 'idle'])
+        self.assertNotIn('quarantined', seen['phases'])
         self.assertEqual(seen['conditions'][1], seen['leased_stamp'])
         self.assertNotEqual(self.wire.stamp, seen['leased_stamp'])
+        self.assertEqual(self.wire.revision, 3)
 
     def test_preread_of_a_committing_delivery_does_not_quarantine(self):
         def mutate(wire):
@@ -530,9 +534,13 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.wire.state['intent_id'], 'ab' * 16)
         self.assertEqual(self.wire.state['intent_digest'], 'cd' * 32)
         self.assertEqual(self.wire.state['quarantine_reason'], '')
+        # Lease write, then one rejected abort CAS. The committing document
+        # is unchanged: the CAS does not commit, and nothing after it is posted.
         self.assertEqual(seen['phases'], ['leased', 'idle'])
+        self.assertNotIn('quarantined', seen['phases'])
         self.assertEqual(seen['conditions'][1], seen['leased_stamp'])
         self.assertNotEqual(self.wire.stamp, seen['leased_stamp'])
+        self.assertEqual(self.wire.revision, 4)
 
     def test_late_access_success_after_delivery_and_commit_does_not_quarantine(self):
         started, delivered = threading.Event(), threading.Event()
@@ -558,8 +566,25 @@ class BrokerTests(unittest.TestCase):
         lease = self.broker.acquire(self.wire.execution['name'], '1' * 32)
         version = self.broker.commit(lease, b'opaque-refreshed-credential')
         self.assertEqual(self.wire.state['phase'], 'committed')
+        delivered_state = copy.deepcopy(self.wire.state)
+        delivered_revision = self.wire.revision
+        firestore_posts = lambda: [call for call in self.wire.calls
+                                    if call[:2] == ('POST', 'firestore.googleapis.com')]
+        posts_before = len(firestore_posts())
         delivered.set(); worker.join(5); self.assertFalse(worker.is_alive())
+        # The stale attempt's quarantine CAS conflicts. Firestore applies nothing,
+        # and no follow-up commit is posted. The original definitive error stands
+        # so the service answers 409, not 503.
+        self.assertEqual(self.wire.state, delivered_state)
+        self.assertEqual(self.wire.revision, delivered_revision)
         self.assertEqual(self.wire.state['phase'], 'committed')   # at 448702c: 'quarantined'
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(len(firestore_posts()), posts_before + 1)
+        self.assertEqual(str(holder['error']), 'credential_lease_not_active')
+        self.assertNotIsInstance(holder['error'], (cb.UpstreamUnavailable, cb.Conflict, cb.MutationUncertain))
+        self.assertNotIn('lease', holder)
+        from agent_hub.credential_broker_service import error_reply
+        self.assertEqual(error_reply(holder['error'])[:2], (409, {'error': 'broker_operation_rejected'}))
         self.broker.release(lease, version)
         self.assertEqual(self.wire.state['phase'], 'idle')
 
