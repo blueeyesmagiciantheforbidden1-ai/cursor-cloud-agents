@@ -38,6 +38,9 @@ MAX_CONFIG = 128 * 1024
 MAX_TOKEN = 16384
 PREFIX = '/v1/credentials/'
 ACTIONS = frozenset(('bootstrap', 'acquire', 'assert-current', 'renew', 'commit', 'release', 'quarantine'))
+# ID-token certificate fetch only. Transport, timeout and these 5xx statuses
+# become UpstreamUnavailable. A 429 or a rejected token stays authentication_required.
+CERTIFICATE_UPSTREAM_STATUSES = frozenset((500, 502, 503, 504))
 SHA = re.compile(r'[a-f0-9]{64}')
 UID = re.compile(r'(?:[a-fA-F0-9]{32}|[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})')
 ID = re.compile(r'[a-f0-9]{32}')
@@ -168,6 +171,11 @@ class GoogleIDAuthenticator:
                 'authentication_required')
         with self._lock:
             if self._certificates is None or self.clock() >= self._certificates_until:
+                # The lock is held across the fetch. A waiter that queued past
+                # its own request deadline fails here instead of starting another
+                # fetch; the fetch itself draws that same per-request deadline.
+                if backend._request_deadline.get() is not None:
+                    backend.upstream_call_budget()
                 try:
                     status, response_headers, data = exchange('www.googleapis.com', '/oauth2/v1/certs', limit=65536)
                 except UpstreamUnavailable:
@@ -176,7 +184,9 @@ class GoogleIDAuthenticator:
                     if str(error) in ('transport_failed', 'transport_limit'):
                         raise UpstreamUnavailable('authentication_upstream_unavailable') from None
                     raise
-                if status in UPSTREAM_HTTP_STATUSES:
+                except (TimeoutError, socket.timeout):
+                    raise UpstreamUnavailable('authentication_upstream_unavailable') from None
+                if status in CERTIFICATE_UPSTREAM_STATUSES:
                     raise UpstreamUnavailable('authentication_upstream_unavailable')
                 require(status == 200, 'authentication_required')
                 value = decode(data, 65536)

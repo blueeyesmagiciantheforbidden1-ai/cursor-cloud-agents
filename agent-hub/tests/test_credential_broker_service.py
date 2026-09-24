@@ -736,8 +736,118 @@ class ServiceTests(unittest.TestCase):
                 status, retry, raw = self._post(server, 'bootstrap', {})
             self.assertEqual((status, retry), (503, '2'))
             self.assertEqual(json.loads(raw), {'error': 'broker_upstream_unavailable'})
+            with patch.object(service, 'exchange', return_value=(429, {}, b'{}')):
+                status, retry, raw = self._post(server, 'bootstrap', {})
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(raw), {'error': 'authentication_required'})
         finally:
             self._stop(server, thread)
+
+    def test_certificate_timeout_is_upstream_and_a_bad_token_stays_401(self):
+        auth = service.GoogleIDAuthenticator(ENDPOINT)
+        url = 'https://www.googleapis.com/oauth2/v1/certs'
+        with patch.object(service, 'exchange', side_effect=TimeoutError('timed out')):
+            with self.assertRaisesRegex(backend.UpstreamUnavailable, '^authentication_upstream_unavailable$') as caught:
+                auth._certificate_request(url)
+        self.assertEqual(service.error_reply(caught.exception)[0], 503)
+        certs = json.dumps({'kid': '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n'}).encode()
+        with patch.object(service, 'exchange', return_value=(200, {}, certs)):
+            with self.assertRaisesRegex(service.BoundaryError, '^authentication_required$') as caught:
+                auth('Bearer aaaa.bbbb.cccc')
+        self.assertEqual(service.error_reply(caught.exception)[:2], (401, {'error': 'authentication_required'}))
+
+    def test_certificate_waiter_past_its_deadline_does_not_start_a_fetch(self):
+        auth = service.GoogleIDAuthenticator(ENDPOINT)
+        url = 'https://www.googleapis.com/oauth2/v1/certs'
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        holder_error = {}
+        waiter_error = {}
+
+        def exchange(*_args, **_kwargs):
+            calls.append(threading.get_ident())
+            entered.set()
+            release.wait(2)
+            raise service.BoundaryError('transport_failed')
+
+        def holder():
+            token = backend.begin_upstream_request()
+            try:
+                backend._request_deadline.set(time.monotonic() + 5)
+                auth._certificate_request(url)
+            except Exception as error:
+                holder_error['error'] = error
+            finally:
+                backend.end_upstream_request(token)
+
+        def waiter():
+            token = backend.begin_upstream_request()
+            try:
+                backend._request_deadline.set(time.monotonic() + 0.2)
+                self.assertTrue(entered.wait(2))
+                time.sleep(0.35)
+                auth._certificate_request(url)
+            except Exception as error:
+                waiter_error['error'] = error
+            finally:
+                backend.end_upstream_request(token)
+
+        with patch.object(service, 'exchange', side_effect=exchange):
+            first = threading.Thread(target=holder)
+            second = threading.Thread(target=waiter)
+            first.start()
+            self.assertTrue(entered.wait(2))
+            second.start()
+            time.sleep(0.5)
+            release.set()
+            first.join(3)
+            second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertIsInstance(holder_error['error'], backend.UpstreamUnavailable)
+        self.assertEqual(str(holder_error['error']), 'authentication_upstream_unavailable')
+        self.assertIsInstance(waiter_error['error'], backend.UpstreamUnavailable)
+        self.assertEqual(str(waiter_error['error']), 'upstream_request_budget_exhausted')
+        self.assertEqual(len(calls), 1)
+
+    def test_interleaved_requests_keep_separate_deadlines_on_the_shared_broker(self):
+        gate = threading.Barrier(2)
+        seen = {}
+        assign = threading.Lock()
+
+        def read():
+            with assign:
+                role = 'slow' if 'slow' not in seen else 'fast'
+                seen[role] = None
+            if role == 'slow':
+                backend._request_deadline.set(time.monotonic() + 0.2)
+                backend._post_mutation.set(True)
+            gate.wait(timeout=3)
+            seen[role] = backend.upstream_transport_limits()
+            return self.active
+
+        self.grant_store.read = read
+        server, thread = self._serve()
+        results = []
+
+        def post():
+            results.append(self._post(server, 'bootstrap', {}))
+
+        try:
+            workers = [threading.Thread(target=post), threading.Thread(target=post)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+        finally:
+            self._stop(server, thread)
+        self.assertEqual(seen['slow'], (backend.POST_MUTATION_SOCKET_SECONDS, backend.POST_MUTATION_WATCHDOG_SECONDS))
+        self.assertEqual(seen['fast'], (backend.UPSTREAM_BUDGET_SECONDS, backend.UPSTREAM_BUDGET_SECONDS))
+        self.assertEqual(sorted(item[0] for item in results), [200, 200])
+        self.assertIsNone(backend._request_deadline.get())
+        self.assertFalse(backend._post_mutation.get())
 
 
 class SignedIdentityTests(unittest.TestCase):
@@ -774,8 +884,9 @@ class SignedIdentityTests(unittest.TestCase):
             signed = self.token()
             parts = signed.split('.')
             parts[1] = base64.urlsafe_b64encode(b'{"sub":"attacker"}').decode().rstrip('=')
-            with self.assertRaisesRegex(backend.BrokerError, '^authentication_required$'):
+            with self.assertRaisesRegex(backend.BrokerError, '^authentication_required$') as caught:
                 auth('Bearer '+'.'.join(parts))
+            self.assertEqual(service.error_reply(caught.exception)[:2], (401, {'error': 'authentication_required'}))
         self.assertEqual(exchange.call_count, 1)
 
     def test_unsigned_stripped_tokens_never_accepted(self):

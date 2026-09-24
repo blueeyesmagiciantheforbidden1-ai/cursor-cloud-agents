@@ -217,10 +217,17 @@ class BrokerRenewTests(unittest.TestCase):
 
     def test_entrypoint_stamps_acquire_start(self):
         source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')
-        start = source.index('acquire_started = time.monotonic()')
-        record = source.index('broker_renew.record_acquire_start(lease.lease_id, acquire_started)')
-        self.assertLess(start, record)
-        self.assertIn('lease = acquire_lease(broker, request_id, started=acquire_started)', source[start:record])
+        acquire = source[source.index('def acquire_lease'):source.index('class Client')]
+        self.assertIn('except MutationUncertain:', acquire)
+        self.assertNotIn('except Conflict', acquire)
+        self.assertNotIn('uuid', acquire)
+        main = source[source.index('def main'):]
+        self.assertEqual(main.count('uuid.uuid4()'), 1)
+        start = main.index('acquire_started = time.monotonic()')
+        record = main.index('broker_renew.record_acquire_start(lease.lease_id, acquire_started)')
+        between = main[start:record]
+        self.assertEqual(between.count('time.monotonic()'), 1)
+        self.assertIn('lease = acquire_lease(broker, request_id, started=acquire_started)', between)
 
     def test_entrypoint_retries_acquire_once_with_the_same_request_id(self):
         from entrypoint import ACQUIRE_RETRY_SECONDS, acquire_lease
@@ -295,6 +302,9 @@ class BrokerRenewTests(unittest.TestCase):
         self.assertEqual(acquired.lease_id, request_id)
         self.assertEqual(acquired.auth_bytes, b'opaque')
         self.assertEqual(bodies, [b'{"request_id":"' + request_id.encode() + b'"}'] * 2)
+        broker_renew.record_acquire_start(acquired.lease_id, 0)
+        anchored = broker_renew.LeaseClock.for_lease(acquired, CodeError, 'grok', clock=lambda: 50)
+        self.assertEqual(anchored.renewed_at, 0)
         denied = [
             (503, {}, b'{"error":"broker_upstream_unavailable"}'),
             (409, {}, b'{"error":"broker_operation_rejected"}'),

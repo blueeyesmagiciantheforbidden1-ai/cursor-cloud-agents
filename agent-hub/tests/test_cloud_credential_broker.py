@@ -297,6 +297,81 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.wire.state['phase'], 'quarantined')
         self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
 
+    def test_idempotent_delivery_restamp_makes_the_stalled_abort_conflict(self):
+        """A same-request_id retry re-stamps before returning bytes.
+
+        The stalled attempt then aborts against the stamp from its own lease
+        write, loses with Conflict, and leaves the delivered lease in place.
+        """
+        started = threading.Event()
+        delivered = threading.Event()
+        stalled = {'done': False}
+        original = self.broker.rest.request
+        holder = {}
+
+        def request(method, host, path, value=None):
+            if (not stalled['done'] and method == 'GET' and host == 'secretmanager.googleapis.com'
+                    and path.endswith(':access')):
+                stalled['done'] = True
+                started.set()
+                delivered.wait(5)
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+
+        def first():
+            try:
+                self.broker.acquire(self.wire.execution['name'], '1' * 32)
+            except Exception as error:
+                holder['error'] = error
+
+        worker = threading.Thread(target=first)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        after_lease = self.wire.revision
+        self.now = 1010.0
+        lease = self.broker.acquire(self.wire.execution['name'], '1' * 32)
+        self.assertEqual(lease.auth_bytes, b'opaque-first-credential')
+        self.assertEqual(self.wire.revision, after_lease + 1)
+        renewed_until = self.wire.state['lease_until_ms']
+        self.assertEqual(renewed_until, 1010 * 1000 + 30 * 1000)
+        delivered.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(holder['error'], cb.UpstreamUnavailable)
+        self.assertEqual(str(holder['error']), 'credential_acquisition_upstream_unavailable')
+        self.assertNotIsInstance(holder['error'], cb.Conflict)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(self.wire.state['lease_until_ms'], renewed_until)
+        self.assertEqual(self.wire.state['fence'], 1)
+        self.assertEqual(self.wire.revision, after_lease + 1)
+        self.assertEqual(self.wire.secret_reads, 1)
+
+    def test_abort_before_the_retry_consumes_the_request_id(self):
+        original = self.broker.rest.request
+
+        def request(method, host, path, value=None):
+            if method == 'GET' and host == 'secretmanager.googleapis.com' and path.endswith(':access'):
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self.assertEqual(self.wire.state['phase'], 'idle')
+        self.assertEqual(self.wire.state['last_release_id'], '1' * 32)
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.broker.rest.request = original
+        with self.assertRaisesRegex(cb.BrokerError, '^execution_already_consumed$'):
+            self.acquire()
+        self.assertEqual(self.wire.state['phase'], 'idle')
+        self.assertEqual(self.wire.state['fence'], 1)
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(self.wire.secret_reads, 0)
+
     def test_pre_mutation_reads_stop_when_the_request_budget_is_spent(self):
         original = self.broker.rest.request
 

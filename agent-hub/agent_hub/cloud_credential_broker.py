@@ -28,8 +28,10 @@ MAX_CREDENTIAL_BYTES = 64 * 1024  # Secret Manager's actual per-version limit.
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_CONTROL_BYTES = 16 * 1024
 # Pre-mutation reads: 8s per call, drawn down from a 12s per-request deadline.
-# Both sit under the worker client's 15s exchange budget. The deadline is per
-# request thread, never a process-wide clock.
+# Both sit under the worker client's 15s exchange budget. The deadline and the
+# post-mutation flag are ContextVars: one value per request thread, not fields
+# of the CloudCredentialBroker or GoogleREST that ThreadingHTTPServer shares
+# across requests.
 # Post-mutation calls (after the lease write, or after the commit intent write)
 # use the historical 10s socket and 15s watchdog and ignore that deadline, so a
 # slow call that used to succeed is not turned into a quarantine.
@@ -460,12 +462,13 @@ class CloudCredentialBroker:
             # Only a strong read of this exact unique intent can resolve a lost
             # acknowledgement. CAS conflicts never enter this recovery branch.
             try:
-                actual, _ = self._read()
+                actual, observed = self._read()
                 if actual == state:
-                    return
+                    return observed
             except BrokerError:
                 pass
             raise MutationUncertain('control_write_unconfirmed') from None
+        return results[0]['updateTime']
 
     def _access(self, version):
         name = _version(self.config, version)
@@ -512,13 +515,18 @@ class CloudCredentialBroker:
         observed = self._execution_status(execution)
         _require(not observed.get('completionTime') and not observed.get('deleteTime'), 'execution_already_terminal')
         state, stamp = self._read()
-        # Abort applies only to a lease this call just wrote. An idempotent
-        # re-entry already returned credential bytes to a caller; idling it
-        # would strand that caller.
+        # Abort applies only to a lease this call just wrote, and only against
+        # the stamp that write acknowledged. An idempotent re-entry re-stamps
+        # the same lease before it returns bytes, so this abort then loses.
         fresh = False
         if (state['phase'] == 'leased' and state['lease_id'] == request_id
                 and state['execution'] == execution and state['execution_uid'] == observed['uid']):
             _require(state['lease_until_ms'] > self._now(), 'lease_expired_reconciliation_required')
+            # Delivery and a stalled attempt's abort compete for one stamp.
+            # Bytes are returned only after this CAS. The abort still holds the
+            # stamp from its own lease write, so it loses with Conflict.
+            state = {**state, 'lease_until_ms': self._now() + self.lease_seconds * 1000}
+            self._write(state, stamp)
         else:
             # A deadline does not fence a provider refresh in an old container.
             # Therefore no expired, quarantined or committing lease is stolen.
@@ -533,7 +541,7 @@ class CloudCredentialBroker:
                      'execution': execution, 'execution_uid': observed['uid'],
                      'lease_until_ms': self._now() + self.lease_seconds * 1000,
                      'intent_id': '', 'intent_digest': '', 'commit_version': '', 'quarantine_reason': ''}
-            self._write(state, stamp)
+            stamp = self._write(state, stamp)
             fresh = True
         lease = Lease(self.config.profile, self.config.account_ref, self.config.canonical_account_ref,
                       state['fence'], state['version'], request_id, execution, observed['uid'], b'')
@@ -546,13 +554,17 @@ class CloudCredentialBroker:
                 self.assert_current(lease)
             except UpstreamUnavailable:
                 # No bytes were returned and no native process can have started.
-                # Idle this exact lease so the controller can relaunch. Quarantine
-                # only when that abort cannot be confirmed, or the lease is no
-                # longer exactly the one just written. A lease this call did not
-                # write already served its bytes; leave it leased.
+                # Idle this exact lease so the controller can relaunch. A lease
+                # this call did not write already served its bytes; leave it leased.
                 if not fresh:
                     raise
-                if not self._release_unserved_lease(lease):
+                try:
+                    released = self._release_unserved_lease(lease, stamp)
+                except Conflict:
+                    # The document moved, often because the same request_id
+                    # re-stamped and delivered. Do not quarantine that lease.
+                    raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
+                if not released:
                     self._best_quarantine(lease, 'credential_read_failed')
                     raise BrokerError('credential_acquisition_unavailable') from None
                 raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
@@ -564,10 +576,16 @@ class CloudCredentialBroker:
         finally:
             end_post_mutation(post)
 
-    def _release_unserved_lease(self, lease):
-        """CAS the just-written lease back to a clean idle release. False if unconfirmed."""
+    def _release_unserved_lease(self, lease, stamp):
+        """CAS the just-written lease back to idle, on the stamp that write returned.
+
+        False when the outcome is unconfirmed (MutationUncertain) or the read
+        shows this lease is no longer the one just written. Conflict propagates:
+        another writer advanced the document, and quarantining it could idle a
+        lease whose bytes were already delivered.
+        """
         try:
-            state, stamp = self._read()
+            state, _current = self._read()
             self._owned(state, lease)
             if state['phase'] != 'leased' or state['version'] != lease.version:
                 return False
@@ -575,6 +593,8 @@ class CloudCredentialBroker:
                          'last_release_id': lease.lease_id,
                          'last_release_fence': lease.fence,
                          'last_release_version': lease.version}, stamp)
+        except Conflict:
+            raise
         except (UpstreamUnavailable, MutationUncertain, BrokerError):
             return False
         return True

@@ -33,7 +33,11 @@ _acquire_started = {}
 
 
 def record_acquire_start(lease_id, started):
-    """entrypoint only: time.monotonic() taken just before broker.acquire."""
+    """entrypoint only: monotonic time taken before the first acquire attempt.
+
+    When that attempt is retried, ``started`` is still the first attempt, not
+    the retry. The renew tolerance window is anchored there.
+    """
     _acquire_started[lease_id] = started
 
 

@@ -825,9 +825,9 @@ class FleetReviewTests(unittest.TestCase):
         aborts = []
         release = broker._release_unserved_lease
 
-        def spy(lease):
+        def spy(lease, stamp):
             aborts.append(lease.lease_id)
-            return release(lease)
+            return release(lease, stamp)
 
         broker._release_unserved_lease = spy
         broker.rest = self._stall(wire, 'access')
@@ -893,9 +893,9 @@ class FleetReviewTests(unittest.TestCase):
         aborts.clear()
         release = broker._release_unserved_lease
 
-        def spy(lease):
+        def spy(lease, stamp):
             aborts.append(lease.lease_id)
-            return release(lease)
+            return release(lease, stamp)
 
         broker._release_unserved_lease = spy
         served = broker.acquire(NEXT, '3' * 32)

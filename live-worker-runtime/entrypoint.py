@@ -29,7 +29,12 @@ ACQUIRE_RETRY_SECONDS = 20
 
 
 def acquire_lease(broker, request_id, *, started, clock=time.monotonic):
-    """Return the lease, retrying this request_id once on a transient result."""
+    """Return the lease, retrying this request_id once on a transient result.
+
+    ``started`` is the first attempt. A 409 or any other definitive broker
+    error, including one from the retry, is final: the caller exits and does
+    not mint a second request_id.
+    """
     try:
         return broker.acquire(broker.execution, request_id)
     except MutationUncertain:
@@ -95,14 +100,16 @@ def main():
     token = os.environ.pop('HUB_AGENT_TOKEN', '')
     if not token or '\r' in token or '\n' in token: raise RuntimeError('hub_token_required')
     # Acquire before any native process starts. The request ID is unique for
-    # this process. acquire_lease may repeat that same id once; it does not
-    # start a second acquisition or retry the execution.
+    # this process. acquire_lease may repeat that same id once; a 409 on either
+    # attempt is final and this process does not mint another request_id.
     request_id = uuid.uuid4().hex
     home = Path('/home/worker') / ('live-' + request_id)
     intent = Path('/home/worker') / ('acquire-' + request_id + '.json')
     with intent.open('x', encoding='utf-8') as stream:
         json.dump({'request_id': request_id, 'execution_uid': broker.execution_uid}, stream)
         stream.flush(); os.fsync(stream.fileno())
+    # Anchor the renew clock at the first attempt, including when acquire_lease
+    # spends time on one retry before it returns.
     acquire_started = time.monotonic()
     lease = acquire_lease(broker, request_id, started=acquire_started)
     broker_renew.record_acquire_start(lease.lease_id, acquire_started)
