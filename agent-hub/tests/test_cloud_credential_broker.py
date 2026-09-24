@@ -534,6 +534,35 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(seen['conditions'][1], seen['leased_stamp'])
         self.assertNotEqual(self.wire.stamp, seen['leased_stamp'])
 
+    def test_late_access_success_after_delivery_and_commit_does_not_quarantine(self):
+        started, delivered = threading.Event(), threading.Event()
+        stalled = {'done': False}
+        original = self.broker.rest.request
+        def request(method, host, path, value=None):
+            if (not stalled['done'] and method == 'GET' and host == 'secretmanager.googleapis.com'
+                    and path.endswith(':access')):
+                stalled['done'] = True
+                started.set()
+                delivered.wait(5)          # stall, then SUCCEED (no raise)
+            return original(method, host, path, value)
+        self.broker.rest.request = request
+        holder = {}
+        def first():
+            try:
+                holder['lease'] = self.broker.acquire(self.wire.execution['name'], '1' * 32)
+            except Exception as error:
+                holder['error'] = error
+        worker = threading.Thread(target=first); worker.start()
+        self.assertTrue(started.wait(5))
+        self.now = 1010.0
+        lease = self.broker.acquire(self.wire.execution['name'], '1' * 32)
+        version = self.broker.commit(lease, b'opaque-refreshed-credential')
+        self.assertEqual(self.wire.state['phase'], 'committed')
+        delivered.set(); worker.join(5); self.assertFalse(worker.is_alive())
+        self.assertEqual(self.wire.state['phase'], 'committed')   # at 448702c: 'quarantined'
+        self.broker.release(lease, version)
+        self.assertEqual(self.wire.state['phase'], 'idle')
+
     def test_idempotent_restamp_aborts_on_its_own_stamp(self):
         self.acquire()
         original = self.broker.rest.request

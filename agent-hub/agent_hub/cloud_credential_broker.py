@@ -587,8 +587,18 @@ class CloudCredentialBroker:
                     raise BrokerError('credential_acquisition_unavailable') from None
                 raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
             except BrokerError:
-                self._best_quarantine(lease, 'credential_read_failed')
-                raise BrokerError('credential_acquisition_unavailable') from None
+                # Definitive read failure (checksum, lease no longer active).
+                # Quarantine only by CAS on the stamp this call wrote. A
+                # Conflict means a later attempt already advanced the document
+                # (delivered, committing, or committed): write nothing and 503.
+                # acquire() never calls quarantine() or _best_quarantine().
+                try:
+                    quarantined = self._quarantine_on_stamp(lease, stamp, state)
+                except Conflict:
+                    raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
+                if quarantined == 'quarantined':
+                    raise BrokerError('credential_acquisition_unavailable') from None
+                raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
             return Lease(lease.profile, lease.account_ref, lease.canonical_account_ref, lease.fence,
                          lease.version, lease.lease_id, lease.execution, lease.execution_uid, body)
         finally:
