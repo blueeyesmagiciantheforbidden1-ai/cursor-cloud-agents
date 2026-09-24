@@ -588,6 +588,34 @@ class BrokerTests(unittest.TestCase):
         self.broker.release(lease, version)
         self.assertEqual(self.wire.state['phase'], 'idle')
 
+    def test_abort_write_transport_failure_after_delivery_must_not_quarantine(self):
+        started, delivered = threading.Event(), threading.Event()
+        stalled, fail_posts, holder = {'done': False}, {'on': False}, {}
+        original = self.broker.rest.request
+        def request(method, host, path, value=None):
+            if (not stalled['done'] and method == 'GET' and host == 'secretmanager.googleapis.com'
+                    and path.endswith(':access')):
+                stalled['done'] = True; started.set(); delivered.wait(5)
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            if fail_posts['on'] and host == 'firestore.googleapis.com' and method == 'POST':
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            return original(method, host, path, value)
+        self.broker.rest.request = request
+        def first():
+            try: self.broker.acquire(self.wire.execution['name'], '1' * 32)
+            except Exception as error: holder['error'] = error
+        worker = threading.Thread(target=first); worker.start()
+        self.assertTrue(started.wait(5))
+        self.now = 1010.0
+        lease = self.broker.acquire(self.wire.execution['name'], '1' * 32)
+        fail_posts['on'] = True
+        delivered.set(); worker.join(5); self.assertFalse(worker.is_alive())
+        fail_posts['on'] = False
+        self.assertIn('error', holder)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.now = 1020.0; self.broker.renew(lease)
+
     def test_idempotent_restamp_aborts_on_its_own_stamp(self):
         self.acquire()
         original = self.broker.rest.request

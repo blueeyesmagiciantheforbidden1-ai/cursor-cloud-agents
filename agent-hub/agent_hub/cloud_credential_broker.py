@@ -640,6 +640,10 @@ class CloudCredentialBroker:
         except MutationUncertain as error:
             return self._settle_uncertain_abort(lease, stamp, leased_state, error)
         except BrokerError:
+            # Transport and other definitive failures of the idle CAS quarantine
+            # on this same stamp. If that write also fails in transport, the
+            # exception propagates and nothing else is written: never a fresh
+            # read of the current stamp.
             return self._quarantine_on_stamp(lease, stamp, leased_state)
         return True
 
