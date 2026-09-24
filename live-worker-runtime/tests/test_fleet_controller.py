@@ -825,9 +825,9 @@ class FleetReviewTests(unittest.TestCase):
         aborts = []
         release = broker._release_unserved_lease
 
-        def spy(lease, stamp):
+        def spy(lease, stamp, leased_state):
             aborts.append(lease.lease_id)
-            return release(lease, stamp)
+            return release(lease, stamp, leased_state)
 
         broker._release_unserved_lease = spy
         broker.rest = self._stall(wire, 'access')
@@ -887,15 +887,17 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(wire.state['last_release_version'], wire.state['version'])
         self.assertEqual(wire.secret_reads, 1)
 
-        # Bytes already returned. A later stall, including a repeat acquire of
-        # this lease, must not idle it.
+        # assert_current is not an acquire. A stall there does not abort.
+        # A repeat acquire re-stamps because the previous response never
+        # arrived; if that attempt fails before returning bytes, it aborts
+        # on the re-stamp.
         broker, wire = self._broker_for(NEXT, NEXT_UID)
         aborts.clear()
         release = broker._release_unserved_lease
 
-        def spy(lease, stamp):
+        def spy(lease, stamp, leased_state):
             aborts.append(lease.lease_id)
-            return release(lease, stamp)
+            return release(lease, stamp, leased_state)
 
         broker._release_unserved_lease = spy
         served = broker.acquire(NEXT, '3' * 32)
@@ -917,17 +919,12 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(wire.state['last_release_id'], '')
         wire.request = original
         broker.rest = self._stall(wire, 'access')
-        with self.assertRaisesRegex(UpstreamUnavailable, '^google_upstream_unavailable$') as caught:
+        with self.assertRaisesRegex(UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
             broker.acquire(NEXT, '3' * 32)
-        self.assertNotEqual(str(caught.exception), 'credential_acquisition_upstream_unavailable')
-        self.assertEqual(aborts, [])
-        self.assertEqual(wire.state['phase'], 'leased')
-        self.assertEqual(wire.state['lease_id'], '3' * 32)
-        broker.rest = wire
-        again = broker.acquire(NEXT, '3' * 32)
-        self.assertEqual(again.auth_bytes, served.auth_bytes)
-        self.assertEqual(again.fence, served.fence)
-        self.assertEqual(wire.state['phase'], 'leased')
+        self.assertEqual(aborts, ['3' * 32])
+        self.assertEqual(wire.state['phase'], 'idle')
+        self.assertEqual(wire.state['last_release_id'], '3' * 32)
+        self.assertEqual(wire.state['quarantine_reason'], '')
 
         # An uncertain abort write falls back to quarantine, which idle_credential rejects.
         broker, wire = self._broker_for(NEXT, NEXT_UID)

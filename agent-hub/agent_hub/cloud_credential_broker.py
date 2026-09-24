@@ -116,6 +116,21 @@ def upstream_transport_limits():
     return budget, budget
 
 
+def require_pre_mutation_write_budget():
+    """Refuse a pre-mutation write when under 8s of the 12s deadline remain.
+
+    A 1-2s watchdog on that write becomes MutationUncertain. Post-mutation
+    calls, and calls outside a broker request, are unchanged.
+    """
+    if _post_mutation.get():
+        return
+    deadline = _request_deadline.get()
+    if deadline is None:
+        return
+    if deadline - time.monotonic() < UPSTREAM_BUDGET_SECONDS:
+        raise UpstreamUnavailable('upstream_request_budget_exhausted')
+
+
 def _require(condition, code):
     if not condition:
         raise BrokerError(code)
@@ -449,6 +464,7 @@ class CloudCredentialBroker:
         return state, raw['updateTime']
 
     def _write(self, state, update_time):
+        require_pre_mutation_write_budget()
         write = {'update': {'name': self.config.document_name, 'fields': _fields(state)},
                  'currentDocument': {'updateTime': update_time} if update_time else {'exists': False}}
         try:
@@ -522,18 +538,17 @@ class CloudCredentialBroker:
         observed = self._execution_status(execution)
         _require(not observed.get('completionTime') and not observed.get('deleteTime'), 'execution_already_terminal')
         state, stamp = self._read()
-        # Abort applies only to a lease this call just wrote, and only against
-        # the stamp that write acknowledged. An idempotent re-entry re-stamps
-        # the same lease before it returns bytes, so this abort then loses.
-        fresh = False
+        # This call has not handed bytes to its caller. An idempotent re-entry
+        # is a repeat of a request whose response never arrived: it re-stamps
+        # the lease, and a transient failure before the return aborts that new
+        # stamp. A stale attempt still holds the older stamp and cannot win.
         if (state['phase'] == 'leased' and state['lease_id'] == request_id
                 and state['execution'] == execution and state['execution_uid'] == observed['uid']):
             _require(state['lease_until_ms'] > self._now(), 'lease_expired_reconciliation_required')
             # Delivery and a stalled attempt's abort compete for one stamp.
-            # Bytes are returned only after this CAS. The abort still holds the
-            # stamp from its own lease write, so it loses with Conflict.
+            # Bytes are returned only after this CAS.
             state = {**state, 'lease_until_ms': self._now() + self.lease_seconds * 1000}
-            self._write(state, stamp)
+            stamp = self._write(state, stamp)
         else:
             # A deadline does not fence a provider refresh in an old container.
             # Therefore no expired, quarantined or committing lease is stolen.
@@ -549,7 +564,6 @@ class CloudCredentialBroker:
                      'lease_until_ms': self._now() + self.lease_seconds * 1000,
                      'intent_id': '', 'intent_digest': '', 'commit_version': '', 'quarantine_reason': ''}
             stamp = self._write(state, stamp)
-            fresh = True
         lease = Lease(self.config.profile, self.config.account_ref, self.config.canonical_account_ref,
                       state['fence'], state['version'], request_id, execution, observed['uid'], b'')
         # _access and assert_current run after the lease write. Keep the
@@ -560,21 +574,16 @@ class CloudCredentialBroker:
                 body = self._access(lease.version)
                 self.assert_current(lease)
             except UpstreamUnavailable:
-                # No bytes were returned and no native process can have started.
-                # Idle this exact lease so the controller can relaunch. A lease
-                # this call did not write already served its bytes; leave it leased.
-                if not fresh:
-                    raise
+                # No bytes were returned to this caller. CAS the leased state
+                # this call wrote straight to idle on its own stamp. Never
+                # re-read and never quarantine on whatever stamp is current.
                 try:
-                    released = self._release_unserved_lease(lease, stamp)
+                    released = self._release_unserved_lease(lease, stamp, state)
                 except Conflict:
-                    # The document moved, often because the same request_id
+                    # The document moved, often because another attempt
                     # re-stamped and delivered. Do not quarantine that lease.
                     raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
                 if released == 'quarantined':
-                    raise BrokerError('credential_acquisition_unavailable') from None
-                if not released:
-                    self._best_quarantine(lease, 'credential_read_failed')
                     raise BrokerError('credential_acquisition_unavailable') from None
                 raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
             except BrokerError:
@@ -585,34 +594,44 @@ class CloudCredentialBroker:
         finally:
             end_post_mutation(post)
 
-    def _release_unserved_lease(self, lease, stamp):
-        """CAS the just-written lease back to idle, on the stamp that write returned.
+    def _release_unserved_lease(self, lease, stamp, leased_state):
+        """CAS ``leased_state`` straight to idle on the stamp this call wrote.
 
-        False when the read shows this lease is no longer the one just written,
-        so the caller quarantines. 'quarantined' when an uncertain abort was
-        settled by a CAS on this stamp. Conflict propagates: another writer
-        advanced the document. A lost abort acknowledgement is settled by
-        _write's strong read before any quarantine.
+        An unchanged stamp is the document this call wrote, so there is no
+        pre-read. Conflict means another writer advanced it: the caller answers
+        503 and writes nothing else. MutationUncertain is settled by the strong
+        read. Any other failure of the idle write quarantines by a CAS on the
+        same stamp, never by quarantine()'s fresh read.
         """
-        state = None
+        idle = {**leased_state, 'phase': 'idle', 'lease_until_ms': 0,
+                'last_release_id': lease.lease_id,
+                'last_release_fence': lease.fence,
+                'last_release_version': lease.version}
         try:
-            state, _current = self._read()
-            self._owned(state, lease)
-            if state['phase'] != 'leased' or state['version'] != lease.version:
-                return False
-            self._write({**state, 'phase': 'idle', 'lease_until_ms': 0,
-                         'last_release_id': lease.lease_id,
-                         'last_release_fence': lease.fence,
-                         'last_release_version': lease.version}, stamp)
+            self._write(idle, stamp)
         except Conflict:
             raise
         except MutationUncertain as error:
-            if state is None:
-                return False
-            return self._settle_uncertain_abort(lease, stamp, state, error)
-        except (UpstreamUnavailable, BrokerError):
-            return False
+            return self._settle_uncertain_abort(lease, stamp, leased_state, error)
+        except BrokerError:
+            return self._quarantine_on_stamp(lease, stamp, leased_state)
         return True
+
+    def _quarantine_on_stamp(self, lease, stamp, leased_state):
+        """CAS a quarantine on the original stamp. Conflict propagates."""
+        try:
+            self._write({**leased_state, 'phase': 'quarantined',
+                         'quarantine_reason': 'credential_read_failed'}, stamp)
+        except Conflict:
+            raise
+        except MutationUncertain as error:
+            if self._abort_strong_read_resolved(getattr(error, 'observed', None), lease, stamp):
+                return True
+            observed = getattr(error, 'observed', None)
+            if observed and observed[0].get('phase') == 'quarantined':
+                return 'quarantined'
+            return True
+        return 'quarantined'
 
     def _settle_uncertain_abort(self, lease, stamp, leased_state, error):
         """Resolve a lost abort ack from the strong read, else quarantine on ``stamp``.
@@ -696,6 +715,10 @@ class CloudCredentialBroker:
         except Conflict:
             # Another contender owns this intent. Do not mutate its state: in
             # particular, do not quarantine a winning commit merely for racing.
+            raise
+        except UpstreamUnavailable:
+            # The write was refused or never acknowledged as sent. Nothing was
+            # committed, so there is no quarantine.
             raise
         except BrokerError:
             self._best_quarantine(lease, 'writeback_uncertain')

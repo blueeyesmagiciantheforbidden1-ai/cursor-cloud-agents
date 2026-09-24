@@ -233,8 +233,10 @@ class BrokerTests(unittest.TestCase):
                     result = wire.request(method, host, path, value)
                     if self.posts == 1 and mode == 'fence':
                         wire.state['fence'] += 1
+                        wire.revision += 1
                     if self.posts == 1 and mode == 'version':
                         wire.state['version'] = wire.config.secret_name + '/versions/2'
+                        wire.revision += 1
                     return result
                 return wire.request(method, host, path, value)
 
@@ -299,7 +301,7 @@ class BrokerTests(unittest.TestCase):
                 raise cb.UpstreamUnavailable('google_upstream_unavailable')
             if host == 'firestore.googleapis.com' and method == 'GET':
                 seen['gets'] += 1
-                if seen['gets'] == 3 and (fail_strong_read or restamp):
+                if seen['gets'] == 2 and (fail_strong_read or restamp):
                     if restamp:
                         with wire.lock:
                             wire.state['lease_until_ms'] += 5000
@@ -363,20 +365,23 @@ class BrokerTests(unittest.TestCase):
         self.assertGreater(self.wire.state['lease_until_ms'], 1000 * 1000 + 30 * 1000)
 
     def test_definitive_fence_or_version_loss_still_quarantines(self):
+        # A real fence or version change advances the stamp. The abort CAS
+        # loses and does not quarantine through a fresh read.
         self._stall_rest('fence')
-        with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
             self.acquire()
-        self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
         self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['fence'], 2)
         self.assertEqual(self.wire.state['last_release_id'], '')
         self.assertEqual(self.wire.state['quarantine_reason'], '')
         self.setUp()
         self._stall_rest('version')
-        with self.assertRaisesRegex(cb.BrokerError, '^credential_acquisition_unavailable$') as caught:
+        moved = self.config.secret_name + '/versions/2'
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
             self.acquire()
-        self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
-        self.assertEqual(self.wire.state['phase'], 'quarantined')
-        self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['version'], moved)
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
 
     def test_idempotent_delivery_restamp_makes_the_stalled_abort_conflict(self):
         """A same-request_id retry re-stamps before returning bytes.
@@ -452,6 +457,129 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.wire.state['fence'], 1)
         self.assertEqual(self.wire.state['quarantine_reason'], '')
         self.assertEqual(self.wire.secret_reads, 0)
+
+    def _delivering_move(self, mutate):
+        """Stall :access, and apply ``mutate`` as the delivering retry.
+
+        The mutation also runs on the second Firestore GET, which is the
+        pre-read the abort used to do. Either way the abort must not write
+        a quarantine.
+        """
+        wire = self.wire
+        original = wire.request
+        seen = {'gets': 0, 'phases': [], 'conditions': [], 'moved': False}
+
+        def move():
+            if seen['moved']:
+                return
+            seen['moved'] = True
+            with wire.lock:
+                mutate(wire)
+
+        def request(method, host, path, value=None):
+            if method == 'GET' and host == 'secretmanager.googleapis.com' and path.endswith(':access'):
+                move()
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            if host == 'firestore.googleapis.com' and method == 'GET':
+                seen['gets'] += 1
+                if seen['gets'] == 2:
+                    move()
+                    raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            if host == 'firestore.googleapis.com' and method == 'POST':
+                seen['phases'].append(cb._decode_fields(value['writes'][0]['update']['fields'])['phase'])
+                seen['conditions'].append(value['writes'][0]['currentDocument'].get('updateTime'))
+                result = original(method, host, path, value)
+                if seen.get('leased_stamp') is None:
+                    seen['leased_stamp'] = wire.stamp
+                return result
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+        return seen
+
+    def test_preread_failure_after_a_restamp_does_not_quarantine(self):
+        original_until = None
+
+        def mutate(wire):
+            nonlocal original_until
+            original_until = wire.state['lease_until_ms']
+            wire.state['lease_until_ms'] += 5000
+            wire.revision += 1
+
+        seen = self._delivering_move(mutate)
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(self.wire.state['lease_until_ms'], original_until + 5000)
+        self.assertEqual(seen['phases'], ['leased', 'idle'])
+        self.assertEqual(seen['conditions'][1], seen['leased_stamp'])
+        self.assertNotEqual(self.wire.stamp, seen['leased_stamp'])
+
+    def test_preread_of_a_committing_delivery_does_not_quarantine(self):
+        def mutate(wire):
+            wire.state['phase'] = 'committing'
+            wire.state['intent_id'] = 'ab' * 16
+            wire.state['intent_digest'] = 'cd' * 32
+            wire.revision += 2
+
+        seen = self._delivering_move(mutate)
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self.assertEqual(self.wire.state['phase'], 'committing')
+        self.assertEqual(self.wire.state['intent_id'], 'ab' * 16)
+        self.assertEqual(self.wire.state['intent_digest'], 'cd' * 32)
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(seen['phases'], ['leased', 'idle'])
+        self.assertEqual(seen['conditions'][1], seen['leased_stamp'])
+        self.assertNotEqual(self.wire.stamp, seen['leased_stamp'])
+
+    def test_idempotent_restamp_aborts_on_its_own_stamp(self):
+        self.acquire()
+        original = self.broker.rest.request
+        seen = {'conditions': [], 'after_restamp': None}
+
+        def request(method, host, path, value=None):
+            if method == 'GET' and host == 'secretmanager.googleapis.com' and path.endswith(':access'):
+                raise cb.UpstreamUnavailable('google_upstream_unavailable')
+            if host == 'firestore.googleapis.com' and method == 'POST':
+                seen['conditions'].append(value['writes'][0]['currentDocument'].get('updateTime'))
+                result = original(method, host, path, value)
+                if seen['after_restamp'] is None:
+                    seen['after_restamp'] = self.wire.stamp
+                return result
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+        with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+            self.acquire()
+        self._assert_clean_release()
+        self.assertEqual(seen['conditions'][1], seen['after_restamp'])
+        self.assertNotEqual(seen['conditions'][0], seen['conditions'][1])
+
+    def test_pre_mutation_write_refuses_when_under_eight_seconds_remain(self):
+        token = cb.begin_upstream_request()
+        try:
+            cb._request_deadline.set(time.monotonic() + 7)
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
+                self.acquire()
+        finally:
+            cb.end_upstream_request(token)
+        self.assertEqual(self.wire.state['phase'], 'idle')
+        self.assertEqual(self.wire.revision, 1)
+        self.assertEqual(self.wire.state['fence'], 0)
+        lease = self.acquire()
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        token = cb.begin_upstream_request()
+        try:
+            cb._request_deadline.set(time.monotonic() + 7)
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
+                self.broker.commit(lease, b'opaque-refreshed-credential')
+        finally:
+            cb.end_upstream_request(token)
+        self.assertEqual(self.wire.state['phase'], 'leased')
+        self.assertEqual(self.wire.state['intent_id'], '')
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
 
     def test_pre_mutation_reads_stop_when_the_request_budget_is_spent(self):
         original = self.broker.rest.request

@@ -25,19 +25,27 @@ import provider_errors
 HUB = 'https://runcrew-hub-kdhodumsza-uc.a.run.app'
 # One same-request_id retry, only while this attempt is still inside 20s and
 # before any native process exists. A 503 reaches acquire as MutationUncertain.
+# The broker's Retry-After is 2s; the sleep stays inside the 20s window.
 ACQUIRE_RETRY_SECONDS = 20
+ACQUIRE_RETRY_AFTER_SECONDS = 2
 
 
-def acquire_lease(broker, request_id, *, started, clock=time.monotonic):
+def acquire_lease(broker, request_id, *, started, clock=time.monotonic, sleeper=time.sleep):
     """Return the lease, retrying this request_id once on a transient result.
 
-    ``started`` is the first attempt. A 409 or any other definitive broker
-    error, including one from the retry, is final: the caller exits and does
-    not mint a second request_id.
+    ``started`` is the first attempt. The retry waits about 2s (Retry-After)
+    and still begins inside the 20s window. A 409 or any other definitive
+    broker error, including one from the retry, is final: the caller exits
+    and does not mint a second request_id.
     """
     try:
         return broker.acquire(broker.execution, request_id)
     except MutationUncertain:
+        elapsed = clock() - started
+        if (elapsed >= ACQUIRE_RETRY_SECONDS
+                or elapsed + ACQUIRE_RETRY_AFTER_SECONDS >= ACQUIRE_RETRY_SECONDS):
+            raise
+        sleeper(ACQUIRE_RETRY_AFTER_SECONDS)
         if clock() - started >= ACQUIRE_RETRY_SECONDS:
             raise
         return broker.acquire(broker.execution, request_id)

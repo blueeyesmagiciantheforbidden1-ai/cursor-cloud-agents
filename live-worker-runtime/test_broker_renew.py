@@ -228,6 +228,9 @@ class BrokerRenewTests(unittest.TestCase):
         between = main[start:record]
         self.assertEqual(between.count('time.monotonic()'), 1)
         self.assertIn('lease = acquire_lease(broker, request_id, started=acquire_started)', between)
+        from entrypoint import ACQUIRE_RETRY_AFTER_SECONDS
+        self.assertEqual(ACQUIRE_RETRY_AFTER_SECONDS, 2)
+        self.assertIn('sleeper(ACQUIRE_RETRY_AFTER_SECONDS)', acquire)
 
     def test_entrypoint_retries_acquire_once_with_the_same_request_id(self):
         from entrypoint import ACQUIRE_RETRY_SECONDS, acquire_lease
@@ -251,12 +254,21 @@ class BrokerRenewTests(unittest.TestCase):
 
         Broker.execution = execution
 
-        self.assertIs(acquire_lease(Broker(), request_id, started=0, clock=lambda: 1), lease)
+        slept = []
+        self.assertIs(acquire_lease(Broker(), request_id, started=0, clock=lambda: 1,
+                                    sleeper=slept.append), lease)
+        self.assertEqual(slept, [2])
         self.assertEqual(calls, [request_id, request_id])
         calls.clear()
         with self.assertRaises(MutationUncertain):
-            acquire_lease(Broker(), request_id, started=0, clock=lambda: 20)
+            acquire_lease(Broker(), request_id, started=0, clock=lambda: 20, sleeper=slept.append)
         self.assertEqual(calls, [request_id])
+        self.assertEqual(slept, [2])
+        calls.clear()
+        with self.assertRaises(MutationUncertain):
+            acquire_lease(Broker(), request_id, started=0, clock=lambda: 18, sleeper=slept.append)
+        self.assertEqual(calls, [request_id])
+        self.assertEqual(slept, [2])
         calls.clear()
 
         class Rejected(Broker):
@@ -277,7 +289,8 @@ class BrokerRenewTests(unittest.TestCase):
                 raise BrokerError('execution_already_consumed')
 
         with self.assertRaisesRegex(BrokerError, '^execution_already_consumed$'):
-            acquire_lease(OnceThenConsumed(), request_id, started=0, clock=lambda: 19)
+            acquire_lease(OnceThenConsumed(), request_id, started=0, clock=lambda: 17,
+                          sleeper=lambda _seconds: None)
         self.assertEqual(calls, [(execution, request_id), (execution, request_id)])
 
         client = BrokerHTTPClient(profile, endpoint='https://broker.run.app', execution=execution,
@@ -298,7 +311,8 @@ class BrokerRenewTests(unittest.TestCase):
 
         with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), \
                 patch.object(broker_service, 'exchange', side_effect=exchange):
-            acquired = acquire_lease(client, request_id, started=0, clock=lambda: 1)
+            acquired = acquire_lease(client, request_id, started=0, clock=lambda: 1,
+                                     sleeper=lambda _seconds: None)
         self.assertEqual(acquired.lease_id, request_id)
         self.assertEqual(acquired.auth_bytes, b'opaque')
         self.assertEqual(bodies, [b'{"request_id":"' + request_id.encode() + b'"}'] * 2)
@@ -316,7 +330,8 @@ class BrokerRenewTests(unittest.TestCase):
         with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), \
                 patch.object(broker_service, 'exchange', side_effect=exchange_denied):
             with self.assertRaises(Conflict) as caught:
-                acquire_lease(client, request_id, started=0, clock=lambda: 1)
+                acquire_lease(client, request_id, started=0, clock=lambda: 1,
+                              sleeper=lambda _seconds: None)
         self.assertNotIsInstance(caught.exception, MutationUncertain)
 
 
