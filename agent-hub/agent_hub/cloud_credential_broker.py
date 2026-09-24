@@ -27,14 +27,20 @@ COLLECTION = 'runcrew_provider_credentials'
 MAX_CREDENTIAL_BYTES = 64 * 1024  # Secret Manager's actual per-version limit.
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_CONTROL_BYTES = 16 * 1024
-# Per-call cap, and the total for one broker HTTP request. Both sit under the
-# worker client's 15s exchange budget. The request budget is per thread, never
-# a process-wide clock: the broker serves concurrent requests.
+# Pre-mutation reads: 8s per call, drawn down from a 12s per-request deadline.
+# Both sit under the worker client's 15s exchange budget. The deadline is per
+# request thread, never a process-wide clock.
+# Post-mutation calls (after the lease write, or after the commit intent write)
+# use the historical 10s socket and 15s watchdog and ignore that deadline, so a
+# slow call that used to succeed is not turned into a quarantine.
 UPSTREAM_BUDGET_SECONDS = 8
 REQUEST_BUDGET_SECONDS = 12
 REQUEST_BUDGET_FLOOR_SECONDS = 1
+POST_MUTATION_SOCKET_SECONDS = 10
+POST_MUTATION_WATCHDOG_SECONDS = 15
 UPSTREAM_HTTP_STATUSES = frozenset((429, 500, 502, 503, 504))
 _request_deadline = contextvars.ContextVar('runcrew_broker_upstream_deadline', default=None)
+_post_mutation = contextvars.ContextVar('runcrew_broker_post_mutation', default=False)
 _DIGEST = re.compile(r'[a-f0-9]{64}')
 _ID = re.compile(r'[a-f0-9]{32}')
 _STAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z')
@@ -74,12 +80,22 @@ def end_upstream_request(token):
     _request_deadline.reset(token)
 
 
+def begin_post_mutation():
+    """After a lease or intent write, later calls use the 10s/15s budget."""
+    return _post_mutation.set(True)
+
+
+def end_post_mutation(token):
+    _post_mutation.reset(token)
+
+
 def upstream_call_budget():
-    """Seconds for the next upstream call. Outside a broker request, the per-call cap.
+    """Seconds for the next pre-mutation read. Outside a broker request, the 8s cap.
 
     Inside a request the call draws down the 12s deadline: timeout is
     min(8, remaining). Less than 1s remaining refuses the call instead of
-    starting one the worker client would abandon.
+    starting one the worker client would abandon. Post-mutation calls do not
+    use this; see upstream_transport_limits.
     """
     deadline = _request_deadline.get()
     if deadline is None:
@@ -88,6 +104,14 @@ def upstream_call_budget():
     if remaining < REQUEST_BUDGET_FLOOR_SECONDS:
         raise UpstreamUnavailable('upstream_request_budget_exhausted')
     return min(UPSTREAM_BUDGET_SECONDS, remaining)
+
+
+def upstream_transport_limits():
+    """(socket_timeout, watchdog_seconds) for the next upstream call."""
+    if _post_mutation.get():
+        return POST_MUTATION_SOCKET_SECONDS, POST_MUTATION_WATCHDOG_SECONDS
+    budget = upstream_call_budget()
+    return budget, budget
 
 
 def _require(condition, code):
@@ -259,9 +283,10 @@ def _decode_fields(value):
 class GoogleREST:
     """Actual Google REST transport, without ADC discovery, proxies or redirects.
 
-    Each call's socket timeout and watchdog share upstream_call_budget(): 8s,
-    or less when this broker request's 12s deadline is running low. Response
-    bytes are bounded. The total stays under the worker client's 15s budget.
+    Pre-mutation reads use upstream_transport_limits(): 8s, or less when this
+    request's 12s deadline is running low. After a lease or intent write the
+    socket timeout is 10s and the watchdog is 15s, and that deadline does not
+    apply. Response bytes are bounded.
     The watchdog shuts down the socket, including a Connection: close response.
     Hostname resolution still uses the platform resolver. There
     are no automatic HTTP retries, especially on non-idempotent addVersion.
@@ -276,10 +301,10 @@ class GoogleREST:
         expired = threading.Event()
         timer = None
         active_socket = None
-        budget = upstream_call_budget()
+        socket_timeout, watchdog = upstream_transport_limits()
         try:
             connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(
-                host, timeout=budget)
+                host, timeout=socket_timeout)
             def stop():
                 expired.set()
                 sock = active_socket or connection.sock
@@ -289,7 +314,7 @@ class GoogleREST:
                     except OSError:
                         pass
                 connection.close()
-            timer = threading.Timer(budget, stop)
+            timer = threading.Timer(watchdog, stop)
             timer.daemon = True
             timer.start()
             connection.request(method, path, body=body, headers=headers or {})
@@ -507,23 +532,29 @@ class CloudCredentialBroker:
             self._write(state, stamp)
         lease = Lease(self.config.profile, self.config.account_ref, self.config.canonical_account_ref,
                       state['fence'], state['version'], request_id, execution, observed['uid'], b'')
+        # _access and assert_current run after the lease write. Keep the
+        # historical 10s/15s budget so a slow read is not a quarantine.
+        post = begin_post_mutation()
         try:
-            body = self._access(lease.version)
-            self.assert_current(lease)
-        except UpstreamUnavailable:
-            # No bytes were returned and no native process can have started.
-            # Idle this exact lease so the controller can relaunch. Quarantine
-            # only when that abort cannot be confirmed, or the lease is no
-            # longer exactly the one just written.
-            if not self._release_unserved_lease(lease):
+            try:
+                body = self._access(lease.version)
+                self.assert_current(lease)
+            except UpstreamUnavailable:
+                # No bytes were returned and no native process can have started.
+                # Idle this exact lease so the controller can relaunch. Quarantine
+                # only when that abort cannot be confirmed, or the lease is no
+                # longer exactly the one just written.
+                if not self._release_unserved_lease(lease):
+                    self._best_quarantine(lease, 'credential_read_failed')
+                    raise BrokerError('credential_acquisition_unavailable') from None
+                raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
+            except BrokerError:
                 self._best_quarantine(lease, 'credential_read_failed')
                 raise BrokerError('credential_acquisition_unavailable') from None
-            raise UpstreamUnavailable('credential_acquisition_upstream_unavailable') from None
-        except BrokerError:
-            self._best_quarantine(lease, 'credential_read_failed')
-            raise BrokerError('credential_acquisition_unavailable') from None
-        return Lease(lease.profile, lease.account_ref, lease.canonical_account_ref, lease.fence,
-                     lease.version, lease.lease_id, lease.execution, lease.execution_uid, body)
+            return Lease(lease.profile, lease.account_ref, lease.canonical_account_ref, lease.fence,
+                         lease.version, lease.lease_id, lease.execution, lease.execution_uid, body)
+        finally:
+            end_post_mutation(post)
 
     def _release_unserved_lease(self, lease):
         """CAS the just-written lease back to a clean idle release. False if unconfirmed."""
@@ -584,28 +615,34 @@ class CloudCredentialBroker:
         except BrokerError:
             self._best_quarantine(lease, 'writeback_uncertain')
             raise
+        # The intent is recorded. Later calls keep the 15s watchdog, and a
+        # failure still quarantines so reconcile_commit can recover the bytes.
+        post = begin_post_mutation()
         try:
-            if hashlib.sha256(lease.auth_bytes).hexdigest() == digest:
-                version = lease.version  # No refresh: no new secret/version charge.
-            else:
-                result = self.rest.request('POST', 'secretmanager.googleapis.com',
-                    '/v1/' + self.config.secret_name + ':addVersion',
-                    {'payload': {'data': base64.b64encode(body).decode('ascii'),
-                                 'dataCrc32c': str(crc32c(body))}})
-                version = _version(self.config, result.get('name'))
-                _require(result.get('state') == 'ENABLED' and result.get('clientSpecifiedPayloadChecksum') is True,
-                         'secret_version_ack_invalid')
-            # Re-read exact immutable version before publishing, not `latest`.
-            _require(hashlib.sha256(self._access(version)).hexdigest() == digest, 'secret_roundtrip_mismatch')
-            actual, update_time = self._read()
-            self._owned(actual, lease)
-            _require(actual['phase'] == 'committing' and actual['intent_id'] == intent['intent_id']
-                     and actual['intent_digest'] == digest, 'credential_commit_fence_changed')
-            self._write({**actual, 'phase': 'committed', 'version': version, 'commit_version': version}, update_time)
-            return version
-        except BrokerError:
-            self._best_quarantine(lease, 'writeback_uncertain')
-            raise MutationUncertain('credential_commit_quarantined') from None
+            try:
+                if hashlib.sha256(lease.auth_bytes).hexdigest() == digest:
+                    version = lease.version  # No refresh: no new secret/version charge.
+                else:
+                    result = self.rest.request('POST', 'secretmanager.googleapis.com',
+                        '/v1/' + self.config.secret_name + ':addVersion',
+                        {'payload': {'data': base64.b64encode(body).decode('ascii'),
+                                     'dataCrc32c': str(crc32c(body))}})
+                    version = _version(self.config, result.get('name'))
+                    _require(result.get('state') == 'ENABLED' and result.get('clientSpecifiedPayloadChecksum') is True,
+                             'secret_version_ack_invalid')
+                # Re-read exact immutable version before publishing, not `latest`.
+                _require(hashlib.sha256(self._access(version)).hexdigest() == digest, 'secret_roundtrip_mismatch')
+                actual, update_time = self._read()
+                self._owned(actual, lease)
+                _require(actual['phase'] == 'committing' and actual['intent_id'] == intent['intent_id']
+                         and actual['intent_digest'] == digest, 'credential_commit_fence_changed')
+                self._write({**actual, 'phase': 'committed', 'version': version, 'commit_version': version}, update_time)
+                return version
+            except BrokerError:
+                self._best_quarantine(lease, 'writeback_uncertain')
+                raise MutationUncertain('credential_commit_quarantined') from None
+        finally:
+            end_post_mutation(post)
 
     def release(self, lease, version):
         version = _version(self.config, version)

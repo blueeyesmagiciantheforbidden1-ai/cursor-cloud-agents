@@ -1330,9 +1330,12 @@ class BrokerRenewGuardTests(unittest.TestCase):
         default = dynamic_broker.Policy.__dataclass_fields__['lease_seconds'].default
         self.assertEqual(broker_renew.LEASE_SECONDS, default)
         source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')
-        acquire_at = source.index('lease = broker.acquire(')
-        self.assertIn('acquire_started = time.monotonic()', source[:acquire_at])
-        self.assertIn('broker_renew.record_acquire_start(lease.lease_id, acquire_started)', source[acquire_at:])
+        start = source.index('acquire_started = time.monotonic()')
+        record = source.index('broker_renew.record_acquire_start(lease.lease_id, acquire_started)')
+        self.assertLess(start, record)
+        self.assertIn('lease = acquire_lease(broker, request_id, started=acquire_started)', source[start:record])
+        body = source[source.index('def acquire_lease'):source.index('class Client')]
+        self.assertEqual(body.count('broker.acquire(broker.execution, request_id)'), 2)
 
 
 if __name__ == '__main__': unittest.main()

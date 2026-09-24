@@ -107,13 +107,20 @@ def exchange(host, path, *, method='GET', body=None, headers=None, metadata=Fals
     so a platform DNS stall is not strictly bounded by the socket watchdog.
     """
     require(not metadata or host == 'metadata.google.internal', 'endpoint_invalid')
-    # A broker request draws every upstream call down from one 12s deadline.
-    # The worker client never sets that deadline, so its own 15s cap is unchanged.
-    if backend._request_deadline.get() is not None:
+    # Pre-mutation broker reads draw down one 12s deadline. After a lease or
+    # intent write the historical 10s socket and 15s watchdog apply instead.
+    # The worker client never sets either, so its own 15s cap is unchanged.
+    if backend._post_mutation.get():
+        socket_timeout = backend.POST_MUTATION_SOCKET_SECONDS
+        timeout_seconds = backend.POST_MUTATION_WATCHDOG_SECONDS
+    elif backend._request_deadline.get() is not None:
         timeout_seconds = backend.upstream_call_budget()
+        socket_timeout = min(10, timeout_seconds)
+    else:
+        socket_timeout = min(10, timeout_seconds)
     require(type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds) and 0 < timeout_seconds <= 15,
             'transport_limit')
-    connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(host, timeout=min(10, timeout_seconds))
+    connection = (http.client.HTTPConnection if metadata else http.client.HTTPSConnection)(host, timeout=socket_timeout)
     expired = threading.Event()
     active_socket = None
     def stop():
@@ -161,7 +168,16 @@ class GoogleIDAuthenticator:
                 'authentication_required')
         with self._lock:
             if self._certificates is None or self.clock() >= self._certificates_until:
-                status, response_headers, data = exchange('www.googleapis.com', '/oauth2/v1/certs', limit=65536)
+                try:
+                    status, response_headers, data = exchange('www.googleapis.com', '/oauth2/v1/certs', limit=65536)
+                except UpstreamUnavailable:
+                    raise
+                except BoundaryError as error:
+                    if str(error) in ('transport_failed', 'transport_limit'):
+                        raise UpstreamUnavailable('authentication_upstream_unavailable') from None
+                    raise
+                if status in UPSTREAM_HTTP_STATUSES:
+                    raise UpstreamUnavailable('authentication_upstream_unavailable')
                 require(status == 200, 'authentication_required')
                 value = decode(data, 65536)
                 require(value and len(value) <= 32 and all(isinstance(k, str) and isinstance(v, str)
@@ -179,6 +195,8 @@ class GoogleIDAuthenticator:
             from google.oauth2.id_token import verify_oauth2_token
             claims = verify_oauth2_token(token, self._certificate_request, audience=self.audience,
                                          clock_skew_in_seconds=30)
+        except UpstreamUnavailable:
+            raise
         except Exception:
             raise BoundaryError('authentication_required') from None
         require(isinstance(claims, dict) and claims.get('aud') == self.audience

@@ -217,11 +217,97 @@ class BrokerRenewTests(unittest.TestCase):
 
     def test_entrypoint_stamps_acquire_start(self):
         source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')
-        acquire_at = source.index('lease = broker.acquire(')
-        before, after = source[:acquire_at], source[acquire_at:]
-        self.assertIn('acquire_started = time.monotonic()', before)
-        self.assertLess(before.rindex('time.monotonic()'), acquire_at)
-        self.assertIn('broker_renew.record_acquire_start(lease.lease_id, acquire_started)', after)
+        start = source.index('acquire_started = time.monotonic()')
+        record = source.index('broker_renew.record_acquire_start(lease.lease_id, acquire_started)')
+        self.assertLess(start, record)
+        self.assertIn('lease = acquire_lease(broker, request_id, started=acquire_started)', source[start:record])
+
+    def test_entrypoint_retries_acquire_once_with_the_same_request_id(self):
+        from entrypoint import ACQUIRE_RETRY_SECONDS, acquire_lease
+        self.assertEqual(ACQUIRE_RETRY_SECONDS, 20)
+        profile = ProfileConfig('grok', 'blueeyes', 'a' * 64, 'b' * 64,
+                                'runcrew-credential-grok-blueeyes', 'runcrew-worker-grok')
+        execution = profile.job_name + '/executions/' + profile.job_id + '-abcde'
+        uid = 'e93aecda-13b2-46d3-af37-f834d5bff100'
+        request_id = '1' * 32
+        version = profile.secret_name + '/versions/1'
+        lease = Lease(profile.profile, profile.account_ref, profile.canonical_account_ref, 1,
+                      version, request_id, execution, uid, b'opaque')
+        calls = []
+
+        class Broker:
+            def acquire(self, observed, request):
+                calls.append(request)
+                if len(calls) == 1:
+                    raise MutationUncertain('broker_http_outcome_uncertain')
+                return lease
+
+        Broker.execution = execution
+
+        self.assertIs(acquire_lease(Broker(), request_id, started=0, clock=lambda: 1), lease)
+        self.assertEqual(calls, [request_id, request_id])
+        calls.clear()
+        with self.assertRaises(MutationUncertain):
+            acquire_lease(Broker(), request_id, started=0, clock=lambda: 20)
+        self.assertEqual(calls, [request_id])
+        calls.clear()
+
+        class Rejected(Broker):
+            def acquire(self, observed, request):
+                calls.append(request)
+                raise BrokerError('execution_already_consumed')
+
+        with self.assertRaisesRegex(BrokerError, '^execution_already_consumed$'):
+            acquire_lease(Rejected(), request_id, started=0, clock=lambda: 1)
+        self.assertEqual(calls, [request_id])
+        calls.clear()
+
+        class OnceThenConsumed(Broker):
+            def acquire(self, observed, request):
+                calls.append((observed, request))
+                if len(calls) == 1:
+                    raise MutationUncertain('broker_http_outcome_uncertain')
+                raise BrokerError('execution_already_consumed')
+
+        with self.assertRaisesRegex(BrokerError, '^execution_already_consumed$'):
+            acquire_lease(OnceThenConsumed(), request_id, started=0, clock=lambda: 19)
+        self.assertEqual(calls, [(execution, request_id), (execution, request_id)])
+
+        client = BrokerHTTPClient(profile, endpoint='https://broker.run.app', execution=execution,
+                                   execution_uid=uid, grant='g' * 43)
+        bodies = []
+        ready = broker_service.encode({
+            'lease': {'fence': 1, 'version': version, 'lease_id': request_id},
+            'credential_b64': 'b3BhcXVl',
+        })
+        replies = [
+            (503, {'Retry-After': '2'}, b'{"error":"broker_upstream_unavailable"}'),
+            (200, {}, ready),
+        ]
+
+        def exchange(*_args, **kwargs):
+            bodies.append(kwargs.get('body'))
+            return replies.pop(0)
+
+        with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), \
+                patch.object(broker_service, 'exchange', side_effect=exchange):
+            acquired = acquire_lease(client, request_id, started=0, clock=lambda: 1)
+        self.assertEqual(acquired.lease_id, request_id)
+        self.assertEqual(acquired.auth_bytes, b'opaque')
+        self.assertEqual(bodies, [b'{"request_id":"' + request_id.encode() + b'"}'] * 2)
+        denied = [
+            (503, {}, b'{"error":"broker_upstream_unavailable"}'),
+            (409, {}, b'{"error":"broker_operation_rejected"}'),
+        ]
+
+        def exchange_denied(*_args, **_kwargs):
+            return denied.pop(0)
+
+        with patch.object(client, '_id_token', return_value='synthetic.jwt.signature'), \
+                patch.object(broker_service, 'exchange', side_effect=exchange_denied):
+            with self.assertRaises(Conflict) as caught:
+                acquire_lease(client, request_id, started=0, clock=lambda: 1)
+        self.assertNotIsInstance(caught.exception, MutationUncertain)
 
 
 if __name__ == '__main__':

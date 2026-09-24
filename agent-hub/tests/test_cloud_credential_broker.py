@@ -297,6 +297,126 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.wire.state['phase'], 'quarantined')
         self.assertEqual(self.wire.state['quarantine_reason'], 'credential_read_failed')
 
+    def test_pre_mutation_reads_stop_when_the_request_budget_is_spent(self):
+        original = self.broker.rest.request
+
+        def request(method, host, path, value=None):
+            cb.upstream_transport_limits()
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+        token = cb.begin_upstream_request()
+        try:
+            cb._request_deadline.set(time.monotonic() + 0.2)
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^upstream_request_budget_exhausted$'):
+                self.acquire()
+        finally:
+            cb.end_upstream_request(token)
+        self.assertEqual(self.wire.state['phase'], 'idle')
+        self.assertEqual(self.wire.state['fence'], 0)
+        self.assertEqual(self.wire.state['quarantine_reason'], '')
+        self.assertEqual(self.wire.secret_reads, 0)
+
+    def test_post_write_calls_keep_the_legacy_budget_when_the_deadline_is_spent(self):
+        seen = {}
+        wire = self.wire
+
+        class Rest:
+            def __init__(self):
+                self.posts = 0
+                self.gets = 0
+
+            def request(self, method, host, path, value=None):
+                if host == 'firestore.googleapis.com' and method == 'GET':
+                    self.gets += 1
+                    if self.gets == 1:
+                        seen['before_write'] = cb._post_mutation.get()
+                if host == 'firestore.googleapis.com' and method == 'POST':
+                    self.posts += 1
+                    if self.posts == 1:
+                        result = wire.request(method, host, path, value)
+                        cb._request_deadline.set(time.monotonic() + 0.05)
+                        return result
+                    seen['abort'] = cb.upstream_transport_limits()
+                    return wire.request(method, host, path, value)
+                if host == 'secretmanager.googleapis.com' and method == 'GET':
+                    seen['access'] = cb.upstream_transport_limits()
+                    seen['access_post'] = cb._post_mutation.get()
+                    raise cb.UpstreamUnavailable('google_upstream_unavailable')
+                return wire.request(method, host, path, value)
+
+        self.broker.rest = Rest()
+        token = cb.begin_upstream_request()
+        try:
+            with self.assertRaisesRegex(cb.UpstreamUnavailable, '^credential_acquisition_upstream_unavailable$'):
+                self.acquire()
+        finally:
+            cb.end_upstream_request(token)
+        self.assertFalse(seen['before_write'])
+        self.assertEqual(seen['access'], (10, 15))
+        self.assertTrue(seen['access_post'])
+        self.assertEqual(seen['abort'], (10, 15))
+        self._assert_clean_release()
+        self.assertFalse(cb._post_mutation.get())
+
+    def test_commit_after_intent_stays_quarantine_on_the_legacy_budget(self):
+        lease = self.acquire()
+        seen = {}
+        wire = self.wire
+
+        class Rest:
+            def __init__(self):
+                self.posts = 0
+
+            def request(self, method, host, path, value=None):
+                if host == 'firestore.googleapis.com' and method == 'POST':
+                    self.posts += 1
+                    result = wire.request(method, host, path, value)
+                    if self.posts == 1:
+                        seen['during_intent'] = cb._post_mutation.get()
+                        cb._request_deadline.set(time.monotonic() + 0.05)
+                    return result
+                if host == 'secretmanager.googleapis.com' and method == 'POST':
+                    seen['add'] = cb.upstream_transport_limits()
+                    raise cb.UpstreamUnavailable('google_upstream_unavailable')
+                return wire.request(method, host, path, value)
+
+        self.broker.rest = Rest()
+        token = cb.begin_upstream_request()
+        try:
+            with self.assertRaisesRegex(cb.MutationUncertain, '^credential_commit_quarantined$') as caught:
+                self.broker.commit(lease, b'new-refresh')
+            self.assertNotIsInstance(caught.exception, cb.UpstreamUnavailable)
+        finally:
+            cb.end_upstream_request(token)
+        self.assertFalse(seen['during_intent'])
+        self.assertEqual(seen['add'], (10, 15))
+        self.assertEqual(self.wire.state['phase'], 'quarantined')
+        self.assertEqual(self.wire.state['quarantine_reason'], 'writeback_uncertain')
+        self.assertNotEqual(self.wire.state['intent_id'], '')
+        self.assertFalse(cb._post_mutation.get())
+
+    def test_renew_reads_stay_on_the_pre_mutation_budget(self):
+        lease = self.acquire()
+        seen = {}
+        original = self.broker.rest.request
+
+        def request(method, host, path, value=None):
+            if 'limits' not in seen:
+                seen['post'] = cb._post_mutation.get()
+                seen['limits'] = cb.upstream_transport_limits()
+            return original(method, host, path, value)
+
+        self.broker.rest.request = request
+        token = cb.begin_upstream_request()
+        try:
+            self.broker.renew(lease)
+        finally:
+            cb.end_upstream_request(token)
+        self.assertFalse(seen['post'])
+        self.assertEqual(seen['limits'], (8, 8))
+        self.assertEqual(self.wire.state['phase'], 'leased')
+
     def test_acquire_lost_ack_resolved_by_strong_read_without_second_fence(self):
         self.wire.lose_phase_ack = 'leased'
         first = self.acquire()
@@ -659,6 +779,56 @@ class TransportTests(unittest.TestCase):
             thread.join(2)
             self.assertFalse(thread.is_alive())
         self.assertEqual(seen, {'blocked': 'refused', 'open': 8})
+
+    def test_post_mutation_exchange_uses_ten_second_socket_and_fifteen_second_watchdog(self):
+        self.assertEqual(cb.POST_MUTATION_SOCKET_SECONDS, 10)
+        self.assertEqual(cb.POST_MUTATION_WATCHDOG_SECONDS, 15)
+        seen = {}
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                seen['socket'] = timeout
+
+            def request(self, *args, **kwargs):
+                return None
+
+            def getresponse(self):
+                class Response:
+                    status = 200
+
+                    def read(self, limit):
+                        return b'{}'
+
+                    def getheader(self, name):
+                        return None
+
+                return Response()
+
+            def close(self):
+                return None
+
+        class Timer:
+            def __init__(self, interval, function):
+                seen['watchdog'] = interval
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        token = cb.begin_upstream_request()
+        post = cb.begin_post_mutation()
+        try:
+            cb._request_deadline.set(time.monotonic() + 0.2)
+            with patch.object(cb.http.client, 'HTTPSConnection', Connection), patch.object(cb.threading, 'Timer', Timer):
+                self.assertEqual(self.rest._exchange('firestore.googleapis.com', '/v1/known', 'GET') , {})
+            self.assertEqual(seen, {'socket': 10, 'watchdog': 15})
+        finally:
+            cb.end_post_mutation(post)
+            cb.end_upstream_request(token)
 
     def _connection(self, status, body, *, fail=None):
         class Response:

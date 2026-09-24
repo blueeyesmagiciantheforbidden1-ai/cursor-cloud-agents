@@ -15,6 +15,7 @@ import uuid
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), '/opt/runcrew', '/opt/runcrew/app']
 
+from agent_hub.cloud_credential_broker import MutationUncertain
 from agent_hub.worker import Config, HubClient, NoRedirect, WorkerError
 from dynamic_broker import load_client
 from live_loop import Settings, Worker, finish_exit
@@ -22,6 +23,19 @@ import broker_renew
 import provider_errors
 
 HUB = 'https://runcrew-hub-kdhodumsza-uc.a.run.app'
+# One same-request_id retry, only while this attempt is still inside 20s and
+# before any native process exists. A 503 reaches acquire as MutationUncertain.
+ACQUIRE_RETRY_SECONDS = 20
+
+
+def acquire_lease(broker, request_id, *, started, clock=time.monotonic):
+    """Return the lease, retrying this request_id once on a transient result."""
+    try:
+        return broker.acquire(broker.execution, request_id)
+    except MutationUncertain:
+        if clock() - started >= ACQUIRE_RETRY_SECONDS:
+            raise
+        return broker.acquire(broker.execution, request_id)
 
 
 class Client(HubClient):
@@ -80,8 +94,9 @@ def main():
     if os.environ.get('RUNCREW_LIVE_PROVIDER', agent) != agent: raise RuntimeError('provider_image_mismatch')
     token = os.environ.pop('HUB_AGENT_TOKEN', '')
     if not token or '\r' in token or '\n' in token: raise RuntimeError('hub_token_required')
-    # Acquire before native starts. The request ID is unique for this one
-    # process. There is no second acquisition or execution retry in this job.
+    # Acquire before any native process starts. The request ID is unique for
+    # this process. acquire_lease may repeat that same id once; it does not
+    # start a second acquisition or retry the execution.
     request_id = uuid.uuid4().hex
     home = Path('/home/worker') / ('live-' + request_id)
     intent = Path('/home/worker') / ('acquire-' + request_id + '.json')
@@ -89,7 +104,7 @@ def main():
         json.dump({'request_id': request_id, 'execution_uid': broker.execution_uid}, stream)
         stream.flush(); os.fsync(stream.fileno())
     acquire_started = time.monotonic()
-    lease = broker.acquire(broker.execution, request_id)
+    lease = acquire_lease(broker, request_id, started=acquire_started)
     broker_renew.record_acquire_start(lease.lease_id, acquire_started)
     from credential_state import RefreshSession
     session = RefreshSession(broker, lease, home)

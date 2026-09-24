@@ -674,6 +674,71 @@ class ServiceTests(unittest.TestCase):
             backend.end_upstream_request(token)
         self.assertEqual(service.exchange.__kwdefaults__['timeout_seconds'], 15)
 
+    def test_post_mutation_exchange_is_not_cut_by_the_request_deadline(self):
+        seen = {}
+
+        class Connection:
+            sock = None
+
+            def __init__(self, host, timeout):
+                seen['socket'] = timeout
+
+            def request(self, *args, **kwargs):
+                return None
+
+            def getresponse(self):
+                class Response:
+                    status = 200
+
+                    def read(self, limit):
+                        return b'{}'
+
+                    def getheaders(self):
+                        return []
+
+                return Response()
+
+            def close(self):
+                return None
+
+        class Timer:
+            def __init__(self, interval, function):
+                seen['watchdog'] = interval
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        token = backend.begin_upstream_request()
+        post = backend.begin_post_mutation()
+        try:
+            backend._request_deadline.set(time.monotonic() + 0.2)
+            with patch.object(service.http.client, 'HTTPSConnection', Connection), patch.object(service.threading, 'Timer', Timer):
+                status, _, raw = service.exchange('firestore.googleapis.com', '/v1/documents/legacy')
+            self.assertEqual(status, 200)
+            self.assertEqual(raw, b'{}')
+            self.assertEqual(seen, {'socket': 10, 'watchdog': 15})
+        finally:
+            backend.end_post_mutation(post)
+            backend.end_upstream_request(token)
+
+    def test_certificate_fetch_stall_answers_503(self):
+        self.service.authenticator = service.GoogleIDAuthenticator(ENDPOINT)
+        server, thread = self._serve()
+        try:
+            with patch.object(service, 'exchange', side_effect=service.BoundaryError('transport_failed')):
+                status, retry, raw = self._post(server, 'bootstrap', {})
+            self.assertEqual((status, retry), (503, '2'))
+            self.assertEqual(json.loads(raw), {'error': 'broker_upstream_unavailable'})
+            with patch.object(service, 'exchange', return_value=(503, {}, b'{}')):
+                status, retry, raw = self._post(server, 'bootstrap', {})
+            self.assertEqual((status, retry), (503, '2'))
+            self.assertEqual(json.loads(raw), {'error': 'broker_upstream_unavailable'})
+        finally:
+            self._stop(server, thread)
+
 
 class SignedIdentityTests(unittest.TestCase):
     @classmethod
