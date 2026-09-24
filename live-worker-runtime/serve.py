@@ -36,6 +36,8 @@ def main():
     if not Path(config).is_file():
         raise RuntimeError('protected_config_missing')
     module = __import__(module_name)
+    # Broker role loads dynamic_broker.main, which checks the auth library
+    # before BrokerServer binds the port.
     module.main()
     return 0
 

@@ -2,8 +2,10 @@
 import builtins
 import io
 import json
+import os
 import re
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -69,6 +71,23 @@ class BrokerAuthCheckTests(unittest.TestCase):
                 self._assert_fixed(dynamic_broker.main)
         check.assert_called_once()
         server.assert_not_called()
+
+    def test_dunder_main_exits_nonzero_without_constructing_broker_server(self):
+        main_source = Path(dynamic_broker.__file__).read_text(encoding='utf-8').split('def main():', 1)[1]
+        main_source = main_source.split("if __name__ == '__main__':", 1)[0]
+        self.assertLess(main_source.index('broker_auth_check.check()'), main_source.index('BrokerServer('))
+        proc = _run_module_as_main(dynamic_broker.__file__)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn('live_broker_startup_rejected', proc.stdout)
+        self.assertNotIn('authentication_required', proc.stdout)
+
+    def test_serve_broker_role_runs_dynamic_broker_main_and_exits_nonzero(self):
+        self.assertEqual(serve.ROLES['broker'][0], 'dynamic_broker')
+        proc = _run_module_as_main(serve.__file__, broker_role=True)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn('"status": "stopped"', proc.stdout)
+        self.assertIn('broker_auth_library_unavailable', proc.stdout)
+        self.assertNotIn('authentication_required', proc.stdout)
 
     def test_plain_check_stays_green_without_google(self):
         buffer = io.StringIO()
@@ -156,6 +175,60 @@ class BrokerAuthCheckTests(unittest.TestCase):
 
 def _from_line(text):
     return next(line for line in text.splitlines() if line.startswith('FROM '))
+
+
+def _run_module_as_main(path, *, broker_role=False):
+    """Execute path as __main__ with check() failing and BrokerServer patched.
+
+    Exit 1 means the module guard turned the failure into a non-zero status
+    and never constructed BrokerServer. 0 means the guard swallowed it. 2 means
+    the server was constructed. 3 means check() never ran.
+    """
+    script = r'''
+import os, sys
+from unittest.mock import patch
+import runpy
+runtime, hub, target = sys.argv[1:]
+sys.path[:0] = [runtime, hub]
+sys.argv = ["serve.py"]
+if os.environ.get("BROKER_ROLE") == "1":
+    os.environ["RUNCREW_ROLE"] = "broker"
+    from pathlib import Path
+    real_is_file = Path.is_file
+    def is_file(self):
+        if self.as_posix() == "/run/config/live-broker.json":
+            return True
+        return real_is_file(self)
+    Path.is_file = is_file
+import broker_auth_check
+from agent_hub import credential_broker_service as base
+with patch.object(broker_auth_check, "check", side_effect=broker_auth_check.BrokerAuthLibraryUnavailable()) as check, \
+     patch.object(base, "BrokerServer") as server:
+    try:
+        runpy.run_path(target, run_name="__main__")
+    except SystemExit as error:
+        code = error.code
+    except Exception:
+        code = 1
+    else:
+        code = 0
+    if server.called:
+        raise SystemExit(2)
+    if not check.called:
+        raise SystemExit(3)
+    if code in (0, None):
+        raise SystemExit(0)
+    raise SystemExit(code if isinstance(code, int) else 1)
+'''
+    env = os.environ.copy()
+    if broker_role:
+        env['BROKER_ROLE'] = '1'
+    else:
+        env.pop('RUNCREW_ROLE', None)
+        env.pop('BROKER_ROLE', None)
+    return subprocess.run(
+        [sys.executable, '-c', script, str(ROOT / 'live-worker-runtime'), str(ROOT / 'agent-hub'), path],
+        capture_output=True, text=True, env=env, check=False)
 
 
 if __name__ == '__main__':

@@ -201,9 +201,10 @@ def load_client(path):
 
 
 def main():
-    # Before listen. A missing google-auth install must exit so Cloud Run keeps
-    # the previous revision. Reaching HTTP would turn that ImportError into
-    # authentication_required and 401 every worker.
+    # First. BrokerServer.__init__ binds PORT, and that open socket is what lets
+    # Cloud Run mark the revision Ready. The check has to fail before that
+    # constructor runs, and before any other startup work, so the process can
+    # exit non-zero with nothing listening and the previous revision stays up.
     import broker_auth_check
     broker_auth_check.check()
     base.require(os.name == 'posix' and os.geteuid() != 0 and os.environ.get('K_SERVICE')
