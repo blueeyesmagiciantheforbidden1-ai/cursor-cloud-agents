@@ -262,6 +262,22 @@ class GrokAdapter(unittest.TestCase):
             self.assertFalse(any(name == 'session/prompt' for name, _ in fixture.calls))
             self.assertEqual(fixture.events, ['stop', 'commit-release'])
 
+    def test_execute_positive_owner_mismatch_does_not_commit(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            self.assertTrue(handle.preflight['account']['native_owner_verified'])
+            fixture.overrides['x.ai/auth/info'] = {
+                'methodId': 'cached_token', 'email': 'another@example.com'}
+            with self.assertRaisesRegex(g.NativeError, 'owner_mismatch|owner_unverified_at_close|close_requires_reconciliation'):
+                g.execute(handle, 'Project.', time.monotonic()+30)
+            self.assertFalse(handle.preflight['account']['native_owner_verified'])
+            self.assertFalse(any(name == 'session/prompt' for name, _ in fixture.calls))
+            session.finish.assert_not_called()
+            session.broker.quarantine.assert_called()
+            self.assertEqual(fixture.events, ['stop'])
+            self.assertNotIn('commit-release', fixture.events)
+
     def test_wrong_final_prompt_identity_stops_without_replay(self):
         def wrong(native, params, result):
             result['_meta']['requestId'] = 'different'
@@ -823,7 +839,6 @@ class GrokAdapter(unittest.TestCase):
     def test_quota_refresh_passthrough_renew_heartbeat_and_tool(self):
         cases = [
             ('grok_broker_renew_rejected', 'fail'),
-            ('grok_hub_heartbeat_lost', 'retry'),
             ('native_tool_observed', 'fail'),
         ]
         for code, fault in cases:
@@ -840,6 +855,21 @@ class GrokAdapter(unittest.TestCase):
                     self.assertEqual(str(caught.exception), code)
                     self.assertEqual(live_loop.maintain_fault(caught.exception), fault)
                     g.close(handle)
+
+    def test_quota_refresh_hub_heartbeat_loss_drains(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                fixture.overrides['x.ai/billing'] = g.NativeError('grok_hub_heartbeat_lost')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(
+                        g.NativeError, '^grok_quota_refresh_transport_lost$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                g.close(handle)
 
     def test_quota_refresh_owner_mismatch_raises_and_close_skips_commit(self):
         clock = StepClock()
@@ -1139,6 +1169,16 @@ class TransportSmoke(unittest.TestCase):
             native = wire.Native(Path('/offline'), lambda: None, time.monotonic()+5)
             self.assertEqual(native.request('x.ai/auth/info', {}), {'email': 'fixture'})
             self.assertEqual(native.internal_ack_counts, {'skills-reload': 1})
+            native.close()
+
+    def test_malformed_watcher_ack_raises_reload_schema(self):
+        process = self.transport([
+            {'jsonrpc': '2.0', 'id': 'skills-reload', 'result': {'reloaded': 'yes'}}])
+        with patch.object(wire.subprocess, 'Popen', return_value=process), patch.object(wire.os, 'killpg', create=True), \
+                patch.object(wire.signal, 'SIGKILL', 9, create=True):
+            native = wire.Native(Path('/offline'), lambda: None, time.monotonic()+5)
+            with self.assertRaisesRegex(g.NativeError, 'native_internal_reload_schema'):
+                native.request('x.ai/auth/info', {})
             native.close()
 
     def test_unrelated_string_id_is_not_swallowed(self):

@@ -1238,6 +1238,61 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('completion_delivery', result)
         self.assertEqual(len(client.completions), 1)
 
+    def test_complete_accepts_retry_scheduled(self):
+        worker, client, adapter, _ = self.setup_worker()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                client.calls.append((path, copy.deepcopy(value)))
+                client.completions.append(copy.deepcopy(value))
+                return {'room_id': ROOM, 'status': 'retry_scheduled'}
+            return original(path, value)
+
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('completion_delivery', result)
+        self.assertEqual(len(client.completions), 1)
+
+    def test_complete_accepts_blocked_on_provider(self):
+        worker, client, adapter, _ = self.setup_worker()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                client.calls.append((path, copy.deepcopy(value)))
+                client.completions.append(copy.deepcopy(value))
+                return {'room_id': ROOM, 'status': 'blocked_on_provider'}
+            return original(path, value)
+
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('completion_delivery', result)
+        self.assertEqual(len(client.completions), 1)
+
+    def test_cleanup_failed_clears_stale_drain_code(self):
+        # Drain path sets drain_code, then finally close() fails: outcome must
+        # report credential_cleanup_failed without a stale drain_code.
+        worker, client, adapter, _ = self.setup_worker()
+        client.empty = True
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            raise CodeError('warm_session_expired')
+
+        def close(handle):
+            adapter.calls.append('close')
+            raise ValueError('quarantined')
+
+        adapter.maintain, adapter.close = maintain, close
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(result['error_code'], 'credential_cleanup_failed')
+        self.assertNotIn('drain_code', result)
+        self.assertEqual(worker.last_exit, 1)
+
     def test_spans_for_a_pre_model_failure(self):
         logs = []
         token = 'lease-token-not-for-logs'

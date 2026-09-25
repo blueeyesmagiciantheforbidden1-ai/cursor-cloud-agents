@@ -342,10 +342,14 @@ _GROK_REFRESH_TRANSPORT_CODES = frozenset({
     'native_object_required',  # request(): non-dict frame
     'notification_limit',  # request(): notification buffer cap
     'native_internal_reload_limit',  # request(): watcher ack budget
+    'native_internal_reload_schema',  # request(): watcher ack shape miss
     'native_write_failed',  # send(): stdin OSError/ValueError
     'native_write_invalid_count',  # send(): bad write length
     'native_flush_failed',  # send(): flush OSError/ValueError
     'request_limit',  # send(): outbound message size cap
+    # Mid-refresh hub loss (request wait loop → renew → heartbeat) must drain:
+    # a retry leaves the metadata reply buffered for the next tick (strike).
+    'grok_hub_heartbeat_lost',
 })
 
 
@@ -365,11 +369,11 @@ def _refresh_quota(handle):
 
     Intact non-exhaustion error frames and native_result_missing are swallowed
     like schema validation failures (stream still sync). Vetted non-transport
-    codes (tools, broker renew, hub heartbeat, quota) pass through unchanged.
-    Uncoded exceptions and _GROK_REFRESH_TRANSPORT_CODES become
-    grok_quota_refresh_transport_lost. Exhaustion and positive owner-mismatch raise.
-    The prepare-era native.deadline is replaced for the refresh window and
-    restored after.
+    codes (tools, broker renew, quota) pass through unchanged. Hub heartbeat
+    loss mid-refresh is transport-lost (drain), not retry. Uncoded exceptions
+    and _GROK_REFRESH_TRANSPORT_CODES become grok_quota_refresh_transport_lost.
+    Exhaustion and positive owner-mismatch raise. The prepare-era
+    native.deadline is replaced for the refresh window and restored after.
     """
     if time.monotonic() < handle.next_quota_refresh:
         return
@@ -469,7 +473,21 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(task_kind == 'project', 'grok_automatic_improvement_not_enabled')
         need(type(prompt) is str and 0 < len(prompt.encode()) <= MAX_PROMPT_BYTES, 'grok_prompt_limit')
         handle.native.deadline = _deadline(task_deadline)
-        handle.preflight = _fresh_metadata(handle.native)  # Never reuse stale idle-time quota.
+        # Never reuse stale idle-time quota. A positive owner mismatch must
+        # clear native_owner_verified before the except-path close() so commit
+        # is refused (same policy as idle refresh / codex).
+        responses = None
+        try:
+            responses = _metadata_responses(handle.native)
+            handle.preflight = _metadata_preflight(*responses)
+        except Exception as error:
+            code = provider_errors.error_code(error)
+            if (code == 'grok_owner_mismatch' and responses is not None
+                    and _positive_owner_mismatch(responses[0])):
+                account = handle.preflight.get('account') if type(handle.preflight) is dict else None
+                if type(account) is dict:
+                    account['native_owner_verified'] = False
+            raise
         if handle.lease_clock.degraded:  # never send the prompt on an unconfirmed lease
             handle.lease_clock.renew(handle.session.broker, handle.session.lease, strict=True)
             handle.native.next_renew = time.monotonic() + 20

@@ -944,6 +944,33 @@ class CodexLive(unittest.TestCase):
             self.assertEqual(handle.native.protocol_state, 'denied')
             self.assertNotEqual(handle.state, 'ready')
 
+    def test_quota_refresh_warm_send_codes_drain(self):
+        # WarmRPC._send need() codes are LiveCodexError but mean dead stdin:
+        # during a refresh they drain, never strike.
+        self.assertEqual(c._CODEX_REFRESH_SEND_CODES, {
+            'native_input_failed', 'native_write_deadline',
+            'native_short_write_invalid', 'native_request_limit'})
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            original_send = handle.native._send
+
+            def failing_send(value=None, *, close=False):
+                if value is not None and value.get('method') == 'account/rateLimits/read':
+                    raise c.LiveCodexError('native_input_failed')
+                return original_send(value, close=close)
+
+            handle.native._send = failing_send
+            with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+            self.assertEqual(handle.native.protocol_state, 'denied')
+            self.assertNotEqual(handle.state, 'ready')
+
     def test_quota_refresh_account_mismatch_clears_owner_and_refuses_commit(self):
         clock = StepClock()
         with patch('time.monotonic', clock):

@@ -734,7 +734,7 @@ class Lifecycle(unittest.TestCase):
     def test_quota_refresh_vetted_passthrough_keeps_own_code(self):
         codes = (
             'copilot_broker_renew_failed', 'copilot_broker_renew_rejected',
-            'copilot_hub_heartbeat_lost', 'copilot_tools_forbidden',
+            'copilot_tools_forbidden',
             'copilot_unexpected_pre_prompt_activity',
             'copilot_unexpected_pre_prompt_assistant_message')
         clock = StepClock()
@@ -762,10 +762,39 @@ class Lifecycle(unittest.TestCase):
                     self.assertNotEqual(str(caught.exception), 'copilot_quota_refresh_transport_lost')
                     self.assertNotEqual(str(caught.exception), 'copilot_warm_session_lost')
                     self.assertNotEqual(str(caught.exception), 'copilot_idle_maintain_failed')
-                    if code == 'copilot_hub_heartbeat_lost':
-                        self.assertFalse(handle.finished)
-                    else:
-                        self.assertTrue(handle.finished)
+                    self.assertTrue(handle.finished)
+
+    def test_quota_refresh_hub_heartbeat_loss_drains_without_strike(self):
+        # Mid-refresh hub loss must drain (not retry): a late getQuota reply
+        # would otherwise fail the next tick with unexpected_native_frame.
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            real_request = handle.native.request
+            late_frames = []
+
+            def hub_loss_then_late_reply(method, params=None):
+                if method == 'account.getQuota':
+                    handle.native.index += 1
+                    handle.native.calls.append((method, copy.deepcopy(params)))
+                    late_frames.append({'jsonrpc': '2.0', 'id': handle.native.index,
+                                        'result': {'quota': {}}})
+                    raise c.CopilotError('copilot_hub_heartbeat_lost')
+                return real_request(method, params)
+
+            handle.native.request = hub_loss_then_late_reply
+            with self.assertRaisesRegex(
+                    c.CopilotError, '^copilot_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+            self.assertTrue(handle.finished)
+            # Session closed: no next-tick strike from the buffered reply.
+            self.assertEqual(len(late_frames), 1)
+            with self.assertRaisesRegex(c.CopilotError, 'copilot_handle_not_idle'):
+                c.maintain(handle)
 
     def test_quota_refresh_transport_codes_drain(self):
         codes = (

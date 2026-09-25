@@ -584,7 +584,9 @@ class Worker:
                 result = self.client.post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
                 require(result.get('room_id') == self.task['room_id'] and
                         result.get('status') in ('completed', 'queued', 'failed',
-                                                 'needs_reconciliation'),
+                                                 'needs_reconciliation',
+                                                 'retry_scheduled',
+                                                 'blocked_on_provider'),
                         'completion_unconfirmed')
                 return
             except Exception:
@@ -799,6 +801,7 @@ class Worker:
                     outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed',
                                    model_call_attempted=self.model_call_attempted,
                                    claim_attempted=self.claim_attempted)
+                    outcome.pop('drain_code', None)
                     return outcome
             # A stop before any claim is the same clean end as a drain.
             idle_session_lost = idle_session_lost or (
@@ -841,6 +844,7 @@ class Worker:
                     self._close_for_span()
                 except Exception:
                     outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed')
+                    outcome.pop('drain_code', None)
                     self.last_exit = 1
             measured = _usage_measured_at(self.handle)
             if measured is not None:

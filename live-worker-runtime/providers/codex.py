@@ -469,6 +469,15 @@ def prepare(session, heartbeat, deadline):
         _fail(handle, error)
 
 
+# WarmRPC._send raises these through need() as LiveCodexError: stdin is dead or
+# the write was aborted. During a refresh they are transport loss (drain), not
+# vetted codes that keep their meaning.
+_CODEX_REFRESH_SEND_CODES = frozenset({
+    'native_input_failed', 'native_write_deadline',
+    'native_short_write_invalid', 'native_request_limit',
+})
+
+
 def _refresh_quota(handle):
     """Re-measure quota for hub reports. Validation failures keep the last real row.
 
@@ -499,7 +508,8 @@ def _refresh_quota(handle):
         rates = native.request('account/rateLimits/read', {})
     except Exception as error:
         # Vetted codex codes (renew rejected/failed, quota) keep their meaning.
-        if (isinstance(error, LiveCodexError) and provider_errors.error_code(error) is not None
+        code = provider_errors.error_code(error) if isinstance(error, LiveCodexError) else None
+        if (code is not None and code not in _CODEX_REFRESH_SEND_CODES
                 and not _idle_hub_loss(handle, error)):
             raise
         # Protocol already 'denied'; drain idle without a controller strike.

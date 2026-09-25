@@ -53,6 +53,10 @@ _COPILOT_REFRESH_TRANSPORT_CODES = frozenset({
     'copilot_native_input_closed',  # Native.write_frame
     'copilot_outbound_frame_limit',  # Native.request body size
     'copilot_native_request_failed',  # Native.request: untagged id/result miss
+    # Mid-refresh hub loss (Native._tick → renew → heartbeat) must drain: a
+    # retry would leave the late getQuota reply buffered and the next tick
+    # fails with copilot_unexpected_native_frame (strike). Same as codex.
+    'copilot_hub_heartbeat_lost',
 })
 # Native.request caps at 24 calls (index < 24). Budget for idle quota refresh:
 #   prepare: connect + _fresh_metadata(3) + session.create + setAllowedModels
@@ -705,9 +709,11 @@ def _refresh_quota(handle):
     identity mismatch. Quota park: copilot_quota_exhausted (error frame or
     _billing exhaustion) re-raises unchanged out of maintain(). Vetted codes
     outside _COPILOT_REFRESH_TRANSPORT_CODES pass through unchanged. Transport
-    lost (untagged request_failed, deadlines, frame/output limits, OSError)
-    becomes copilot_quota_refresh_transport_lost before maintain()'s except
-    (which would otherwise map OSError to copilot_warm_session_lost).
+    lost (untagged request_failed, deadlines, frame/output limits, OSError,
+    and mid-refresh hub heartbeat loss) becomes
+    copilot_quota_refresh_transport_lost before maintain()'s except
+    (which would otherwise map OSError to copilot_warm_session_lost, or leave
+    a hub loss as retry with the getQuota reply still buffered).
     """
     if time.monotonic() < handle.next_quota_refresh:
         return
