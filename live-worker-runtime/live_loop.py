@@ -14,6 +14,7 @@ import math
 import os
 import re
 import time
+from urllib.error import HTTPError
 
 import provider_errors
 import usage_report
@@ -33,6 +34,19 @@ def require(value, code):
 
 def finite(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _hub_rejected_request(error):
+    """True only when the hub answered HTTP 400 (validation rejection).
+
+    HubClient.post raises WorkerError(... HTTP {code} ...) from HTTPError, so the
+    status lives on exc.__cause__.code. Direct HTTPError(400) also counts.
+    Non-400 HTTP, transport failures, and not-accepted receipts must not retry.
+    """
+    if isinstance(error, HTTPError) and getattr(error, 'code', None) == 400:
+        return True
+    cause = getattr(error, '__cause__', None)
+    return isinstance(cause, HTTPError) and getattr(cause, 'code', None) == 400
 
 
 # The adapter's own warm deadline starts when prepare() does, so it expires
@@ -492,9 +506,13 @@ class Worker:
         try:
             receipt = self.client.post('/v1/workers/report', payload)
             require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
-        except Exception:
+        except Exception as error:
             usage_rows = payload.get('usage')
-            if not isinstance(usage_rows, list) or not usage_rows:
+            # Retry once with usage:[] ONLY on hub HTTP 400 with a non-empty usage
+            # list (validation rejection of quota rows). Never on transport/5xx,
+            # other HTTP codes, LeaseLost, or a not-accepted receipt.
+            if (not isinstance(usage_rows, list) or not usage_rows
+                    or not _hub_rejected_request(error)):
                 raise
             # Count only: dropped row count; never usage contents; never a span.
             self.usage_rejected += len(usage_rows)

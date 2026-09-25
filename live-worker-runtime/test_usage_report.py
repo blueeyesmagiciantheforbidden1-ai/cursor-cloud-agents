@@ -4,20 +4,27 @@ from __future__ import annotations
 import copy
 import inspect
 import math
+import socket
 import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT.parent / 'agent-hub'))
+# Append agent-hub (never insert at 0): agent-hub/tests must not shadow
+# live-worker-runtime/tests when unittest discover loads this module.
+_AGENT_HUB = str(ROOT.parent / 'agent-hub')
+if _AGENT_HUB not in sys.path:
+    sys.path.append(_AGENT_HUB)
 
 import usage_report  # noqa: E402
 from agent_hub.core import HubError  # noqa: E402
 from agent_hub.telemetry import ERRORS, iso, timestamp, usage_entry  # noqa: E402
+from agent_hub.worker import LeaseLost, WorkerError  # noqa: E402
 from live_loop import Worker, Settings  # noqa: E402
 
 
@@ -648,6 +655,30 @@ class ReportClient:
         return {'accepted': True}
 
 
+def _hub_http_error(code, reason='Bad Request'):
+    """WorkerError shaped like HubClient.post on an HTTP error."""
+    try:
+        raise WorkerError(f'Hub request failed (HTTP {code})') from HTTPError(
+            'http://hub/v1/workers/report', code, reason, None, None)
+    except WorkerError as exc:
+        return exc
+
+
+def _hub_connection_failed():
+    try:
+        raise WorkerError('Hub connection failed') from URLError('connection refused')
+    except WorkerError as exc:
+        return exc
+
+
+def _lease_lost():
+    try:
+        raise LeaseLost('The hub revoked or expired this task lease') from HTTPError(
+            'http://hub/v1/workers/report', 409, 'Conflict', None, None)
+    except LeaseLost as exc:
+        return exc
+
+
 class ReportPayloadTests(unittest.TestCase):
     def _worker(self, agent='codex'):
         client = ReportClient()
@@ -723,7 +754,7 @@ class ReportPayloadTests(unittest.TestCase):
         worker.ready = True
         worker._last_turn_usage = CODEX_USAGE
         worker._last_turn_observed_at = OBSERVED
-        outcomes = [RuntimeError('rejected'), {'accepted': True}]
+        outcomes = [_hub_http_error(400), {'accepted': True}]
 
         def post(path, value):
             client.calls.append((path, copy.deepcopy(value)))
@@ -741,38 +772,39 @@ class ReportPayloadTests(unittest.TestCase):
         self.assertTrue(all('span' in item for item in worker.spans))
         self.assertEqual(worker.next_report, 1025.0)
 
-    def test_report_not_accepted_with_usage_retries(self):
+    def test_report_not_accepted_with_usage_does_not_retry(self):
+        # Was test_report_not_accepted_with_usage_retries: not-accepted receipt
+        # must not trigger the usage:[] retry (only HTTP 400 does).
         worker, client = self._worker('codex')
         worker.ready = True
         worker._last_turn_usage = CODEX_USAGE
         worker._last_turn_observed_at = OBSERVED
-        outcomes = [{'accepted': False}, {'accepted': True}]
 
         def post(path, value):
             client.calls.append((path, copy.deepcopy(value)))
-            return outcomes.pop(0)
+            return {'accepted': False}
 
         client.post = post
-        worker.report(force=True)
-        self.assertEqual(len(client.calls), 2)
+        with self.assertRaises(Exception):
+            worker.report(force=True)
+        self.assertEqual(len(client.calls), 1)
         self.assertTrue(client.calls[0][1]['usage'])
-        self.assertEqual(client.calls[1][1]['usage'], [])
-        self.assertEqual(worker.usage_rejected, 1)
-        self.assertTrue(all('span' in item for item in worker.spans))
-        self.assertEqual(worker.next_report, 1025.0)
+        self.assertEqual(worker.usage_rejected, 0)
+        self.assertEqual(worker.next_report, 0.0)
 
     def test_report_failure_without_usage_no_retry(self):
         worker, client = self._worker()
         worker.ready = True
+        first = _hub_http_error(400)
 
         def post(path, value):
             client.calls.append((path, copy.deepcopy(value)))
-            raise RuntimeError('rejected')
+            raise first
 
         client.post = post
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(WorkerError) as caught:
             worker.report(force=True)
-        self.assertEqual(str(caught.exception), 'rejected')
+        self.assertIs(caught.exception, first)
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0][1]['usage'], [])
         self.assertEqual(worker.spans, [])
@@ -784,16 +816,18 @@ class ReportPayloadTests(unittest.TestCase):
         worker.ready = True
         worker._last_turn_usage = CODEX_USAGE
         worker._last_turn_observed_at = OBSERVED
-        outcomes = [ValueError('first'), KeyError('second')]
+        first = _hub_http_error(400)
+        second = _hub_http_error(400, 'Still Bad')
+        outcomes = [first, second]
 
         def post(path, value):
             client.calls.append((path, copy.deepcopy(value)))
             raise outcomes.pop(0)
 
         client.post = post
-        with self.assertRaises(KeyError) as caught:
+        with self.assertRaises(WorkerError) as caught:
             worker.report(force=True)
-        self.assertEqual(caught.exception.args, ('second',))
+        self.assertIs(caught.exception, second)
         self.assertEqual(len(client.calls), 2)
         self.assertTrue(client.calls[0][1]['usage'])
         self.assertEqual(client.calls[1][1]['usage'], [])
@@ -806,7 +840,7 @@ class ReportPayloadTests(unittest.TestCase):
         worker.ready = True
         worker._last_turn_usage = CODEX_USAGE
         worker._last_turn_observed_at = OBSERVED
-        outcomes = [RuntimeError('rejected'), {'accepted': True}]
+        outcomes = [_hub_http_error(400), {'accepted': True}]
 
         def post(path, value):
             client.calls.append((path, copy.deepcopy(value)))
@@ -821,6 +855,49 @@ class ReportPayloadTests(unittest.TestCase):
         self.assertEqual(client.calls[1][1]['usage'], [])
         self.assertEqual(worker.usage_rejected, 1)
         self.assertTrue(all('span' in item for item in worker.spans))
+
+    def _assert_no_retry_on(self, error):
+        worker, client = self._worker('codex')
+        worker.ready = True
+        worker._last_turn_usage = CODEX_USAGE
+        worker._last_turn_observed_at = OBSERVED
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            raise error
+
+        client.post = post
+        with self.assertRaises(type(error)) as caught:
+            worker.report(force=True)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(client.calls[0][1]['usage'])
+        self.assertEqual(worker.usage_rejected, 0)
+        self.assertEqual(worker.next_report, 0.0)
+
+    def test_report_http_500_with_usage_no_retry(self):
+        self._assert_no_retry_on(_hub_http_error(500, 'Internal Server Error'))
+
+    def test_report_http_503_with_usage_no_retry(self):
+        self._assert_no_retry_on(_hub_http_error(503, 'Service Unavailable'))
+
+    def test_report_http_429_with_usage_no_retry(self):
+        self._assert_no_retry_on(_hub_http_error(429, 'Too Many Requests'))
+
+    def test_report_http_401_with_usage_no_retry(self):
+        self._assert_no_retry_on(_hub_http_error(401, 'Unauthorized'))
+
+    def test_report_lease_lost_409_with_usage_no_retry(self):
+        self._assert_no_retry_on(_lease_lost())
+
+    def test_report_connection_failed_with_usage_no_retry(self):
+        self._assert_no_retry_on(_hub_connection_failed())
+
+    def test_report_socket_timeout_with_usage_no_retry(self):
+        self._assert_no_retry_on(socket.timeout('timed out'))
+
+    def test_report_timeout_error_with_usage_no_retry(self):
+        self._assert_no_retry_on(TimeoutError('timed out'))
 
 
 if __name__ == '__main__':

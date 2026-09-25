@@ -1055,6 +1055,8 @@ class LoopTests(unittest.TestCase):
         self.assert_hidden(logs, token, prompt, answer, 'SNAPSHOT-SECRET', 'PREFLIGHT-SECRET')
 
     def test_outcome_carries_usage_rejected_when_hub_drops_usage(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
         worker, client, adapter, _ = self.setup_worker()
         def execute(handle, prompt_text, deadline, *, task_kind):
             adapter.calls.append('execute')
@@ -1073,7 +1075,8 @@ class LoopTests(unittest.TestCase):
                     and value['usage'] and not dropped[0]):
                 dropped[0] = True
                 client.calls.append((path, copy.deepcopy(value)))
-                raise RuntimeError('usage rejected')
+                raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                    'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
             return original(path, value)
         client.post = post
         result = worker.run()
