@@ -1,0 +1,1 @@
+# MyHero usefulness benchmark package.
