@@ -5,6 +5,7 @@ import json
 import os
 import re
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import unittest
@@ -455,11 +456,11 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(completion['error_code'], 'purpose_missing')
         self.assertIs(completion['model_call_attempted'], False)
         self.assertEqual(set(completion), {'lease_token', 'output', 'exit_code', 'error_code',
-                                           'model_call_attempted'})
-        # A success keeps exactly today's payload.
+                                           'model_call_attempted', 'step'})
+        # A success keeps today's payload plus the claimed step (MyHero MH-005).
         worker, client, adapter, _ = self.setup_worker()
         worker.run()
-        self.assertEqual(set(client.completions[0]), {'lease_token', 'output', 'exit_code'})
+        self.assertEqual(set(client.completions[0]), {'lease_token', 'output', 'exit_code', 'step'})
 
     def test_sigterm_interrupt_during_execute_sends_one_worker_stopping_completion(self):
         # Demand's review of a0fd2c3: the entrypoint's SIGTERM handler raises
@@ -786,6 +787,50 @@ class LoopTests(unittest.TestCase):
         client.task['messages'] = client.room['messages'] = messages
         text = task_prompt(client.task, client.room, 'grok')
         for m in messages: self.assertIn(m['text'], text)
+
+    def test_claim_sends_worker_id_and_completion_echoes_step(self):
+        # MyHero MH-005: the hub records which execution held the attempt.
+        worker, client, _, _ = self.setup_worker()
+        client.task['step'] = client.room['step'] = 3
+        worker.run()
+        claims = [value for path, value in client.calls if path.endswith('/claim')]
+        self.assertEqual(claims[0], {'worker_id': 'grok-live'})
+        self.assertEqual(client.completions[0]['step'], 3)
+
+    def test_worker_id_the_hub_would_refuse_is_left_out_of_the_claim(self):
+        worker, client, _, _ = self.setup_worker()
+        worker.settings = replace(worker.settings, worker_id='g' * 49)
+        worker.run()
+        claims = [value for path, value in client.calls if path.endswith('/claim')]
+        self.assertEqual(claims[0], {})
+
+    def test_repair_errors_reach_the_prompt(self):
+        worker, client, _, _ = self.setup_worker()
+        client.task['repair'] = {'attempt': 1, 'errors': ['invariant failed: len(batch_outcomes) != value']}
+        text = task_prompt(client.task, client.room, 'grok')
+        self.assertIn('rejected by the hub', text)
+        self.assertIn('invariant failed: len(batch_outcomes) != value', text)
+        for bad in ({'errors': 'x'}, {'errors': []}, {'errors': ['y' * 161]}, {'errors': [1]},
+                    {'errors': ['z'] * 9}, 'repair'):
+            with self.subTest(bad=bad):
+                client.task['repair'] = bad
+                text = task_prompt(client.task, client.room, 'grok')
+                self.assertNotIn('rejected by the hub', text)
+                self.assertNotIn('previous_attempt_rejected_by_hub', text)
+        del client.task['repair']
+        self.assertNotIn('previous_attempt_rejected_by_hub', task_prompt(client.task, client.room, 'grok'))
+
+    def test_idle_drain_records_its_drain_code(self):
+        # Light 25d gap: pins outcome['drain_code'] on the second idle_drained path.
+        worker, client, adapter, _ = self.setup_worker(); client.empty = True
+        seen = {'n': 0}
+        def maintain(handle):
+            adapter.calls.append('maintain'); seen['n'] += 1
+            if seen['n'] == 2: raise CodeError('copilot_warm_session_lost')
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(result['drain_code'], 'copilot_warm_session_lost')
 
     def test_insufficient_server_deadline_never_calls_provider(self):
         worker, client, adapter, _ = self.setup_worker(); client.task['deadline'] = 710

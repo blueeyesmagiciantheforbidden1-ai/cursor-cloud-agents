@@ -983,6 +983,24 @@ class GrokAdapter(unittest.TestCase):
                 g.close(handle)
                 self.assertEqual(fixture.events, ['stop', 'commit-release'])
 
+    def test_quota_refresh_reload_schema_miss_drains(self):
+        # Light 25d gap: a malformed watcher ack during an idle refresh drains
+        # (strict schema, drain classification), never fail + strike.
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                fixture.overrides['x.ai/auth/info'] = g.NativeError('native_internal_reload_schema')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_quota_refresh_transport_lost$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
     def test_quota_refresh_transport_failure_propagates_from_maintain(self):
         clock = StepClock()
         fixture = Fixture()
