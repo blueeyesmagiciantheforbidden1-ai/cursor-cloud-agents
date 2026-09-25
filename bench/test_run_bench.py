@@ -166,7 +166,10 @@ class TestScopeAndScoring(unittest.TestCase):
 class TestOrderingAndBenchmark(unittest.TestCase):
     def test_deterministic_order_for_seed(self):
         tasks = run_bench.list_tasks(TASKS_ROOT)
-        self.assertEqual(len(tasks), 10)
+        # Every task directory with a meta.json is listed (the set grows over time).
+        expected = sorted(p.name for p in TASKS_ROOT.iterdir() if (p / 'meta.json').is_file())
+        self.assertEqual(sorted(p.name for p in tasks), expected)
+        self.assertGreaterEqual(len(tasks), 10)
         a = [p.name for p in shuffled_tasks(tasks, 42)]
         b = [p.name for p in shuffled_tasks(tasks, 42)]
         c = [p.name for p in shuffled_tasks(tasks, 7)]
