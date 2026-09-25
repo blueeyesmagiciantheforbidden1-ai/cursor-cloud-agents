@@ -1323,6 +1323,150 @@ class LoopTests(unittest.TestCase):
         self.assertIn('trace_id=broker.execution_uid', source)
         self.assertIn("value.get('kind') == 'runcrew_live_span'", source)
 
+    def test_idle_hour_reports_refresh_quota_observed_at_within_900s(self):
+        # Fake idle hour: maintain refreshes quota every 600s of fake time so
+        # every /v1/workers/report carries an observed_at within 900s of send.
+        epoch = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+
+        def iso(fake_now):
+            return datetime.fromtimestamp(epoch + fake_now, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+        def fake_from_iso(value):
+            return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp() - epoch
+
+        clock = Clock()
+        client = Client(clock)
+        client.empty = True
+        adapter = Adapter()
+        reports = []
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            return SimpleNamespace(
+                state='ready',
+                next_quota_refresh=clock.now + 600,
+                preflight={
+                    'quota': {
+                        'observed_at': iso(clock.now),
+                        'native_included_used_percent': 50,
+                        'native_usage_status': 'available',
+                        'period': {'start': iso(clock.now - 1000), 'end': iso(clock.now + 100000)},
+                    },
+                    'same_process_account_model_quota': True,
+                },
+            )
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            if clock.now >= handle.next_quota_refresh:
+                handle.preflight['quota'] = {
+                    **handle.preflight['quota'],
+                    'observed_at': iso(clock.now),
+                }
+                handle.next_quota_refresh = clock.now + 600
+
+        original_post = client.post
+
+        def post(path, value):
+            if path.endswith('/report'):
+                reports.append((clock.now, copy.deepcopy(value)))
+            return original_post(path, value)
+
+        adapter.prepare, adapter.maintain, client.post = prepare, maintain, post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=3600), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep, log=lambda record: None)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertGreater(len(reports), 10)
+        quota_reports = 0
+        for send_at, payload in reports:
+            usage = payload.get('usage') or []
+            for row in usage:
+                if row.get('metric') != 'quota_percent':
+                    continue
+                quota_reports += 1
+                age = abs(send_at - fake_from_iso(row['observed_at']))
+                self.assertLessEqual(age, 900, f'stale at send={send_at} observed_at={row["observed_at"]}')
+        self.assertGreater(quota_reports, 0)
+
+    def test_idle_hour_refresh_failure_keeps_old_observed_at_and_stays_ready(self):
+        epoch = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
+
+        def iso(fake_now):
+            return datetime.fromtimestamp(epoch + fake_now, timezone.utc).isoformat().replace('+00:00', 'Z')
+
+        clock = Clock()
+        client = Client(clock)
+        client.empty = True
+        adapter = Adapter()
+        original_observed = iso(clock.now)
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            return SimpleNamespace(
+                state='ready',
+                next_quota_refresh=clock.now + 600,
+                preflight={
+                    'quota': {
+                        'observed_at': original_observed,
+                        'native_included_used_percent': 50,
+                        'native_usage_status': 'available',
+                        'period': {'start': iso(clock.now - 1000), 'end': iso(clock.now + 100000)},
+                    },
+                    'same_process_account_model_quota': True,
+                },
+            )
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            if clock.now >= handle.next_quota_refresh:
+                try:
+                    raise RuntimeError('synthetic quota refresh failure')
+                except Exception:
+                    pass
+
+        adapter.prepare, adapter.maintain = prepare, maintain
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=3600), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep, log=lambda record: None)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertTrue(worker.ready or result['outcome'] == 'idle_drained')
+        idle_reports = [v for p, v in client.calls if p.endswith('/report') and v.get('status') == 'idle']
+        self.assertGreater(len(idle_reports), 0)
+        for payload in idle_reports:
+            for row in payload.get('usage') or []:
+                if row.get('metric') == 'quota_percent':
+                    self.assertEqual(row['observed_at'], original_observed)
+
+    def test_quota_refresh_transport_lost_drains_without_a_strike(self):
+        # Optional idle quota telemetry must never fail or strike a healthy agent.
+        # Model on warm_session_expired: idle_drained / exit 0 / close / no error_code.
+        for code in (
+            'codex_quota_refresh_transport_lost',
+            'grok_quota_refresh_transport_lost',
+            'copilot_quota_refresh_transport_lost',
+        ):
+            with self.subTest(code=code):
+                worker, client, adapter, clock = self.setup_worker()
+                client.empty = True
+
+                def maintain(handle, code=code):
+                    adapter.calls.append('maintain')
+                    raise CodeError(code)
+
+                adapter.maintain = maintain
+                result = worker.run()
+                self.assertEqual(result['outcome'], 'idle_drained')
+                self.assertNotIn('error_code', result)
+                self.assertEqual(worker.last_exit, 0)
+                self.assertEqual(adapter.calls.count('maintain'), 1)
+                self.assertEqual(client.claims, 0)
+                self.assertNotIn('execute', adapter.calls)
+                self.assertIn('close', adapter.calls)
+                self.assertEqual(live_loop.maintain_fault(CodeError(code)), 'drain')
+                self.assertIn(code, live_loop._IDLE_DRAIN_CODES)
+
 
 class BrokerRenewGuardTests(unittest.TestCase):
     """Fail codes for an exhausted or rejected renew. Neither is a retry or a drain."""

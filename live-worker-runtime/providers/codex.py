@@ -38,6 +38,10 @@ WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
 # does not cap the native deadline on warm_deadline.
 EXECUTE_WARM_FLOOR = FINALIZE_RESERVE + 30
 RENEW_SECONDS = 20
+# Hub release 3 marks usage stale 900 s after observed_at; refresh sooner.
+QUOTA_REFRESH_SECONDS = 600
+# Swallowed validation failures back off so maintain() does not re-request every poll.
+QUOTA_RETRY_SECONDS = 120
 # Recorded by the successful pinned Linux build in two independent empty homes.
 CONFIG_SHA = 'c584ec84021d23203d0c444cf474c3f184a0b759faf51bed0ba1fc16361af9cf'
 REQUIREMENTS_SHA = '25b86fa3671a4ee1ea904a1f5777c164347763d01dda591fcac3022b64235e10'
@@ -260,6 +264,7 @@ class Handle:
     credential_writeback: str = 'pending'
     credential_version_ref: str | None = None
     next_renew: float = 0
+    next_quota_refresh: float = 0
     lock: object = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -367,6 +372,7 @@ def _collect(handle):
                         'canonical_account_ref': session.lease.canonical_account_ref,
                         'selection_basis': 'exact_reviewed_diverse_model_and_native_maximum_effort',
                         'universal_best_claimed': False}
+    handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
     handle.gate = gate
 
 
@@ -459,6 +465,42 @@ def prepare(session, heartbeat, deadline):
         _fail(handle, error)
 
 
+def _refresh_quota(handle):
+    """Re-measure quota for hub reports. Validation failures keep the last real row.
+
+    WarmRPC.request sets protocol_state='denied' on ANY exception (error frame,
+    id mismatch, tick/deadline, pre-send refusal), so every native.request
+    failure here is transport lost and drains via the fixed code below. Only
+    _quota(...) failures after a successful request are swallowed. Do not
+    restore protocol_state. Skip when the warm window is too short or the
+    transport is not idle-ready; leave next_quota_refresh due so the next
+    tick retries.
+    """
+    if time.monotonic() < handle.next_quota_refresh:
+        return
+    native = handle.native
+    if handle.warm_deadline - time.monotonic() < 20:
+        return
+    # Gate before any request: only real RPC outcomes remain (denied already).
+    if getattr(native, 'protocol_state', None) != 'thread_ready':
+        return
+    # Re-bound after possible _renew spend earlier in this maintain() tick.
+    native.deadline = min(handle.warm_deadline, time.monotonic() + 15)
+    try:
+        rates = native.request('account/rateLimits/read', {})
+    except Exception:
+        # Protocol already 'denied'; drain idle without a controller strike.
+        raise LiveCodexError('codex_quota_refresh_transport_lost') from None
+    try:
+        quota = _quota(rates, handle.session.lease.canonical_account_ref)
+        handle.preflight['quota'] = quota
+        handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
+    except Exception:
+        # Keep last real observed_at; back off so a persistent validation miss
+        # does not re-request on every idle poll.
+        handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
+
+
 def maintain(handle):
     _enter(handle)
     try:
@@ -478,6 +520,7 @@ def maintain(handle):
             # miss stays due. A non-vetted broker failure still fails below.
             if not _idle_hub_loss(handle, error):
                 raise
+        _refresh_quota(handle)
         return handle.readiness
     except Exception as error:
         _fail(handle, error)

@@ -30,6 +30,35 @@ TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
 # The prepare() argument is only the startup budget. The live loop then waits
 # up to an hour. This cap does not slide; maintain() must not push it forward.
 WARM_SECONDS = 3600
+# Hub release 3 marks usage stale 900 s after observed_at; refresh sooner.
+QUOTA_REFRESH_SECONDS = 600
+# Swallowed validation failures back off so maintain() does not re-request every poll.
+QUOTA_RETRY_SECONDS = 120
+# Idle refresh temporarily replaces the warm idle_deadline horizon (~4500 s).
+QUOTA_REFRESH_DEADLINE_SECONDS = 30
+# Intact error frames from Native.request: id matched / frame consumed.
+# copilot_native_request_failed also covers id mismatch and missing result, but
+# an id mismatch during refresh can only come from a stream already desynced
+# before the refresh, and execute() would fail on it anyway — so swallow both.
+_COPILOT_QUOTA_REFRESH_SWALLOW = frozenset({
+    'copilot_quota_exhausted', 'copilot_native_request_failed',
+})
+# Native.request caps at 24 calls (index < 24). Budget for idle quota refresh:
+#   prepare: connect + _fresh_metadata(3) + session.create + setAllowedModels
+#            + getCurrent = 7 requests
+#   execute: _fresh_metadata(3) + getCurrent + session.send + getCurrent
+#            + runtime.shutdown = 7 requests
+#   close() on a never-executed idle handle: Native.close() only killpg/wait —
+#            it does NOT send runtime.shutdown through request(). The execute
+#            reserve still covers a later turn (which does request shutdown).
+#   idle horizon ≈ WARM_SECONDS (3600) + prepare slack ≈ 4500 s → at most
+#            ceil(4500/600) = 8, typically 7 refreshes at 600 s steps
+#   remaining after prepare+execute reserve: 24 - 7 - 7 = 10 >= 7 refreshes
+#   each refresh is ONE account.getQuota request
+# Skip when index + 1 + EXECUTE_RESERVE > 24 so execute never hits the cap.
+_REFRESH_NATIVE_REQUESTS = 1
+_EXECUTE_NATIVE_REQUESTS = 7
+_NATIVE_REQUEST_CAP = 24
 # Idle maintain() failures that mean the warm native session is gone. A dead
 # stdio pipe is the third case and arrives as OSError, which has no code.
 # Every other vetted CopilotError keeps its own code. copilot_hub_heartbeat_lost
@@ -519,6 +548,7 @@ class Handle:
     finished: bool = False
     close_failed: bool = False
     credential_version: str = field(default='', repr=False)
+    next_quota_refresh: float = 0
 
     @property
     def readiness(self):
@@ -608,6 +638,7 @@ def prepare(session, heartbeat, deadline):
         protocol = handle.native.request('connect')
         need(type(protocol) is dict and protocol.get('protocolVersion') == 3, 'copilot_protocol_unsupported')
         handle.preflight = _fresh_metadata(handle)
+        handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
         sid = str(uuid4())
         created = handle.native.request('session.create', {'sessionId': sid, 'model': MODEL, 'reasoningEffort': EFFORT,
             'workingDirectory': str(session.home/'work'), 'availableTools': [], 'excludedTools': [],
@@ -640,6 +671,58 @@ def prepare(session, heartbeat, deadline):
         raise CopilotError('copilot_prepare_requires_reconciliation') from None
 
 
+def _refresh_quota(handle):
+    """Re-measure quota for hub reports. Validation failures keep the last real row.
+
+    Quota-only: one account.getQuota request, then _billing. Never reads or
+    writes owner_verified (close() publishes credentials only after identity
+    proof; execute()'s _fresh_metadata still re-verifies the owner).
+
+    Request arithmetic (Native.request cap 24): prepare uses 7, execute needs 7
+    (including runtime.shutdown). Idle close() does not request shutdown.
+    Each refresh is 1 request; 24 - 7 - 7 = 10 >= 7 idle-horizon refreshes.
+    Skip when index + 1 + EXECUTE_RESERVE > 24.
+
+    Intact error frames (copilot_quota_exhausted / copilot_native_request_failed)
+    are swallowed like validation. Any other request() failure, including
+    deadline/OSError, becomes copilot_quota_refresh_transport_lost before
+    maintain()'s except (which would otherwise map OSError to
+    copilot_warm_session_lost).
+    """
+    if time.monotonic() < handle.next_quota_refresh:
+        return
+    native = handle.native
+    index = getattr(native, 'index', 0)
+    if index + _REFRESH_NATIVE_REQUESTS + _EXECUTE_NATIVE_REQUESTS > _NATIVE_REQUEST_CAP:
+        return
+    old_deadline = native.deadline
+    native.deadline = min(handle.idle_deadline, time.monotonic() + QUOTA_REFRESH_DEADLINE_SECONDS)
+    try:
+        try:
+            result = native.request('account.getQuota')
+        except Exception as error:
+            code = provider_errors.error_code(error)
+            if code in _COPILOT_QUOTA_REFRESH_SWALLOW:
+                handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
+                return
+            # Convert before maintain()'s except remaps OSError / idle loss.
+            raise CopilotError('copilot_quota_refresh_transport_lost') from None
+        try:
+            quota = _billing(result, handle.session.lease.canonical_account_ref)
+            handle.preflight = {
+                **handle.preflight,
+                'quota': quota,
+                'same_process_account_model_quota': quota['native_usage_status'] == 'available',
+            }
+            handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
+        except Exception:
+            # Keep last real observed_at; back off so a persistent validation miss
+            # does not re-request on every idle poll.
+            handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
+    finally:
+        native.deadline = old_deadline
+
+
 def maintain(handle):
     """Renew an idle session.
 
@@ -668,6 +751,7 @@ def maintain(handle):
     try:
         need(time.monotonic() < handle.idle_deadline, 'copilot_idle_deadline_expired')
         handle.native.maintain()
+        _refresh_quota(handle)
         return handle.readiness
     except Exception as error:
         code = provider_errors.error_code(error)

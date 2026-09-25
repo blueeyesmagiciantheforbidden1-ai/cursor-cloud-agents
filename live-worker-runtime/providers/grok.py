@@ -31,6 +31,12 @@ ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 MAX_PROMPT_BYTES = 200000
 MAX_ANSWER_BYTES = 15000
+# Hub release 3 marks usage stale 900 s after observed_at; refresh sooner.
+QUOTA_REFRESH_SECONDS = 600
+# Swallowed validation failures back off so maintain() does not re-request every poll.
+QUOTA_RETRY_SECONDS = 120
+# Idle refresh temporarily replaces the prepare-era native.deadline.
+QUOTA_REFRESH_DEADLINE_SECONDS = 30
 NativeProcess = Native
 
 
@@ -144,13 +150,28 @@ def _billing(value, topup):
             'automatic_improvement_ready': False}
 
 
-def _fresh_metadata(native):
-    account = _owner(native.request('x.ai/auth/info', {}))
-    catalog = _catalog(native.request('x.ai/models/list', {}))
-    quota = _billing(native.request('x.ai/billing', {}), native.request('x.ai/auto-topup-rule', {}))
+def _metadata_responses(native):
+    """Issue every metadata RPC. Transport errors propagate to the caller."""
+    return (
+        native.request('x.ai/auth/info', {}),
+        native.request('x.ai/models/list', {}),
+        native.request('x.ai/billing', {}),
+        native.request('x.ai/auto-topup-rule', {}),
+    )
+
+
+def _metadata_preflight(auth, models, billing, topup):
+    """Validate already-fetched metadata responses into a preflight dict."""
+    account = _owner(auth)
+    catalog = _catalog(models)
+    quota = _billing(billing, topup)
     return {'account': account, 'catalog': catalog, 'quota': quota,
             'same_process_account_model_billing': True,
             'same_process_account_model_quota': quota['native_usage_status'] == 'available'}
+
+
+def _fresh_metadata(native):
+    return _metadata_preflight(*_metadata_responses(native))
 
 
 def _home(session):
@@ -200,6 +221,7 @@ class Handle:
     close_failed: bool = False
     credential_version: str = field(default='', repr=False)
     internal_acks: dict = field(default_factory=dict)
+    next_quota_refresh: float = 0
 
     @property
     def readiness(self):
@@ -265,6 +287,7 @@ def prepare(session, heartbeat, deadline):
              and not any(row.get('id') == 'xai.api_key' for row in methods), 'grok_cached_subscription_auth_required')
         handle.native.request('authenticate', {'methodId': 'cached_token', '_meta': {'headless': True}})
         handle.preflight = _fresh_metadata(handle.native)
+        handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
         created = handle.native.request('session/new', {'cwd': str(session.home / 'work'), 'mcpServers': [],
             '_meta': {'sessionKind': 'headless', 'modelId': MODEL, 'reasoningEffort': EFFORT}})
         need(type(created) is dict and type(created.get('sessionId')) is str and bool(created['sessionId']),
@@ -285,12 +308,64 @@ def prepare(session, heartbeat, deadline):
         raise
 
 
+# Intact error / missing-result frames from Native.request: id matched and the
+# frame was consumed; the stream stays in sync. native_rpc_<int> and
+# native_rpc_failed come from rpc_error_code(); native_result_missing from need().
+_GROK_QUOTA_REFRESH_SWALLOW = frozenset({
+    'grok_quota_exhausted', 'native_rpc_failed', 'native_result_missing',
+})
+
+
+def _grok_quota_refresh_swallowed(error):
+    code = str(error) if isinstance(error, NativeError) else ''
+    if code in _GROK_QUOTA_REFRESH_SWALLOW:
+        return True
+    # native_rpc_<int> from rpc_error_code when error.code is an int.
+    return code.startswith('native_rpc_') and code[len('native_rpc_'):].isdigit()
+
+
+def _refresh_quota(handle):
+    """Re-measure quota for hub reports. Validation failures keep the last real row.
+
+    Intact error frames and native_result_missing are swallowed like validation
+    failures (stream still sync). Everything else from request()/send() is
+    transport lost and drains via grok_quota_refresh_transport_lost.
+    native_extension_failed surfaces in unwrap() during validation and is
+    swallowed by the inner try. The prepare-era native.deadline is replaced
+    for the refresh window and restored after.
+    """
+    if time.monotonic() < handle.next_quota_refresh:
+        return
+    native = handle.native
+    old_deadline = native.deadline
+    native.deadline = time.monotonic() + QUOTA_REFRESH_DEADLINE_SECONDS
+    try:
+        try:
+            responses = _metadata_responses(native)
+        except Exception as error:
+            if _grok_quota_refresh_swallowed(error):
+                handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
+                return
+            raise NativeError('grok_quota_refresh_transport_lost') from None
+        try:
+            handle.preflight = _metadata_preflight(*responses)
+            handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
+        except Exception:
+            # Keep last real observed_at; back off so a persistent validation
+            # miss (including native_extension_failed) does not re-request
+            # on every idle poll.
+            handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
+    finally:
+        native.deadline = old_deadline
+
+
 def maintain(handle):
     """Call during idle polling. The lease is 240s; transient renew failures are tolerated for 180s."""
     need(not handle.finished and not handle.attempted and not handle.close_failed and handle.native is not None, 'grok_handle_not_idle')
     need(handle.native.process.poll() is None, 'grok_warm_process_ended')
     if time.monotonic() >= handle.native.next_renew:
         handle.native.next_renew = broker_renew.next_due(_renew(handle), 20)
+    _refresh_quota(handle)
     return handle.readiness
 
 

@@ -1,6 +1,7 @@
 """Offline lifecycle, admission and transport tests; no provider/Cloud calls."""
 import copy
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -8,6 +9,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 import broker_renew
+import live_loop
+import provider_errors
 from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
 from agent_hub.credential_broker_service import BoundaryError
 from providers import copilot as c
@@ -72,11 +75,13 @@ class FakeNative:
         # Matches Native.__init__: the first renew is not due immediately.
         # maintain() advances this only after renew() returns, same as _tick.
         self.next_renew = time.monotonic() + 3600
+        self.index = 0
         self.late = []
         self.instances.append(self)
 
     def request(self, method, params=None):
         c.Native._tick(self)
+        self.index += 1
         self.calls.append((method, copy.deepcopy(params)))
         if method == 'connect': return {'protocolVersion': 3}
         if method == 'auth.getStatus': return copy.deepcopy(self.owner)
@@ -546,6 +551,253 @@ class Lifecycle(unittest.TestCase):
         result = c.execute(handle, 'x'*200000, time.monotonic()+100)
         self.assertGreater(len(result['text'].split()), 40)
         self.assertLessEqual(len(result['text'].encode()), 15000)
+
+    def test_quota_refresh_fires_after_quota_refresh_seconds_not_before(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            before = sum(1 for m, _ in handle.native.calls if m == 'account.getQuota')
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before)
+            clock.advance(c.QUOTA_REFRESH_SECONDS - 1)
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before)
+            clock.advance(1)
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 1)
+            c.close(handle)
+
+    def test_quota_refresh_success_replaces_observed_at(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            old = handle.preflight['quota']['observed_at']
+            verified = handle.owner_verified
+            handle.native.quota = quota()
+            handle.native.quota['quotaSnapshots']['premium_interactions']['remainingPercentage'] = 55.0
+            fixed = datetime(2099, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+            class FakeDateTime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed
+
+            before_auth = sum(1 for m, _ in handle.native.calls if m == 'auth.getStatus')
+            with patch('providers.copilot.datetime', FakeDateTime):
+                c.maintain(handle)
+            self.assertEqual(handle.preflight['quota']['observed_at'], fixed.isoformat())
+            self.assertAlmostEqual(handle.preflight['quota']['native_included_used_percent'], 45.0)
+            self.assertNotEqual(handle.preflight['quota']['observed_at'], old)
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_REFRESH_SECONDS)
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'auth.getStatus'), before_auth)
+            c.close(handle)
+
+    def test_quota_refresh_validation_failure_keeps_old_row_and_retries_at_120s(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            old = copy.deepcopy(handle.preflight['quota'])
+            verified = handle.owner_verified
+            handle.next_quota_refresh = clock()
+            handle.native.quota = {'broken': True}
+            before = sum(1 for m, _ in handle.native.calls if m == 'account.getQuota')
+            readiness = c.maintain(handle)
+            self.assertTrue(readiness['ready_for_project_prompt'])
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 1)
+            clock.advance(c.QUOTA_RETRY_SECONDS - 1)
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 1)
+            clock.advance(1)
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 2)
+            self.assertEqual(handle.owner_verified, verified)
+            c.close(handle)
+
+    def test_quota_refresh_exhausted_does_not_raise(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            old = copy.deepcopy(handle.preflight['quota'])
+            verified = handle.owner_verified
+            handle.next_quota_refresh = clock()
+            exhausted = quota()
+            exhausted['quotaSnapshots']['premium_interactions']['remainingPercentage'] = 0
+            exhausted['quotaSnapshots']['premium_interactions']['usedRequests'] = 20000
+            handle.native.quota = exhausted
+            readiness = c.maintain(handle)
+            self.assertTrue(readiness['ready_for_project_prompt'])
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
+            c.close(handle)
+
+    def test_quota_refresh_error_frame_keeps_old_row_and_retries_at_120s(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            old = copy.deepcopy(handle.preflight['quota'])
+            verified = handle.owner_verified
+            handle.next_quota_refresh = clock()
+            real_request = handle.native.request
+            before = sum(1 for m, _ in handle.native.calls if m == 'account.getQuota')
+
+            def error_frame(method, params=None):
+                if method == 'account.getQuota':
+                    handle.native.index += 1
+                    handle.native.calls.append((method, copy.deepcopy(params)))
+                    raise c.CopilotError('copilot_native_request_failed')
+                return real_request(method, params)
+
+            handle.native.request = error_frame
+            readiness = c.maintain(handle)
+            self.assertTrue(readiness['ready_for_project_prompt'])
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 1)
+            clock.advance(c.QUOTA_RETRY_SECONDS - 1)
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 1)
+            clock.advance(1)
+
+            def exhausted_frame(method, params=None):
+                if method == 'account.getQuota':
+                    handle.native.index += 1
+                    handle.native.calls.append((method, copy.deepcopy(params)))
+                    raise c.CopilotError('copilot_quota_exhausted')
+                return real_request(method, params)
+
+            handle.native.request = exhausted_frame
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 2)
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertFalse(handle.finished)
+            c.close(handle)
+
+    def test_quota_refresh_transport_failure_propagates_from_maintain(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            verified = handle.owner_verified
+            handle.next_quota_refresh = clock()
+            real_request = handle.native.request
+
+            def boom(method, params=None):
+                if method == 'account.getQuota':
+                    handle.native.index += 1
+                    handle.native.calls.append((method, copy.deepcopy(params)))
+                    raise OSError('synthetic transport failure')
+                return real_request(method, params)
+
+            handle.native.request = boom
+            with self.assertRaisesRegex(c.CopilotError, '^copilot_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'copilot_quota_refresh_transport_lost')
+            self.assertEqual(provider_errors.error_code(caught.exception),
+                             'copilot_quota_refresh_transport_lost')
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertTrue(handle.finished)
+
+    def test_quota_refresh_deadline_bound_drains_on_hang(self):
+        # Idle native.deadline is the ~4500 s warm horizon; refresh must re-bound
+        # to 30 s so a hung account.getQuota cannot block maintain()/hub reports.
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            warm_deadline = handle.native.deadline
+            self.assertEqual(warm_deadline, handle.idle_deadline)
+            real_request = handle.native.request
+            seen = {}
+
+            def hang(method, params=None):
+                if method == 'account.getQuota':
+                    handle.native.index += 1
+                    handle.native.calls.append((method, copy.deepcopy(params)))
+                    seen['start'] = clock()
+                    seen['bound'] = handle.native.deadline
+                    while clock() < handle.native.deadline:
+                        clock.advance(1)
+                    raise c.CopilotError('copilot_native_deadline_expired')
+                return real_request(method, params)
+
+            handle.native.request = hang
+            native = handle.native  # close() on the drain path clears handle.native
+            with self.assertRaisesRegex(c.CopilotError, '^copilot_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(seen['bound'], seen['start'] + c.QUOTA_REFRESH_DEADLINE_SECONDS)
+            self.assertLess(seen['bound'], warm_deadline)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+            self.assertEqual(native.deadline, warm_deadline)
+            self.assertTrue(handle.finished)
+
+    def test_quota_refresh_skipped_when_native_request_budget_tight(self):
+        # prepare=7, refresh=1, execute=7; skip when index + 1 + 7 > 24.
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            self.assertEqual(handle.native.index, 7)
+            handle.native.index = 17  # 17 + 1 + 7 = 25 > 24
+            old = copy.deepcopy(handle.preflight['quota'])
+            before = len(handle.native.calls)
+            handle.next_quota_refresh = clock()
+            c.maintain(handle)
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(len(handle.native.calls), before)
+            self.assertEqual(handle.native.index, 17)
+            result = c.execute(handle, 'project', clock() + 100)
+            self.assertEqual(result['text'], 'The project answer.')
+            self.assertTrue(result['native_stopped'])
+
+    def test_quota_refresh_idle_horizon_keeps_observed_at_within_900s(self):
+        # 1 request/refresh → enough budget for a full idle horizon at 600 s steps.
+        clock = StepClock()
+        origin = datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+        class FakeDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return origin.fromtimestamp(origin.timestamp() + (clock() - 1_000_000.0), tz=timezone.utc)
+
+        with patch('time.monotonic', clock), patch('providers.copilot.datetime', FakeDateTime):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 100000
+            while clock() + c.QUOTA_REFRESH_SECONDS < handle.idle_deadline:
+                clock.advance(c.QUOTA_REFRESH_SECONDS)
+                c.maintain(handle)
+                observed = datetime.fromisoformat(handle.preflight['quota']['observed_at'])
+                age = (FakeDateTime.now(timezone.utc) - observed).total_seconds()
+                self.assertLessEqual(age, 900)
+            quota_calls = sum(1 for m, _ in handle.native.calls if m == 'account.getQuota')
+            # prepare issues 1 getQuota; idle steps add one per 600 s until the horizon.
+            self.assertGreaterEqual(quota_calls, 1 + (c.WARM_SECONDS // c.QUOTA_REFRESH_SECONDS) - 1)
+            self.assertLessEqual(handle.native.index,
+                                 c._NATIVE_REQUEST_CAP - c._EXECUTE_NATIVE_REQUESTS)
+            c.close(handle)
 
 
 class Admission(unittest.TestCase):

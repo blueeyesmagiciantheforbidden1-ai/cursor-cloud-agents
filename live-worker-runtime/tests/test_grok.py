@@ -85,6 +85,8 @@ class Fixture:
                 self.closed = False
                 self.process = SimpleNamespace(poll=lambda: 0 if self.closed else None)
             def request(self, method, params):
+                if time.monotonic() >= self.deadline:
+                    raise g.NativeError('native_deadline')
                 if owner.pump and method == 'session/prompt' and owner.prompt_renews:
                     owner.calls.append((method, copy.deepcopy(params)))
                     for _ in range(owner.prompt_renews):
@@ -672,6 +674,148 @@ class GrokAdapter(unittest.TestCase):
             self.assertEqual(worker.last_exit, 1)
             self.assertEqual(maintains['n'], 1)
             self.assertEqual(client.claims, 0)
+
+    def test_quota_refresh_fires_after_quota_refresh_seconds_not_before(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                billing_calls = sum(1 for m, _ in fixture.calls if m == 'x.ai/billing')
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), billing_calls)
+                clock.advance(g.QUOTA_REFRESH_SECONDS - 1)
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), billing_calls)
+                clock.advance(1)
+                old_deadline = handle.native.deadline
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), billing_calls + 1)
+                self.assertEqual(handle.native.deadline, old_deadline)
+                g.close(handle)
+
+    def test_quota_refresh_success_replaces_observed_at(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                prepare_deadline = handle.native.deadline
+                clock.advance(prepare_deadline - clock.now + 1)
+                self.assertGreaterEqual(clock.now, prepare_deadline)
+                data = billing()
+                data['config']['creditUsagePercent'] = 40
+                fixture.overrides['x.ai/billing'] = data
+                handle.next_quota_refresh = clock.now
+                old_deadline = handle.native.deadline
+                with patch.object(g, '_utc', return_value='2099-06-01T12:00:00+00:00'):
+                    g.maintain(handle)
+                self.assertEqual(handle.preflight['quota']['observed_at'], '2099-06-01T12:00:00+00:00')
+                self.assertEqual(handle.preflight['quota']['native_included_used_percent'], 40)
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_REFRESH_SECONDS)
+                self.assertEqual(handle.native.deadline, old_deadline)
+                g.close(handle)
+
+    def test_quota_refresh_validation_failure_keeps_old_row_and_retries_at_120s(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                old = copy.deepcopy(handle.preflight['quota'])
+                fixture.overrides['x.ai/billing'] = {'broken': True}
+                handle.next_quota_refresh = clock.now
+                before = sum(1 for m, _ in fixture.calls if m == 'x.ai/billing')
+                readiness = g.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertEqual(handle.preflight['quota'], old)
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 1)
+                clock.advance(g.QUOTA_RETRY_SECONDS - 1)
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 1)
+                clock.advance(1)
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 2)
+                self.assertEqual(handle.preflight['quota'], old)
+                g.close(handle)
+
+    def test_quota_refresh_exhausted_does_not_raise(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                old = copy.deepcopy(handle.preflight['quota'])
+                bad = billing()
+                bad['config']['creditUsagePercent'] = 100
+                fixture.overrides['x.ai/billing'] = bad
+                handle.next_quota_refresh = clock.now
+                readiness = g.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertEqual(handle.preflight['quota'], old)
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                g.close(handle)
+
+    def test_quota_refresh_error_frame_keeps_old_row_and_retries_at_120s(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                old = copy.deepcopy(handle.preflight['quota'])
+                # Intact error frame: id matched, rpc_error_code → native_rpc_429.
+                fixture.overrides['x.ai/billing'] = g.NativeError('native_rpc_429')
+                handle.next_quota_refresh = clock.now
+                before = sum(1 for m, _ in fixture.calls if m == 'x.ai/billing')
+                readiness = g.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertEqual(handle.preflight['quota'], old)
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 1)
+                clock.advance(g.QUOTA_RETRY_SECONDS - 1)
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 1)
+                clock.advance(1)
+                fixture.overrides['x.ai/billing'] = g.NativeError('grok_quota_exhausted')
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 2)
+                self.assertEqual(handle.preflight['quota'], old)
+                g.close(handle)
+
+    def test_quota_refresh_transport_failure_propagates_from_maintain(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                fixture.overrides['x.ai/billing'] = g.NativeError('unexpected_response')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_quota_refresh_transport_lost$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(str(caught.exception), 'grok_quota_refresh_transport_lost')
+                self.assertEqual(provider_errors.error_code(caught.exception),
+                                 'grok_quota_refresh_transport_lost')
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                g.close(handle)
+
+    def test_quota_refresh_deadline_is_transport_lost_drain(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                fixture.overrides['x.ai/billing'] = g.NativeError('native_deadline')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_quota_refresh_transport_lost$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                g.close(handle)
 
 
 class BillingPolicy(unittest.TestCase):

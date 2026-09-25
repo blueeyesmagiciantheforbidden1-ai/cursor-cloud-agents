@@ -52,7 +52,12 @@ def _hub_rejected_request(error):
 # The adapter's own warm deadline starts when prepare() does, so it expires
 # while this loop still has startup time left on warm_seconds. That expiry is
 # the end of the idle window, not a crashed worker.
-_IDLE_DRAIN_CODES = frozenset({'warm_session_expired'})
+_IDLE_DRAIN_CODES = frozenset({
+    'warm_session_expired',
+    'codex_quota_refresh_transport_lost',
+    'grok_quota_refresh_transport_lost',
+    'copilot_quota_refresh_transport_lost',
+})
 # No task is leased yet, so a missed hub heartbeat can be polled again.
 _IDLE_RETRY_CODES = frozenset({
     'hub_lease_lost', 'claude_hub_heartbeat_lost', 'grok_hub_heartbeat_lost',

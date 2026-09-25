@@ -808,6 +808,135 @@ class CodexLive(unittest.TestCase):
         self.assertEqual(self.prompt_count(), 0)
         handle.lock.release(); c.close(handle)
 
+    def test_quota_refresh_fires_after_quota_refresh_seconds_not_before(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            before = sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests)
+            c.maintain(handle)
+            self.assertEqual(sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before)
+            clock.advance(c.QUOTA_REFRESH_SECONDS - 1)
+            c.maintain(handle)
+            self.assertEqual(sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before)
+            clock.advance(1)
+            c.maintain(handle)
+            self.assertEqual(sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before + 1)
+            c.close(handle)
+
+    def test_quota_refresh_success_replaces_observed_at(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            old = handle.preflight['quota']['observed_at']
+            self.native.rates = rates(33)
+            c.maintain(handle)
+            self.assertEqual(handle.preflight['quota']['included_used_percent'], 33)
+            self.assertNotEqual(handle.preflight['quota']['observed_at'], old)
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_REFRESH_SECONDS)
+            c.close(handle)
+
+    def test_quota_refresh_validation_failure_keeps_old_row_and_retries_at_120s(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            old = copy.deepcopy(handle.preflight['quota'])
+            handle.next_quota_refresh = clock()
+            self.native.rates = {'broken': True}
+            before = sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests)
+            readiness = c.maintain(handle)
+            self.assertTrue(readiness['ready_for_project_prompt'])
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.native.protocol_state, 'thread_ready')
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
+            self.assertEqual(
+                sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before + 1)
+            clock.advance(c.QUOTA_RETRY_SECONDS - 1)
+            c.maintain(handle)
+            self.assertEqual(
+                sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before + 1)
+            clock.advance(1)
+            c.maintain(handle)
+            self.assertEqual(
+                sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before + 2)
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.native.protocol_state, 'thread_ready')
+            c.close(handle)
+
+    def test_quota_refresh_exhausted_does_not_raise(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            old = copy.deepcopy(handle.preflight['quota'])
+            handle.next_quota_refresh = clock()
+            self.native.rates = rates(100)
+            readiness = c.maintain(handle)
+            self.assertTrue(readiness['ready_for_project_prompt'])
+            self.assertEqual(handle.preflight['quota'], old)
+            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
+            self.assertEqual(handle.native.protocol_state, 'thread_ready')
+            c.close(handle)
+
+    def test_quota_refresh_transport_failure_propagates_from_maintain(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            original_send = handle.native._send
+
+            def failing_send(value=None, *, close=False):
+                if value is not None and value.get('method') == 'account/rateLimits/read':
+                    raise c.transport.TransportError('native_exited_before_completion')
+                return original_send(value, close=close)
+
+            handle.native._send = failing_send
+            with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(str(caught.exception), 'codex_quota_refresh_transport_lost')
+            self.assertTrue(c.SAFE_CODE.fullmatch(str(caught.exception)))
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+            self.assertEqual(handle.native.protocol_state, 'denied')
+            self.assertNotEqual(handle.state, 'ready')
+
+    def test_quota_refresh_error_frame_is_transport_lost_drain(self):
+        # WarmRPC sets denied on any exception, including an intact error frame;
+        # Alpha's transport raises the same TransportError for error/id/non-dict.
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            original_send = handle.native._send
+
+            def failing_send(value=None, *, close=False):
+                if value is not None and value.get('method') == 'account/rateLimits/read':
+                    raise c.transport.TransportError('native_rpc_rejected')
+                return original_send(value, close=close)
+
+            handle.native._send = failing_send
+            with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+            self.assertEqual(handle.native.protocol_state, 'denied')
+
+
 
 class WireWrites(unittest.TestCase):
     def test_real_sender_completes_only_unwritten_suffix_of_large_prompt(self):
