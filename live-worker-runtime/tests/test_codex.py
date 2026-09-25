@@ -1,6 +1,7 @@
 """Offline first-LIVE Codex lifecycle tests; no native/provider/cloud execution."""
 import copy
 from collections import deque
+from datetime import datetime
 import io
 import json
 from pathlib import Path
@@ -306,6 +307,54 @@ class CodexLive(unittest.TestCase):
                 c._quota(rates(percentage), canonical)
         candidate = rates(0); candidate['rateLimitsByLimitId']['codex']['primary']['resetsAt'] = int(time.time()) - 1
         with self.assertRaises(c.LiveCodexError): c._quota(candidate, canonical)
+
+    def test_quota_carries_window_duration_mins_and_observed_at(self):
+        """Alpha runs this: codex.py imports private metadata/codex-cloud-transport (not on Demand)."""
+        canonical = self.session.lease.canonical_account_ref
+        value = rates(12)
+        bucket = value['rateLimitsByLimitId']['codex']
+        bucket['primary']['windowDurationMins'] = 300
+        bucket['secondary'] = {
+            'usedPercent': 40, 'resetsAt': int(time.time()) + 86400,
+            'windowDurationMins': 10080,
+        }
+        got = c._quota(value, canonical)
+        self.assertIn('observed_at', got)
+        self.assertIsInstance(got['observed_at'], str)
+        datetime.fromisoformat(got['observed_at'].replace('Z', '+00:00'))
+        by_name = {row['window']: row for row in got['windows']}
+        self.assertEqual(by_name['primary']['window_duration_mins'], 300)
+        self.assertEqual(by_name['secondary']['window_duration_mins'], 10080)
+
+    def test_quota_invalid_window_duration_mins_stored_as_none(self):
+        """Alpha runs this: codex.py imports private metadata/codex-cloud-transport (not on Demand).
+
+        Existing test_codex assertions comparing the whole preflight or quota dict may need
+        the two new keys (window_duration_mins, observed_at). Whole-dict equality assertions
+        found in this file: none. Key-level quota/preflight checks that Alpha should note:
+        tests/test_codex.py:230 (handle.usage['included_used_percent']),
+        tests/test_codex.py:233 (result['preflight']['quota']['included_used_percent']),
+        tests/test_codex.py:322-327 (observed_at / window_duration_mins key checks).
+        """
+        canonical = self.session.lease.canonical_account_ref
+        for bad in (0, 600000, '300', 12.5, True):
+            candidate = rates(12)
+            candidate['rateLimitsByLimitId']['codex']['primary']['windowDurationMins'] = bad
+            with self.subTest(duration=bad):
+                got = c._quota(candidate, canonical)
+                by_name = {row['window']: row for row in got['windows']}
+                self.assertIsNone(by_name['primary']['window_duration_mins'])
+        value = rates(12)
+        bucket = value['rateLimitsByLimitId']['codex']
+        bucket['primary']['windowDurationMins'] = 300
+        bucket['secondary'] = {
+            'usedPercent': 40, 'resetsAt': int(time.time()) + 86400,
+            'windowDurationMins': 10080,
+        }
+        got = c._quota(value, canonical)
+        by_name = {row['window']: row for row in got['windows']}
+        self.assertEqual(by_name['primary']['window_duration_mins'], 300)
+        self.assertEqual(by_name['secondary']['window_duration_mins'], 10080)
 
     def test_catalog_drift_blocks_prompt_without_lower_model_fallback(self):
         handle = self.prepare()

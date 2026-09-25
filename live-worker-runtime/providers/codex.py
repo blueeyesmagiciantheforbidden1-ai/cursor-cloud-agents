@@ -8,6 +8,7 @@ Official protocol: https://learn.chatgpt.com/docs/app-server
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -316,17 +317,23 @@ def _quota(value, canonical):
             if window is None:
                 continue
             need(type(window) is dict, 'native_quota_window_invalid')
+            duration = window.get('windowDurationMins')
+            if not (type(duration) is int and not isinstance(duration, bool)
+                    and 1 <= duration <= 525600):
+                duration = None
             used = window.get('usedPercent')
             need(used is None or type(used) in (int, float) and math.isfinite(used) and 0 <= used <= 10000,
                  'native_quota_percentage_invalid')
             need(used is None or used < 100, 'included_quota_exhausted')
             reset = window.get('resetsAt')
             need(reset is None or type(reset) is int and reset > time.time(), 'native_quota_reset_stale')
-            windows.append({'limit_id': key, 'window': name, 'used_percent': used, 'resets_at': reset})
+            windows.append({'limit_id': key, 'window': name, 'used_percent': used, 'resets_at': reset,
+                            'window_duration_mins': duration})
     known = [row['used_percent'] for row in windows if row['used_percent'] is not None]
     return {'ordinary_usage_allowed': True, 'included_used_percent': max(known) if known else None,
             'windows': windows, 'source': 'same_process_native', 'extra_spending_enabled': False,
-            'api_fallback_enabled': False, 'automatic_improvement_ready': False}
+            'api_fallback_enabled': False, 'automatic_improvement_ready': False,
+            'observed_at': datetime.now(timezone.utc).isoformat()}
 
 
 def _collect(handle):
