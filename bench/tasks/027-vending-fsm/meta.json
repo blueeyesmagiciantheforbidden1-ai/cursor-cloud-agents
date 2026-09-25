@@ -1,0 +1,9 @@
+{
+  "id": "027-vending-fsm",
+  "category": "feature",
+  "difficulty": 4,
+  "time_budget_s": 1200,
+  "expected_files": ["vending/machine.py"],
+  "multi_agent_suitable": false,
+  "notes": "Vending machine state machine with coins, selection, refund."
+}

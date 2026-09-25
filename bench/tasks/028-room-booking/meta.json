@@ -1,0 +1,9 @@
+{
+  "id": "028-room-booking",
+  "category": "multi-file",
+  "difficulty": 5,
+  "time_budget_s": 1500,
+  "expected_files": ["rooms/inventory.py", "rooms/bookings.py", "rooms/finder.py"],
+  "multi_agent_suitable": true,
+  "notes": "Multi-file room inventory + conflict-aware booking + finder."
+}

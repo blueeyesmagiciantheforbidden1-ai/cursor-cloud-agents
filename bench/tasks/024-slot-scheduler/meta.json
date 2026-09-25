@@ -1,0 +1,9 @@
+{
+  "id": "024-slot-scheduler",
+  "category": "multi-file",
+  "difficulty": 4,
+  "time_budget_s": 1200,
+  "expected_files": ["booking/slots.py", "booking/calendar.py"],
+  "multi_agent_suitable": true,
+  "notes": "Half-open interval slot booking without overlaps."
+}

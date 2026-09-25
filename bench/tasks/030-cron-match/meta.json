@@ -1,0 +1,9 @@
+{
+  "id": "030-cron-match",
+  "category": "feature",
+  "difficulty": 3,
+  "time_budget_s": 900,
+  "expected_files": ["schedule/cron.py"],
+  "multi_agent_suitable": false,
+  "notes": "Five-field cron-like matcher without concurrency."
+}

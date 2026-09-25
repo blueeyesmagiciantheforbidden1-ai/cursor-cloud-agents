@@ -1,0 +1,9 @@
+{
+  "id": "025-token-bucket",
+  "category": "review",
+  "difficulty": 3,
+  "time_budget_s": 900,
+  "expected_files": ["ratelimit/bucket.py"],
+  "multi_agent_suitable": false,
+  "notes": "Review/fix classic token-bucket refill and allow bugs."
+}

@@ -1,0 +1,9 @@
+{
+  "id": "026-csv-join",
+  "category": "multi-file",
+  "difficulty": 2,
+  "time_budget_s": 600,
+  "expected_files": ["csvtools/reader.py", "csvtools/join.py"],
+  "multi_agent_suitable": false,
+  "notes": "Left/inner join of row dict lists on a key."
+}

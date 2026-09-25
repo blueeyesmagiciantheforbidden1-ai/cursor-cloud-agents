@@ -1,0 +1,9 @@
+{
+  "id": "021-invoice-totals",
+  "category": "review",
+  "difficulty": 2,
+  "time_budget_s": 600,
+  "expected_files": ["invoice/totals.py"],
+  "multi_agent_suitable": false,
+  "notes": "Review and fix invoice subtotal/discount/tax/rounding bugs."
+}

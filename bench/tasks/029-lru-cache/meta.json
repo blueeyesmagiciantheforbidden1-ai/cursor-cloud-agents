@@ -1,0 +1,9 @@
+{
+  "id": "029-lru-cache",
+  "category": "review",
+  "difficulty": 1,
+  "time_budget_s": 450,
+  "expected_files": ["cache/lru.py"],
+  "multi_agent_suitable": false,
+  "notes": "Easy review: fix LRU get/put eviction bugs."
+}

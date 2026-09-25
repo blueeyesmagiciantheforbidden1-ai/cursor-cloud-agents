@@ -1,0 +1,9 @@
+{
+  "id": "023-order-fsm",
+  "category": "feature",
+  "difficulty": 3,
+  "time_budget_s": 900,
+  "expected_files": ["orders/fsm.py"],
+  "multi_agent_suitable": false,
+  "notes": "Order lifecycle state machine with guarded transitions."
+}
