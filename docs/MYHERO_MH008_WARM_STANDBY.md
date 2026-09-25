@@ -85,7 +85,10 @@ The worst single relaunch gap is about 420-460 s, and typically about 250 s:
 2. **C2 with a reason, not a boolean.** Expose why an agent is not ready: `provisioning`, `backoff`, `parked`, `busy` or `offline`, so flexible dispatch treats a 600 s backoff differently from a 150 s provisioning.
    - The hub can already derive `busy`: the agent holds a lease in some room.
    - It can also derive `offline`/`stale` from the worker reports.
-   - `provisioning`, `backoff` and `parked` are controller state (`runcrew_fleet_state`), so the controller has to publish its phase and `next_launch_at` to the hub, or the hub reads it. That is a small read-only interface to design.
+   - `provisioning`, `backoff` and `parked` are controller state. The controller **publishes** a small per-slot status document (`phase`, `next_launch_at`, a fixed reason code, `published_at`), and the hub only reads it.
+   - The hub gets no access to `runcrew_fleet_state` or the receipts, which keeps its service account away from controller state.
+   - The document is advisory and can go stale. The hub shows a reason only when `published_at` is newer than about two controller ticks, and otherwise shows `unknown`.
+   - It feeds the readiness reason only. It never feeds a dispatch, lease or claim decision.
 3. **C1 before B.** A staggered idle drain is the same exclusivity problem as B, in the easy idle-only case. Build the exclusivity mechanism there, and B inherits it.
 4. **B's exclusivity proof, for Light's review before any code:**
    - the **broker** (fence and version on acquire) enforces a single holder, so a standby is refused even if the controller's view lags;
