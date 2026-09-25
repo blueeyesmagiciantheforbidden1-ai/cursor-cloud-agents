@@ -100,7 +100,7 @@ file, and is never overwritten if it cannot be read.
 | `cursor` | `node.exe index.js -p --output-format text --trust --sandbox disabled --auto-review --workspace <ws> <prompt>`. On Windows it uses the newest `%LOCALAPPDATA%\cursor-agent\versions\*` that has `node.exe` and `index.js`, as `C:\agent-bus\cursor-worker.ps1` does, with the same argument quoting. On Linux it uses `cursor-agent` from PATH. `CURSOR_INVOKED_AS=cursor-agent`. | Flags checked against `--help` of 2026.09.23-86fc751 |
 | `claude` | `claude -p --output-format text --permission-mode auto --permission-prompts none --no-session-persistence <prompt>` | Flags checked against `claude --help` 2.1.280 |
 | `codex` | `codex exec --sandbox workspace-write --ephemeral --color never -C <ws> <prompt>` | Flags checked against `codex exec --help` 0.153.4 |
-| `grok` | `grok --output-format plain --permission-mode auto --disable-web-search --no-subagents --cwd <ws> -p <prompt>` (the native `grok.exe`, no shim) | Flags checked against `grok --help` of 1.0.24 (68e414c661e3) on dumpling. No `--always-approve`. |
+| `grok` | `grok --output-format plain --permission-mode auto --disable-web-search --no-subagents --cwd <ws> -p <prompt>` (the native `grok.exe`, no shim) | Flags checked against `grok --help` of 1.0.24 (68e414c661e3) on dumpling. No `--always-approve`. Pinned: any other installed version reports `cli_flags_unverified` and is never run. |
 | `copilot` | none | Detection only. The CLI is not installed on any fleet host, so no flag was verified. The adapter reports `cli_not_found` or `cli_flags_unverified` and never runs the CLI, not even `--version`. |
 | `fake` (tests) | an in-process function | Test double for `test_runner_cert.py` |
 

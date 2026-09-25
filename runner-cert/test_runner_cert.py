@@ -595,7 +595,7 @@ class AdapterTest(unittest.TestCase):
             self.assertTrue(claude.probe()["flags_verified"])
 
     def test_grok_uses_only_locally_verified_flags(self):
-        with mock.patch.object(runner_cert, "_cli_version", return_value="grok 1.0.24"):
+        with mock.patch.object(runner_cert, "_cli_version", return_value="grok 1.0.24 (68e414c661e3)"):
             grok = runner_cert.make_adapter("grok")
             grok._which = lambda name: "/opt/bin/grok"
             self.assertEqual(grok.command("/ws", "go", ["/opt/bin/grok"]),
@@ -605,6 +605,16 @@ class AdapterTest(unittest.TestCase):
             info = grok.probe()
             self.assertTrue(info["available"])
             self.assertTrue(info["flags_verified"])
+        with mock.patch.object(runner_cert, "_cli_version", return_value="grok 1.0.13 (5e9a58528b76) [stable]"):
+            old = runner_cert.GrokAdapter(which=lambda name: "/opt/bin/grok")
+            info = old.probe()
+            self.assertTrue(info["available"])
+            self.assertFalse(info["flags_verified"])
+            self.assertEqual(info["reason"], "cli_flags_unverified")
+            with mock.patch.object(runner_cert, "run_process") as run_process:
+                self.assertEqual(old.run(self.root, "x", 5, os.path.join(self.root, "g.log"))["status"],
+                                 "unavailable")
+            run_process.assert_not_called()
         missing = runner_cert.GrokAdapter(which=lambda name: None)
         self.assertEqual(missing.probe()["reason"], "cli_not_found")
 

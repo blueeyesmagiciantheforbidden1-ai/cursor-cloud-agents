@@ -693,6 +693,7 @@ class CommandAdapter(Adapter):
 
     cli_name = None
     flags_verified_against = None
+    pin_version = False  # True: run only the exact version whose flags were checked
     env_extra = {}
 
     def __init__(self):
@@ -710,6 +711,9 @@ class CommandAdapter(Adapter):
             prefix, path, version, reason = self.resolve()
             self._prefix = prefix
             verified = prefix is not None and self.flags_verified_against is not None
+            if verified and self.pin_version and version != self.flags_verified_against:
+                # Flags were read from one version's --help; another may differ.
+                verified = False
             if prefix is not None and not verified:
                 reason = "cli_flags_unverified"
             self._probe = {"name": self.cli_name, "version": version, "path": path,
@@ -816,6 +820,8 @@ class GrokAdapter(CommandAdapter):
     # calls and nothing waits for a person. No --always-approve, no web search,
     # no subagents: the run stays one agent in one workspace.
     flags_verified_against = "grok 1.0.24 (68e414c661e3)"
+    # grok changes fast (1.0.13 and 1.0.24 are both on the fleet): pin it.
+    pin_version = True
     FLAGS = ("--output-format", "plain", "--permission-mode", "auto",
              "--disable-web-search", "--no-subagents")
 

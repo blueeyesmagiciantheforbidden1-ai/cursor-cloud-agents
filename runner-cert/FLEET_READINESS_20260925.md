@@ -36,6 +36,6 @@ Harness `5fc48914…` is a4d805d. Harness `efedec52…` is 5d92e8b (the grok ada
 ## To reach five of five
 
 - Codex: fix the codex auth on Alpha, or install codex on a VPS, then rerun `--adapter codex`. The user needs to do this; agents don't touch credentials.
-- Grok: `grok login --device-code` on dumpling/demand/retina, then rerun `--adapter grok`. The user needs to do this.
+- Grok: `grok login --device-code` on dumpling/demand/retina, then rerun `--adapter grok`. The user needs to do this. The adapter is now pinned to grok 1.0.24 (Light's review), so demand's 1.0.13 needs `grok update` first. Until then it reports `cli_flags_unverified` and is never run.
 - Copilot: install the CLI and check its flags with `--help`, then write an adapter.
 - Cursor on Alpha: `cursor-agent login`, then rerun.
