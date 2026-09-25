@@ -34,6 +34,10 @@ def status_reason(state, now):
     if state.get('slot_enabled') is False:
         return 'disabled'
     phase = state.get('phase')
+    if not isinstance(phase, str):
+        # A corrupted or foreign state document must read as unknown, never raise
+        # (an unhashable phase used to fail the set lookup below).
+        return 'unknown'
     if phase == 'active':
         return 'ready_or_running'
     if phase in PROVISIONING_PHASES:

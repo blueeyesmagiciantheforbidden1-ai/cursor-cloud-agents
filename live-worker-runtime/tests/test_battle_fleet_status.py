@@ -341,11 +341,11 @@ class InvariantAndFuzzTests(unittest.TestCase):
         self.assertEqual(status_reason(waiting, now), 'idle_launching')
         self.assertEqual(status_document(waiting, now, 'g')['consecutive_failures'], 0)
 
-    @unittest.expectedFailure
     def test_unhashable_phase_should_be_unknown_not_typeerror(self):
-        # FINDING: status_reason raises TypeError on unhashable phase (dict/list) via
-        # `phase in PROVISIONING_PHASES` instead of falling through to 'unknown'.
-        for phase in ({'nested': True}, ['launch_intent'], set()):
+        # Battle-test finding, fixed: an unhashable phase (dict/list/set) used to
+        # raise TypeError from `phase in PROVISIONING_PHASES`; any non-string
+        # phase now reads as 'unknown'.
+        for phase in ({'nested': True}, ['launch_intent'], set(), 7, None, b'active'):
             with self.subTest(phase=phase):
                 self.assertEqual(status_reason({'phase': phase}, 0), 'unknown')
 
