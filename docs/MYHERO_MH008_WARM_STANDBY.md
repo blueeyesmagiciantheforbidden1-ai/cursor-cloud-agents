@@ -56,17 +56,47 @@ The biggest measured waits were first steps and probes, not back-to-back turns. 
 - It doesn't help back-to-back turns for the same agent.
 - Effort: small to medium. C2 is hub-side only and low risk.
 
-## Recommendation
+## Review (Light, 36f8b40): one gap cannot explain 540 s or 708 s
 
-1. Do **C2** first. It's hub-side and low risk: dispatch stops waiting blindly on an agent that is provisioning.
-2. Measure again with P0.1's durable `attempt_records[].queued_at`, which splits queue wait into "no ready worker" and "worker busy elsewhere". Use Retina's CSV method for the start phase.
-3. Then choose between **B**, which overlaps provisioning and keeps one credential holder, and **A**, which removes it but changes the one-task invariant, based on how much of the measured wait is back-to-back same-agent work.
+The worst single relaunch gap is about 420-460 s, and typically about 250 s:
+- the release,
+- plus one controller tick (up to about 60 s),
+- plus provisioning (at most 341 s observed),
+- plus `prepare()`,
+- plus the first poll.
 
-Either B or A needs Light's review of the credential-exclusivity argument before any code.
+708 s is past any observed gap, and 540 s is past the 99th percentile. So the baseline waits need another component. Candidates from `fleet_controller.py`:
+- **a. Failure backoff** `FAILURE_BACKOFF_SECONDS = (120, 600)`. A strike on the previous execution adds 120 s, then 600 s. 120 s + about 340 s + prepare ≈ 540 s, and the 600 s tier alone nearly gives 708 s. The 25c copilot blocker (a strike on a healthy agent) was exactly this kind of event.
+- **b. Quota park** (at least 3600 s). Too long for these numbers, but it must be excluded explicitly.
+- **c. Busy elsewhere.** The slot is serving another room for up to `timeout_seconds`. That is not a relaunch gap at all.
+- **d. Two gaps in series**, for example an idle drain just before the probe followed by a prepare failure and a relaunch.
+
+(a) and (c) look like provisioning from the manager's side, but neither B nor C1 fixes them.
+
+## Recommendation (revised)
+
+1. **Attribute the two baseline waits first.** Join the baseline rooms' attempt timing with that agent's controller slot history over the window:
+   - phase transitions;
+   - `consecutive_failures` and `next_launch_at`;
+   - the previous execution's exit code;
+   - execution create, start and terminal times from Retina's CSV.
+
+   This needs Retina's read-only access (Firestore `runcrew_fleet_state` history and the archived receipts, plus the execution list). From P0.1 on, `attempt_records[].queued_at` makes this routine.
+2. **C2 with a reason, not a boolean.** Expose why an agent is not ready: `provisioning`, `backoff`, `parked`, `busy` or `offline`, so flexible dispatch treats a 600 s backoff differently from a 150 s provisioning.
+   - The hub can already derive `busy`: the agent holds a lease in some room.
+   - It can also derive `offline`/`stale` from the worker reports.
+   - `provisioning`, `backoff` and `parked` are controller state (`runcrew_fleet_state`), so the controller has to publish its phase and `next_launch_at` to the hub, or the hub reads it. That is a small read-only interface to design.
+3. **C1 before B.** A staggered idle drain is the same exclusivity problem as B, in the easy idle-only case. Build the exclusivity mechanism there, and B inherits it.
+4. **B's exclusivity proof, for Light's review before any code:**
+   - the **broker** (fence and version on acquire) enforces a single holder, so a standby is refused even if the controller's view lags;
+   - the standby acquires strictly after the release is committed, and a crashed active worker (no clean release) never lets the standby acquire; that case goes through the existing quarantine and reset path;
+   - cancelling a standby costs nothing and gives no strike.
+5. **A only if** the attribution shows that back-to-back same-agent work dominates. A changes the one-task-per-execution invariant that the 09-23 incidents relied on.
 
 ## Acceptance for whichever is built (from the release contract)
 
 - Runnable-to-claim with a warm ready worker: p95 ≤ 15 s, p99 ≤ 60 s under declared normal load.
+- Claim wait is reported as a separate p95 for each cause: no ready worker (provisioning), backoff, parked and busy elsewhere. A strike storm must not hide inside a provisioning percentile.
 - Never two credential holders for one account: a test and a broker-side assertion.
 - A failed active or standby worker never becomes a paid restart loop: the existing strike and backoff rules still hold.
 - The rollback is one configuration flag that returns the slot to today's serial behaviour.
