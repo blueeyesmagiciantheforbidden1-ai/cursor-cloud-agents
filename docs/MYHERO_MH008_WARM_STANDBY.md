@@ -91,7 +91,34 @@ Three different agents claimed within 9 s of each other after waits of about 9 m
 
 Six rooms (the chain and five lanes) queued work on one slot per agent. So the later waits (copilot 663 s, cursor step 2, the probe) also include busy-elsewhere time and serial relaunch gaps. Retina is attributing these with the fleet data. If the fleet-wide cause is confirmed, neither A nor B addresses it, and the fix sits in the controller's tick cadence or at the Cloud Run project level.
 
-## Recommendation (revised)
+## Attribution result (Retina, read-only, 2026-09-25; table on Retina `Desktop\Retina\mh008\MH008_wait_attribution.md`)
+
+Each wait's components sum to within 1 s of the observed wait.
+- **(a) failure backoff = 0 and (b) quota park = 0 for all six waits.** Every execution in the window succeeded. Controller relaunch gaps were 4-65 s, which is just tick latency.
+- Everything is **(c) busy elsewhere + (d) serial relaunch cycles**, driven by two mechanisms:
+  1. **One task per execution.** A worker polls about every 10 s until its first task, completes it and exits (e.g. claude claimed 00:22:41, completed 00:22:46, exited 00:22:51). Each task that reaches a slot first costs a full relaunch cycle.
+  2. **Cloud Run starts executions in batches.** Executions from all five jobs created minutes apart go Started in the same second (00:16:55, 00:22:35, 00:24:17, 00:26:38, 00:30:42, 00:35:36, 00:39:27), with create→Started of 94-251 s. The "fleet-wide event" at 00:26:45-54 was the 00:26:38 batch start, not a controller outage.
+- An older non-campaign room (8658a907…) took steps on four agents ahead of the lanes (FIFO).
+- The waits were 2-3 relaunch cycles each. Cloud Run start was **64-83%** of every wait.
+
+What this means for the options:
+- **B (pre-launch standby)** removes Cloud Run start only for the one task that lands on the warm worker. With several tasks queued per slot, most of the wait remains.
+- **C1** doesn't help these waits.
+- **A (keep polling after a completed task, for the rest of the warm window)** would cut each of these waits to about the work time plus about 10 s. The attribution shows back-to-back same-slot work dominates, which is Light's condition for choosing A.
+
+## Recommendation (after attribution)
+
+**Option A, scoped and gated**, subject to Light's review of these safety obligations before any code:
+- Each additional task runs a **fresh native session**: provider `prepare()` again, never reusing a native process across tasks. The credential is renewed and written back and **committed between tasks**, so every task has the same credential start state it has today.
+- The broker lease stays with the one execution throughout, so there is never a second holder. Only the idle gap changes; there is no new acquire race.
+- **Strike accounting per task:** the first unclean task ends the execution exactly as today (drain, release, controller backoff). There is no in-execution retry loop.
+- **Bounded:** at most N tasks per execution (for example 5) and never past the warm window.
+- It is **off by default** behind a per-slot flag. Turning the flag off restores today's one-task behaviour, and that is the rollback.
+- **Evidence gate:** the MH-008 per-cause p95s from `attempt_records[].queued_at` before and after, plus the worker-level fault tests (T15-T17 equivalents with a second task in the same execution).
+
+Keep C2 (readiness reasons, controller half on branch `alpha/mh008-fleet-status`) regardless: it is what made this attribution possible.
+
+## Recommendation (before attribution, kept for the record)
 
 1. **Attribute the two baseline waits first.** Join the baseline rooms' attempt timing with that agent's controller slot history over the window:
    - phase transitions;
