@@ -73,6 +73,24 @@ The worst single relaunch gap is about 420-460 s, and typically about 250 s:
 
 (a) and (c) look like provisioning from the manager's side, but neither B nor C1 fixes them.
 
+## Baseline data (timing_details.json, campaign mh-extreme-f11b93494a, 2026-09-24 UTC)
+
+| Agent | Room / step | Claimed (UTC) | Wait |
+| --- | --- | --- | --- |
+| claude | claude lane 215fbb4b… step 1 | 00:26:45.75 | 539 s |
+| copilot | chain c983bafd… step 1 | 00:26:48.28 | 545 s |
+| cursor | cursor lane a368133b… step 1 | 00:26:54.53 | 560 s |
+| copilot | copilot lane c60524f6… step 1 | 00:30:56.05 | 663 s |
+| cursor | cursor lane step 2 | 00:35:53.48 | 523 s |
+| claude | probe 176f3a0d… step 0 | 00:39:33.98 | 708 s |
+
+Three different agents claimed within 9 s of each other after waits of about 9 minutes. This points to a **fleet-wide** event more than per-agent backoff, which fits Retina's MH-007 note that pending tasks from all five jobs were released in the same second. The remaining causes to separate are:
+- a controller tick delay;
+- a synchronized relaunch after all the step-0 executions ended around 00:17-00:18;
+- a project-level Cloud Run hold.
+
+Six rooms (the chain and five lanes) queued work on one slot per agent. So the later waits (copilot 663 s, cursor step 2, the probe) also include busy-elsewhere time and serial relaunch gaps. Retina is attributing these with the fleet data. If the fleet-wide cause is confirmed, neither A nor B addresses it, and the fix sits in the controller's tick cadence or at the Cloud Run project level.
+
 ## Recommendation (revised)
 
 1. **Attribute the two baseline waits first.** Join the baseline rooms' attempt timing with that agent's controller slot history over the window:
