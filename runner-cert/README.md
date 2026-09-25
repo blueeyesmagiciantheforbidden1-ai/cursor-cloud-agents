@@ -89,9 +89,29 @@ From Python, `latest_certification(registry, runner_id)` returns the runner's
 newest receipt when it certifies the runner now, and `None` otherwise. **The
 newest receipt decides.** A later failed or unavailable run withdraws an
 earlier certification. An expired receipt (`expires_at` = `finished_at` + 14
-days), or one whose time cannot be parsed, is not a certification. The
+days), or one whose time cannot be parsed, is not a certification. If the
+newest receipt's `machine.fingerprint_sha256` differs from that of the previous
+certified receipt for the same `runner_id`, `latest_certification` returns
+`None` and `--status` reports `fingerprint_changed: true` (reason
+`fingerprint_changed`). That means the runner_id has moved to another machine
+and must be re-certified there; a hostname alone is not an identity. The
 registry keeps the last 1000 receipts appended, is written atomically under a lock
 file, and is never overwritten if it cannot be read.
+
+To export one hub-shaped object for a runner:
+
+```bash
+python runner_cert.py --export --runner-id alpha-cursor --registry C:\runner-cert\registry.json
+```
+
+The object is built from `latest_certification()`. When that is `None`, the
+newest receipt is used with `certified` set to false. Exit code 0 when the
+exported certification is certified, 1 when it is not, and 2 when the
+`runner_id` has no receipt. The key set is fixed for the hub:
+
+`suite`, `runner_id`, `certified`, `capabilities`, `finished_at`, `expires_at`,
+`harness_sha256`, `nonce`, `machine_fingerprint_sha256`. Older receipts without
+a `machine` block export `machine_fingerprint_sha256` as null.
 
 ## Adapters
 
@@ -119,15 +139,26 @@ It never shows up as a false pass.
 
 A receipt is **evidence produced by trusted code on that host at that time**.
 It records the harness's own SHA-256 (`harness.sha256`), the Python version,
-the CLI version when it is known, the host name, the base commit, the patch
-digest and the nonce, so the run directory left on disk can be checked
-against it.
+the CLI version when it is known, the host name, a machine fingerprint, the
+base commit, the patch digest and the nonce, so the run directory left on disk
+can be checked against it.
+
+The `machine` block is `{"fingerprint_sha256": ..., "source": ...}`. The raw
+machine id is never stored. On Windows the harness reads MachineGuid under
+`HKLM\SOFTWARE\Microsoft\Cryptography`; on Linux it reads `/etc/machine-id`,
+falling back to `/var/lib/dbus/machine-id`. The fingerprint is
+`sha256("runner-cert-machine-v1:" + raw_id.strip().lower())` as lowercase hex.
+`source` is `windows_machineguid`, `linux_machine_id`, or `unavailable` (with
+`fingerprint_sha256` null) when the id cannot be read. A failed read never
+fails the run. dumpling and retina have reported the same Windows
+`COMPUTERNAME`; the fingerprint distinguishes hosts when a hostname cannot.
 
 It is **not an attestation.** Nothing is signed, and nothing binds it to
-hardware or to an identity. Whoever controls the host could edit the registry
-or the harness. It says that this harness saw this runner do these things
-once. It says nothing about isolation, secrets or network egress (MH-002). It
-does not say the runner will behave the same way on a different task.
+hardware identity beyond that hashed machine id. Whoever controls the host
+could edit the registry or the harness. It says that this harness saw this
+runner do these things once. It says nothing about isolation, secrets or
+network egress (MH-002). It does not say the runner will behave the same way
+on a different task.
 
 Known limits:
 

@@ -1,6 +1,7 @@
 """Tests for runner_cert.py. No network and no real agent CLI: fake adapters
 play the agent. Run from this directory: python -m unittest -v test_runner_cert
 """
+import hashlib
 import json
 import os
 import re
@@ -348,6 +349,57 @@ class CertifyTest(unittest.TestCase):
                 self.assertTrue(receipt["scope"]["clean"])
                 self.assertFalse(receipt["certified"])
 
+    def test_machine_fingerprint_from_injected_readers(self):
+        raw_windows = "AaBb-CcDd-EeFf"
+        receipt = self.certify(honest, windows_machine_reader=lambda: raw_windows)
+        expected = hashlib.sha256(
+            (runner_cert.MACHINE_FP_PREFIX + raw_windows.strip().lower()).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(receipt["machine"]["fingerprint_sha256"], expected)
+        self.assertEqual(receipt["machine"]["source"], "windows_machineguid")
+        dumped = json.dumps(receipt)
+        self.assertNotIn(raw_windows, dumped)
+        self.assertNotIn(raw_windows.lower(), dumped)
+
+        raw_linux = "  DeadBeefCafe01\n"
+        receipt = self.certify(honest, linux_machine_reader=lambda: raw_linux)
+        expected = hashlib.sha256(
+            (runner_cert.MACHINE_FP_PREFIX + raw_linux.strip().lower()).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(receipt["machine"]["fingerprint_sha256"], expected)
+        self.assertEqual(receipt["machine"]["source"], "linux_machine_id")
+        dumped = json.dumps(receipt)
+        self.assertNotIn("DeadBeefCafe01", dumped)
+        self.assertNotIn("deadbeefcafe01", dumped)
+
+        receipt = self.certify(honest, windows_machine_reader=lambda: None)
+        self.assertIsNone(receipt["machine"]["fingerprint_sha256"])
+        self.assertEqual(receipt["machine"]["source"], "unavailable")
+        self.assertTrue(receipt["certified"], receipt["reasons"])
+
+        def boom():
+            raise OSError("registry locked")
+
+        receipt = self.certify(honest, windows_machine_reader=boom)
+        self.assertIsNone(receipt["machine"]["fingerprint_sha256"])
+        self.assertEqual(receipt["machine"]["source"], "unavailable")
+        self.assertTrue(receipt["certified"], receipt["reasons"])
+
+    def test_fingerprint_changed_withdraws_certification(self):
+        registry = os.path.join(self.root, "registry.json")
+        self.certify(honest, registry=registry, windows_machine_reader=lambda: "machine-A")
+        self.certify(honest, registry=registry, windows_machine_reader=lambda: "machine-B")
+        self.assertIsNone(runner_cert.latest_certification(registry, "test-runner"))
+        status = runner_cert.certification_status(registry)["test-runner"]
+        self.assertTrue(status["fingerprint_changed"])
+        self.assertFalse(status["certified"])
+        self.assertEqual(status["reason"], "fingerprint_changed")
+        with mock.patch("sys.stdout") as out:
+            self.assertEqual(runner_cert.main(["--status", "--registry", registry,
+                                               "--runner-id", "test-runner"]), 0)
+        printed = json.loads("".join(call.args[0] for call in out.write.call_args_list))
+        self.assertTrue(printed["test-runner"]["fingerprint_changed"])
+
     def test_unavailable_cli_is_not_certified_and_never_run(self):
         adapter = runner_cert.UnverifiedCliAdapter("grok", "grok", which=lambda name: None)
         receipt = self.certify(adapter)
@@ -515,6 +567,85 @@ class RegistryTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 runner_cert.main(["--registry", self.registry, "--adapter", "fake", "--runner-id", "r",
                                   "--work-root", self.root])
+
+    def test_export_shape_and_exit_codes(self):
+        export_keys = {"suite", "runner_id", "certified", "capabilities", "finished_at",
+                       "expires_at", "harness_sha256", "nonce", "machine_fingerprint_sha256"}
+        finished = runner_cert.iso(self.now - timedelta(days=1))
+        expires = runner_cert.iso(self.now - timedelta(days=1) + runner_cert.RECEIPT_TTL)
+        fp = "a" * 64
+        harness_sha = "b" * 64
+        nonce = "c" * 32
+        certified_receipt = {
+            "runner_id": "demand-cursor", "adapter": "fake", "suite": "runner-cert-v1",
+            "certified": True, "finished_at": finished, "expires_at": expires,
+            "nonce": nonce,
+            "capabilities": {name: {"verified": True, "evidence": "ok"} for name in runner_cert.CAPABILITIES},
+            "harness": {"version": "1", "sha256": harness_sha, "errors": []},
+            "machine": {"fingerprint_sha256": fp, "source": "windows_machineguid"},
+        }
+        runner_cert.append_receipt(self.registry, certified_receipt)
+        exported = runner_cert.export_certification(self.registry, "demand-cursor", now=self.now)
+        self.assertEqual(set(exported), export_keys)
+        self.assertEqual(exported["suite"], "runner-cert-v1")
+        self.assertEqual(exported["runner_id"], "demand-cursor")
+        self.assertIs(exported["certified"], True)
+        self.assertEqual(exported["capabilities"],
+                         {name: True for name in runner_cert.CAPABILITIES})
+        self.assertEqual(exported["finished_at"], finished)
+        self.assertEqual(exported["expires_at"], expires)
+        self.assertEqual(exported["harness_sha256"], harness_sha)
+        self.assertEqual(exported["nonce"], nonce)
+        self.assertEqual(exported["machine_fingerprint_sha256"], fp)
+        self.assertIsInstance(exported["harness_sha256"], str)
+        self.assertIsInstance(exported["nonce"], str)
+        self.assertIsInstance(exported["machine_fingerprint_sha256"], str)
+        with mock.patch("sys.stdout") as out:
+            self.assertEqual(runner_cert.main(["--export", "--runner-id", "demand-cursor",
+                                               "--registry", self.registry]), 0)
+        printed = json.loads("".join(call.args[0] for call in out.write.call_args_list))
+        self.assertEqual(set(printed), export_keys)
+        self.assertTrue(printed["certified"])
+
+        # Not certified: failed newest receipt.
+        failed = dict(certified_receipt)
+        failed["certified"] = False
+        failed["finished_at"] = runner_cert.iso(self.now)
+        failed["expires_at"] = runner_cert.iso(self.now + runner_cert.RECEIPT_TTL)
+        failed["nonce"] = "d" * 32
+        failed["capabilities"] = {name: {"verified": False, "evidence": "no"}
+                                  for name in runner_cert.CAPABILITIES}
+        runner_cert.append_receipt(self.registry, failed)
+        exported = runner_cert.export_certification(self.registry, "demand-cursor", now=self.now)
+        self.assertEqual(set(exported), export_keys)
+        self.assertIs(exported["certified"], False)
+        self.assertEqual(exported["nonce"], "d" * 32)
+        self.assertEqual(exported["capabilities"],
+                         {name: False for name in runner_cert.CAPABILITIES})
+        with mock.patch("sys.stdout") as out:
+            self.assertEqual(runner_cert.main(["--export", "--runner-id", "demand-cursor",
+                                               "--registry", self.registry]), 1)
+
+        # Old receipt without machine → null fingerprint.
+        old_reg = os.path.join(self.root, "old.json")
+        old = {
+            "runner_id": "legacy-runner", "adapter": "fake", "suite": "runner-cert-v1",
+            "certified": True, "finished_at": finished, "expires_at": expires,
+            "nonce": "e" * 32,
+            "capabilities": {name: {"verified": True, "evidence": "ok"} for name in runner_cert.CAPABILITIES},
+            "harness": {"version": "1", "sha256": harness_sha, "errors": []},
+        }
+        runner_cert.append_receipt(old_reg, old)
+        exported = runner_cert.export_certification(old_reg, "legacy-runner", now=self.now)
+        self.assertEqual(set(exported), export_keys)
+        self.assertIs(exported["certified"], True)
+        self.assertIsNone(exported["machine_fingerprint_sha256"])
+
+        # Missing runner_id → exit 2.
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            self.assertEqual(runner_cert.main(["--export", "--runner-id", "no-such-runner",
+                                               "--registry", self.registry]), 2)
+        self.assertIsNone(runner_cert.export_certification(self.registry, "no-such-runner", now=self.now))
 
 
     @unittest.skipUnless(GIT, "git is required")

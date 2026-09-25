@@ -23,6 +23,7 @@ Standard library only; Windows and Linux.
     python runner_cert.py --adapter cursor --runner-id alpha-cursor \
         --work-root <dir> --registry <file> [--timeout 1200]
     python runner_cert.py --status --registry <file> [--runner-id alpha-cursor]
+    python runner_cert.py --export --runner-id alpha-cursor --registry <file>
 """
 import argparse
 import contextlib
@@ -42,6 +43,8 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+
+MACHINE_FP_PREFIX = "runner-cert-machine-v1:"
 
 SUITE = "runner-cert-v1"
 HARNESS_VERSION = "1"
@@ -1028,13 +1031,66 @@ def _verdict(verified, evidence):
     return {"verified": bool(verified), "evidence": _short(evidence)}
 
 
-def certify(adapter, runner_id, work_root, suite=SUITE, timeout=DEFAULT_TIMEOUT, registry=None, clock=None):
+def _read_windows_machine_guid():
+    import winreg
+    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
+    try:
+        value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        return value
+    finally:
+        winreg.CloseKey(key)
+
+
+def _read_linux_machine_id():
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        if text and text.strip():
+            return text
+    return None
+
+
+def _hash_machine_id(raw_id):
+    """sha256 of prefix + stripped lowercased raw id, as lowercase hex. Never the raw id."""
+    return hashlib.sha256((MACHINE_FP_PREFIX + raw_id.strip().lower()).encode("utf-8")).hexdigest()
+
+
+def collect_machine(windows_reader=None, linux_reader=None):
+    """{"fingerprint_sha256", "source"} for a receipt. Never raises; never stores the raw id.
+
+    Pass windows_reader or linux_reader (callables returning the raw id) to avoid
+    reading the real registry or machine-id files — tests use this.
+    """
+    try:
+        if windows_reader is not None:
+            raw, source = windows_reader(), "windows_machineguid"
+        elif linux_reader is not None:
+            raw, source = linux_reader(), "linux_machine_id"
+        elif os.name == "nt":
+            raw, source = _read_windows_machine_guid(), "windows_machineguid"
+        else:
+            raw, source = _read_linux_machine_id(), "linux_machine_id"
+        if raw is None or not str(raw).strip():
+            return {"fingerprint_sha256": None, "source": "unavailable"}
+        return {"fingerprint_sha256": _hash_machine_id(str(raw)), "source": source}
+    except Exception:
+        return {"fingerprint_sha256": None, "source": "unavailable"}
+
+
+def certify(adapter, runner_id, work_root, suite=SUITE, timeout=DEFAULT_TIMEOUT, registry=None,
+            clock=None, windows_machine_reader=None, linux_machine_reader=None):
     """Run one certification and return its receipt (appended to `registry` if given).
 
     Refusals (bad runner id, workspace outside work_root, no git) raise
     CertError before any agent runs, and a workspace the harness cannot
     build raises HarnessError. Once the agent has run, every outcome is a
     receipt.
+
+    windows_machine_reader / linux_machine_reader inject the raw machine id
+    for tests; production leaves them None and reads the host identity.
     """
     adapter = make_adapter(adapter) if isinstance(adapter, str) else adapter
     check_runner_id(runner_id)
@@ -1048,6 +1104,7 @@ def certify(adapter, runner_id, work_root, suite=SUITE, timeout=DEFAULT_TIMEOUT,
     clock = clock or _utcnow
     started = clock()
     epoch = int(started.timestamp())
+    machine = collect_machine(windows_reader=windows_machine_reader, linux_reader=linux_machine_reader)
 
     try:
         os.makedirs(work_root, exist_ok=True)
@@ -1167,6 +1224,7 @@ def certify(adapter, runner_id, work_root, suite=SUITE, timeout=DEFAULT_TIMEOUT,
         "cli": {key: cli.get(key) for key in ("name", "version", "path", "available", "flags_verified",
                                               "flags_verified_against", "reason")},
         "host": _short(socket.gethostname(), 255),
+        "machine": machine,
         "suite": suite,
         "nonce": challenge.nonce,
         "started_at": iso(started),
@@ -1289,6 +1347,44 @@ def _newest(receipts, runner_id):
     return best
 
 
+def _machine_fingerprint(receipt):
+    if not isinstance(receipt, dict):
+        return None
+    machine = receipt.get("machine")
+    if not isinstance(machine, dict):
+        return None
+    return machine.get("fingerprint_sha256")
+
+
+def _previous_certified(receipts, runner_id, newest):
+    """The most recent certified receipt for runner_id that is not `newest`."""
+    best, best_key = None, None
+    for index, receipt in enumerate(receipts):
+        if receipt is newest:
+            continue
+        if not isinstance(receipt, dict) or receipt.get("runner_id") != runner_id:
+            continue
+        if receipt.get("certified") is not True:
+            continue
+        moment = parse_time(receipt.get("finished_at"))
+        key = (moment.timestamp() if moment else float("-inf"), index)
+        if best_key is None or key > best_key:
+            best, best_key = receipt, key
+    return best
+
+
+def fingerprint_changed(receipts, runner_id, newest=None):
+    """True when the newest receipt's machine fingerprint differs from the
+    previous certified receipt for the same runner_id."""
+    newest = newest if newest is not None else _newest(receipts, runner_id)
+    if newest is None:
+        return False
+    previous = _previous_certified(receipts, runner_id, newest)
+    if previous is None:
+        return False
+    return _machine_fingerprint(newest) != _machine_fingerprint(previous)
+
+
 def _judge(receipt, now):
     if receipt is None:
         return False, "no_receipt"
@@ -1304,16 +1400,20 @@ def latest_certification(receipts_or_path, runner_id, now=None):
     """The runner's newest receipt if it certifies the runner at `now`, else None.
 
     The newest receipt decides: a later failed run withdraws an earlier
-    certification, and an expired one is not a certification.
+    certification, and an expired one is not a certification. If the newest
+    receipt's machine fingerprint differs from the previous certified receipt
+    for this runner_id, the runner must be re-certified and this returns None.
     """
     receipts = load_registry(receipts_or_path) if isinstance(receipts_or_path, (str, os.PathLike)) else receipts_or_path
     receipt = _newest(receipts, runner_id)
+    if fingerprint_changed(receipts, runner_id, receipt):
+        return None
     certified, _ = _judge(receipt, now or _utcnow())
     return receipt if certified else None
 
 
 def certification_status(receipts_or_path, runner_id=None, now=None):
-    """{runner_id: {certified, reason, adapter, finished_at, expires_at}} per runner."""
+    """{runner_id: {certified, reason, adapter, finished_at, expires_at, fingerprint_changed}}."""
     receipts = load_registry(receipts_or_path) if isinstance(receipts_or_path, (str, os.PathLike)) else receipts_or_path
     now = now or _utcnow()
     runners = sorted({r.get("runner_id") for r in receipts
@@ -1323,10 +1423,53 @@ def certification_status(receipts_or_path, runner_id=None, now=None):
         if runner_id is not None and name != runner_id:
             continue
         receipt = _newest(receipts, name)
+        changed = fingerprint_changed(receipts, name, receipt)
         certified, reason = _judge(receipt, now)
+        if changed:
+            certified, reason = False, "fingerprint_changed"
         status[name] = {"certified": certified, "reason": reason, "adapter": receipt.get("adapter"),
-                        "finished_at": receipt.get("finished_at"), "expires_at": receipt.get("expires_at")}
+                        "finished_at": receipt.get("finished_at"), "expires_at": receipt.get("expires_at"),
+                        "fingerprint_changed": changed}
     return status
+
+
+def export_certification(receipts_or_path, runner_id, now=None):
+    """One hub-shaped export object for runner_id, or None when there is no receipt.
+
+    Built from latest_certification(); when that is None, uses the newest receipt
+    with certified set to false. Older receipts without `machine` export
+    machine_fingerprint_sha256 as null.
+    """
+    receipts = load_registry(receipts_or_path) if isinstance(receipts_or_path, (str, os.PathLike)) else receipts_or_path
+    now = now or _utcnow()
+    latest = latest_certification(receipts, runner_id, now=now)
+    if latest is not None:
+        receipt, certified = latest, True
+    else:
+        receipt = _newest(receipts, runner_id)
+        if receipt is None:
+            return None
+        certified = False
+    caps_in = receipt.get("capabilities") if isinstance(receipt.get("capabilities"), dict) else {}
+    capabilities = {}
+    for name in CAPABILITIES:
+        entry = caps_in.get(name)
+        if isinstance(entry, dict):
+            capabilities[name] = bool(entry.get("verified"))
+        else:
+            capabilities[name] = bool(entry)
+    harness = receipt.get("harness") if isinstance(receipt.get("harness"), dict) else {}
+    return {
+        "suite": receipt.get("suite") if receipt.get("suite") is not None else SUITE,
+        "runner_id": runner_id,
+        "certified": certified,
+        "capabilities": capabilities,
+        "finished_at": receipt.get("finished_at"),
+        "expires_at": receipt.get("expires_at"),
+        "harness_sha256": harness.get("sha256"),
+        "nonce": receipt.get("nonce"),
+        "machine_fingerprint_sha256": _machine_fingerprint(receipt),
+    }
 
 
 # --- CLI --------------------------------------------------------------------
@@ -1341,11 +1484,22 @@ def main(argv=None):
                         help="hard limit for the agent run, %d..%d seconds" % (CLI_MIN_TIMEOUT, MAX_TIMEOUT))
     parser.add_argument("--status", action="store_true",
                         help="print each runner's certification from the registry and exit")
+    parser.add_argument("--export", action="store_true",
+                        help="print one hub-shaped certification object for --runner-id and exit")
     args = parser.parse_args(argv)
     try:
         if args.status:
             print(json.dumps(certification_status(args.registry, runner_id=args.runner_id), indent=2))
             return 0
+        if args.export:
+            if not args.runner_id:
+                parser.error("--runner-id is required with --export")
+            exported = export_certification(args.registry, args.runner_id)
+            if exported is None:
+                print("runner-cert: no receipt for runner_id %r" % args.runner_id, file=sys.stderr)
+                return 2
+            print(json.dumps(exported, sort_keys=True))
+            return 0 if exported["certified"] else 1
         if not args.adapter or not args.runner_id or not args.work_root:
             parser.error("--adapter, --runner-id and --work-root are required to certify")
         if not CLI_MIN_TIMEOUT <= args.timeout <= MAX_TIMEOUT:
