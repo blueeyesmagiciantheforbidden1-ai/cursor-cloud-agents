@@ -19,6 +19,7 @@ import uuid
 from dynamic_broker import BindingStore
 from agent_hub.credential_broker_service import ExecutionGrantStore
 from agent_hub.cloud_credential_broker import PROJECT_ID, PROJECT_NUMBER
+from fleet_status import status_document
 
 
 class ControllerError(RuntimeError): pass
@@ -90,13 +91,25 @@ class Controller:
     perform the corresponding external mutation. An intent is never replayed.
     """
     def __init__(self, policy, slot, store, cloud, broker, *, binding_store=None,
-                 grant_factory=ExecutionGrantStore, clock=time.time):
+                 grant_factory=ExecutionGrantStore, clock=time.time, status_publisher=None):
         self.policy, self.slot, self.store, self.cloud, self.broker = policy, slot, store, cloud, broker
         self.bindings = binding_store or BindingStore(policy)
         self.grant_factory, self.clock = grant_factory, clock
+        self.status_publisher = status_publisher
+        self.status_publish_failures = 0
         require(set(slot) == {'job_uid', 'template_sha256', 'enabled'} and type(slot['enabled']) is bool
                 and re.fullmatch(r'[a-f0-9-]{36}', slot['job_uid'])
                 and re.fullmatch(r'[a-f0-9]{64}', slot['template_sha256']), 'slot_config_invalid')
+
+    def _publish_status(self, state):
+        """Advisory publish after a tick. Failures never change the tick result."""
+        if self.status_publisher is None:
+            return
+        try:
+            document = status_document(state, self.clock(), self.policy.profile.provider)
+            self.status_publisher.publish(self.policy.profile.provider, document)
+        except Exception:
+            self.status_publish_failures += 1
 
     @property
     def config_sha(self):
@@ -279,141 +292,146 @@ class Controller:
         return result, self.store.cas(result, version)
 
     def tick(self):
-        if not self.slot['enabled']:
-            return {'status': 'disabled'}
-        state, version = self.store.read()
-        if state is None:
-            state = {'schema_version': 1, 'phase': 'idle', 'generation': 0,
-                     'updated_at': int(self.clock()), **self._binding_fields()}
-            version = self.store.cas(state, None)
-        for _ in range(8):
-            # Active is drained under the digest it launched with. A template-only
-            # change is refused until that execution is terminal; the idle or
-            # blocked transition that follows is what re-keys. Any other drift
-            # refuses immediately, including while the execution is still running.
-            if state['phase'] == 'active' and state.get('config_sha256') != self.config_sha:
-                if not self._template_only_change(state):
-                    raise ControllerError('controller_config_changed')
-            else:
-                state, version = self._adopt_config(state, version)
-            phase = state['phase']
-            if phase in ('blocked', 'launch_intent', 'binding_intent', 'grant_intent'):
-                # Another delivery may own this mutation, or its reply was lost.
-                # Read-only reconciliation occurs separately; never repeat it.
-                return {'status': phase, 'generation': state['generation']}
-            if phase == 'idle':
-                if self.clock() < state.get('next_launch_at', 0):
-                    if state.get('error') == 'provider_quota_exhausted':
-                        return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
-                                'quota_parks': state.get('quota_parks', 0), 'generation': state['generation']}
-                    return {'status': 'replacement_cooldown', 'generation': state['generation']}
-                job = self.job(); previous = self.current_terminal(job, state)
-                release_uid = self.broker._read()[0].get('execution_uid')
-                grant = secrets.token_urlsafe(48)
-                # A launch ends any park: an error left from it would make a
-                # later strike backoff report provider_quota_parked and let
-                # reset() treat that backoff as a park (Light's review).
-                launch = {key: value for key, value in state.items() if key != 'error'}
-                state, version = self.save(launch, version, phase='binding_intent',
-                    generation=state['generation'] + 1, intent=uuid.uuid4().hex,
-                    grant=grant, grant_sha256=hashlib.sha256(grant.encode()).hexdigest(),
-                    expires_at=int(self.clock()) + 7200, previous_uid=previous['uid'], release_uid=release_uid)
-                binding = self.policy.binding(state['grant_sha256'], state['expires_at'])
-                self.bindings.publish(binding)
-                state, version = self.save(state, version, phase='binding_ready')
-                continue
-            if phase == 'binding_ready':
-                job = self.job(); previous = self.current_terminal(job, state)
-                require(previous['uid'] == state['previous_uid'], 'another_execution_intervened')
-                require(state['expires_at'] > self.clock() + 6000, 'fresh_grant_required')
-                state, version = self.save(state, version, phase='launch_intent',
-                                           next_launch_at=int(self.clock()) + 60)
-                operation = self.cloud.run(self.policy.profile.job_name, {
-                    'etag': job['etag'], 'overrides': {'containerOverrides': [{'env': [
-                        {'name': 'RUNCREW_EXECUTION_GRANT', 'value': state['grant']},
-                        {'name': 'RUNCREW_CONTROLLER_INTENT', 'value': state['intent']}]}]}})
-                name = operation.get('name', '')
-                require(re.fullmatch(r'projects/(?:496481413971|project-0c6d31fa-509e-4116-a2c)/locations/us-central1/operations/[a-zA-Z0-9_-]+', name),
-                        'launch_operation_unverified')
-                state, version = self.save(state, version, phase='launch_submitted', operation=name)
-                continue
-            if phase == 'launch_submitted':
-                matches = self.cloud.executions(self.policy.profile.job_name, state['intent'])
-                require(isinstance(matches, list) and len(matches) <= 1, 'ambiguous_launch')
-                if not matches:
-                    operation = self.cloud.get(state['operation'])
-                    if operation.get('done'):
-                        state, version = self.save(state, version, phase='blocked', error='launch_without_execution')
-                    return {'status': state['phase'], 'generation': state['generation']}
-                execution = exact_execution(self.policy, matches[0], state['intent'])
-                require(not terminal(execution), 'worker_finished_before_grant')
-                # Cloud Run echoes the project ID; the grant store, the broker
-                # and the profiles use the project number. Store and publish the
-                # canonical form, or publish is refused and the slot parks here.
-                name = canonical_name(execution['name'])
-                state, version = self.save(state, version, phase='grant_intent',
-                    execution=name, execution_uid=execution['uid'])
-                binding = self.policy.binding(state['grant_sha256'], state['expires_at'])
-                self.grant_factory(binding).publish(name, execution['uid'])
-                state, version = self.save(state, version, phase='active', grant=None)
-                return {'status': 'job_running_readiness_separate', 'execution': state['execution'],
-                        'worker_id': self.policy.profile.provider + '-live-' + state['execution_uid'].replace('-', ''),
-                        'generation': state['generation']}
-            if phase == 'active':
-                execution = exact_execution(self.policy, self.cloud.get(state['execution']), state['intent'])
-                require(execution['uid'] == state['execution_uid'], 'execution_uid_changed')
-                if not terminal(execution):
-                    # The slot is still mid-execution. Do not adopt the new template yet.
-                    if state.get('config_sha256') != self.config_sha:
+        state = None
+        try:
+            if not self.slot['enabled']:
+                state = {'slot_enabled': False}
+                return {'status': 'disabled'}
+            state, version = self.store.read()
+            if state is None:
+                state = {'schema_version': 1, 'phase': 'idle', 'generation': 0,
+                         'updated_at': int(self.clock()), **self._binding_fields()}
+                version = self.store.cas(state, None)
+            for _ in range(8):
+                # Active is drained under the digest it launched with. A template-only
+                # change is refused until that execution is terminal; the idle or
+                # blocked transition that follows is what re-keys. Any other drift
+                # refuses immediately, including while the execution is still running.
+                if state['phase'] == 'active' and state.get('config_sha256') != self.config_sha:
+                    if not self._template_only_change(state):
                         raise ControllerError('controller_config_changed')
+                else:
+                    state, version = self._adopt_config(state, version)
+                phase = state['phase']
+                if phase in ('blocked', 'launch_intent', 'binding_intent', 'grant_intent'):
+                    # Another delivery may own this mutation, or its reply was lost.
+                    # Read-only reconciliation occurs separately; never repeat it.
+                    return {'status': phase, 'generation': state['generation']}
+                if phase == 'idle':
+                    if self.clock() < state.get('next_launch_at', 0):
+                        if state.get('error') == 'provider_quota_exhausted':
+                            return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
+                                    'quota_parks': state.get('quota_parks', 0), 'generation': state['generation']}
+                        return {'status': 'replacement_cooldown', 'generation': state['generation']}
+                    job = self.job(); previous = self.current_terminal(job, state)
+                    release_uid = self.broker._read()[0].get('execution_uid')
+                    grant = secrets.token_urlsafe(48)
+                    # A launch ends any park: an error left from it would make a
+                    # later strike backoff report provider_quota_parked and let
+                    # reset() treat that backoff as a park (Light's review).
+                    launch = {key: value for key, value in state.items() if key != 'error'}
+                    state, version = self.save(launch, version, phase='binding_intent',
+                        generation=state['generation'] + 1, intent=uuid.uuid4().hex,
+                        grant=grant, grant_sha256=hashlib.sha256(grant.encode()).hexdigest(),
+                        expires_at=int(self.clock()) + 7200, previous_uid=previous['uid'], release_uid=release_uid)
+                    binding = self.policy.binding(state['grant_sha256'], state['expires_at'])
+                    self.bindings.publish(binding)
+                    state, version = self.save(state, version, phase='binding_ready')
+                    continue
+                if phase == 'binding_ready':
+                    job = self.job(); previous = self.current_terminal(job, state)
+                    require(previous['uid'] == state['previous_uid'], 'another_execution_intervened')
+                    require(state['expires_at'] > self.clock() + 6000, 'fresh_grant_required')
+                    state, version = self.save(state, version, phase='launch_intent',
+                                               next_launch_at=int(self.clock()) + 60)
+                    operation = self.cloud.run(self.policy.profile.job_name, {
+                        'etag': job['etag'], 'overrides': {'containerOverrides': [{'env': [
+                            {'name': 'RUNCREW_EXECUTION_GRANT', 'value': state['grant']},
+                            {'name': 'RUNCREW_CONTROLLER_INTENT', 'value': state['intent']}]}]}})
+                    name = operation.get('name', '')
+                    require(re.fullmatch(r'projects/(?:496481413971|project-0c6d31fa-509e-4116-a2c)/locations/us-central1/operations/[a-zA-Z0-9_-]+', name),
+                            'launch_operation_unverified')
+                    state, version = self.save(state, version, phase='launch_submitted', operation=name)
+                    continue
+                if phase == 'launch_submitted':
+                    matches = self.cloud.executions(self.policy.profile.job_name, state['intent'])
+                    require(isinstance(matches, list) and len(matches) <= 1, 'ambiguous_launch')
+                    if not matches:
+                        operation = self.cloud.get(state['operation'])
+                        if operation.get('done'):
+                            state, version = self.save(state, version, phase='blocked', error='launch_without_execution')
+                        return {'status': state['phase'], 'generation': state['generation']}
+                    execution = exact_execution(self.policy, matches[0], state['intent'])
+                    require(not terminal(execution), 'worker_finished_before_grant')
+                    # Cloud Run echoes the project ID; the grant store, the broker
+                    # and the profiles use the project number. Store and publish the
+                    # canonical form, or publish is refused and the slot parks here.
+                    name = canonical_name(execution['name'])
+                    state, version = self.save(state, version, phase='grant_intent',
+                        execution=name, execution_uid=execution['uid'])
+                    binding = self.policy.binding(state['grant_sha256'], state['expires_at'])
+                    self.grant_factory(binding).publish(name, execution['uid'])
+                    state, version = self.save(state, version, phase='active', grant=None)
                     return {'status': 'job_running_readiness_separate', 'execution': state['execution'],
                             'worker_id': self.policy.profile.provider + '-live-' + state['execution_uid'].replace('-', ''),
                             'generation': state['generation']}
-                clean = (type(execution.get('succeededCount')) is int and execution['succeededCount'] == 1
-                         and type(execution.get('failedCount', 0)) is int and execution.get('failedCount', 0) == 0
-                         and type(execution.get('runningCount', 0)) is int and execution.get('runningCount', 0) == 0)
-                if not clean:
-                    # Quota is decided before the strike counter moves. A failed
-                    # task read or any exit code other than 75 leaves released
-                    # and failures on today's path.
-                    exit_code = self._task_exit_code(state['execution'])
-                    try:
-                        self.idle_credential(None if self.never_bound(state, execution) else execution)
-                        released = True
-                    except ControllerError:
-                        released = False
-                    if exit_code == QUOTA_EXIT_CODE and released:
-                        parks = state.get('quota_parks', 0)
+                if phase == 'active':
+                    execution = exact_execution(self.policy, self.cloud.get(state['execution']), state['intent'])
+                    require(execution['uid'] == state['execution_uid'], 'execution_uid_changed')
+                    if not terminal(execution):
+                        # The slot is still mid-execution. Do not adopt the new template yet.
+                        if state.get('config_sha256') != self.config_sha:
+                            raise ControllerError('controller_config_changed')
+                        return {'status': 'job_running_readiness_separate', 'execution': state['execution'],
+                                'worker_id': self.policy.profile.provider + '-live-' + state['execution_uid'].replace('-', ''),
+                                'generation': state['generation']}
+                    clean = (type(execution.get('succeededCount')) is int and execution['succeededCount'] == 1
+                             and type(execution.get('failedCount', 0)) is int and execution.get('failedCount', 0) == 0
+                             and type(execution.get('runningCount', 0)) is int and execution.get('runningCount', 0) == 0)
+                    if not clean:
+                        # Quota is decided before the strike counter moves. A failed
+                        # task read or any exit code other than 75 leaves released
+                        # and failures on today's path.
+                        exit_code = self._task_exit_code(state['execution'])
+                        try:
+                            self.idle_credential(None if self.never_bound(state, execution) else execution)
+                            released = True
+                        except ControllerError:
+                            released = False
+                        if exit_code == QUOTA_EXIT_CODE and released:
+                            parks = state.get('quota_parks', 0)
+                            self.store.archive(state, execution)
+                            state, version = self.save(state, version, phase='idle', error='provider_quota_exhausted',
+                                quota_parks=(parks if type(parks) is int and parks >= 0 else 0) + 1,
+                                next_launch_at=int(self.clock()) + self._quota_park_seconds(parks),
+                                last_execution=state['execution'], last_execution_uid=state['execution_uid'])
+                            return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
+                                    'quota_parks': state['quota_parks'], 'generation': state['generation']}
+                        failures = state.get('consecutive_failures', 0) + 1
+                        if not released or failures >= MAX_CONSECUTIVE_FAILURES:
+                            state, version = self.save(state, version, phase='blocked', consecutive_failures=failures,
+                                error='worker_failed_no_restart_loop' if released else 'worker_failed_credential_unreleased')
+                            return {'status': 'blocked', 'generation': state['generation']}
+                        first, cap = FAILURE_BACKOFF_SECONDS
                         self.store.archive(state, execution)
-                        state, version = self.save(state, version, phase='idle', error='provider_quota_exhausted',
-                            quota_parks=(parks if type(parks) is int and parks >= 0 else 0) + 1,
-                            next_launch_at=int(self.clock()) + self._quota_park_seconds(parks),
+                        state, version = self.save(state, version, phase='idle', consecutive_failures=failures,
+                            next_launch_at=int(self.clock()) + min(cap, first * 2 ** (failures - 1)),
                             last_execution=state['execution'], last_execution_uid=state['execution_uid'])
-                        return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
-                                'quota_parks': state['quota_parks'], 'generation': state['generation']}
-                    failures = state.get('consecutive_failures', 0) + 1
-                    if not released or failures >= MAX_CONSECUTIVE_FAILURES:
-                        state, version = self.save(state, version, phase='blocked', consecutive_failures=failures,
-                            error='worker_failed_no_restart_loop' if released else 'worker_failed_credential_unreleased')
-                        return {'status': 'blocked', 'generation': state['generation']}
-                    first, cap = FAILURE_BACKOFF_SECONDS
+                        return {'status': 'replacement_after_failure', 'consecutive_failures': failures,
+                                'next_launch_at': state['next_launch_at'], 'generation': state['generation']}
+                    self.idle_credential(execution)
+                    # Preserve this generation's receipt separately before replacing
+                    # the live state. The implementation uses immutable create-only.
+                    # A clean run clears a provider-quota park as well as the strikes.
                     self.store.archive(state, execution)
-                    state, version = self.save(state, version, phase='idle', consecutive_failures=failures,
-                        next_launch_at=int(self.clock()) + min(cap, first * 2 ** (failures - 1)),
+                    cleared = {key: value for key, value in state.items() if key != 'error'}
+                    state, version = self.save(cleared, version, phase='idle', consecutive_failures=0, quota_parks=0,
                         last_execution=state['execution'], last_execution_uid=state['execution_uid'])
-                    return {'status': 'replacement_after_failure', 'consecutive_failures': failures,
-                            'next_launch_at': state['next_launch_at'], 'generation': state['generation']}
-                self.idle_credential(execution)
-                # Preserve this generation's receipt separately before replacing
-                # the live state. The implementation uses immutable create-only.
-                # A clean run clears a provider-quota park as well as the strikes.
-                self.store.archive(state, execution)
-                cleared = {key: value for key, value in state.items() if key != 'error'}
-                state, version = self.save(cleared, version, phase='idle', consecutive_failures=0, quota_parks=0,
-                    last_execution=state['execution'], last_execution_uid=state['execution_uid'])
-                continue
-            raise ControllerError('unknown_controller_state')
-        return {'status': state['phase'], 'generation': state['generation']}
+                    continue
+                raise ControllerError('unknown_controller_state')
+            return {'status': state['phase'], 'generation': state['generation']}
+        finally:
+            self._publish_status(state)
 
     STOPPED = ('blocked', 'binding_intent', 'binding_ready', 'launch_intent', 'launch_submitted', 'grant_intent')
 
