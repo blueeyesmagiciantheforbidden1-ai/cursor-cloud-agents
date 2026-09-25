@@ -54,7 +54,7 @@ class StatusDocumentTests(unittest.TestCase):
 
         # Clean durable launch interval: waiting, but not a strike and not a park.
         cooldown = {'phase': 'idle', 'consecutive_failures': 0, 'next_launch_at': NOW + 60}
-        self.assertEqual(status_reason(cooldown, NOW), 'unknown')
+        self.assertEqual(status_reason(cooldown, NOW), 'idle_launching')
         self.assertEqual(status_reason(cooldown, NOW + 60), 'idle_launching')
 
         absent = {'phase': 'idle', 'consecutive_failures': 1}

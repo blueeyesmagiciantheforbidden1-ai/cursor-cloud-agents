@@ -18,7 +18,17 @@ PROVISIONING_PHASES = frozenset({
 
 
 def status_reason(state, now):
-    """Fixed reason code for a controller slot state at ``now`` (epoch seconds)."""
+    """Fixed reason code for a controller slot state at ``now`` (epoch seconds).
+
+    Idle waiting (``now < next_launch_at``) maps as::
+
+        error == provider_quota_exhausted  -> parked
+        consecutive_failures > 0           -> backoff
+        otherwise (incl. launch interval)  -> idle_launching
+
+    The normal 60 s post-``binding_ready`` launch interval (failures == 0, no
+    quota error) is ``idle_launching``, not ``unknown``.
+    """
     if not isinstance(state, dict):
         return 'unknown'
     if state.get('slot_enabled') is False:
@@ -37,9 +47,9 @@ def status_reason(state, now):
             if state.get('error') == 'provider_quota_exhausted':
                 return 'parked'
             failures = state.get('consecutive_failures', 0)
-            if type(failures) is int and failures > 0 and state.get('error') != 'provider_quota_exhausted':
+            if type(failures) is int and failures > 0:
                 return 'backoff'
-            return 'unknown'
+            return 'idle_launching'
         return 'idle_launching'
     return 'unknown'
 
