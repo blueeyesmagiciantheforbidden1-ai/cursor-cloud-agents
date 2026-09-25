@@ -29,6 +29,9 @@ def stage(task, with_reference):
     hidden = work / 'tests_hidden'
     shutil.copytree(task / 'hidden_tests', hidden)
     (hidden / '__init__.py').touch()
+    # Python 3.14's unittest discover needs an importable start directory.
+    if (work / 'tests').is_dir():
+        (work / 'tests' / '__init__.py').touch()
     if with_reference:
         for file in (task / 'reference').rglob('*'):
             if file.is_file():
