@@ -414,6 +414,30 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('provider_quota_exhausted', result)
         self.assertIn('stopped before it could deliver', client.completions[0]['output'])
 
+    def test_brief_claude_revocation_reconnects_without_a_quota_park(self):
+        # Claude revoked the BlueEyes account briefly. The room fails once,
+        # the process exits 76, and the controller relaunches the session.
+        from dataclasses import replace
+        worker, client, adapter, _ = self.setup_worker()
+        worker.settings = replace(worker.settings, agent='claude', worker_id='claude-live')
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            raise CodeError('claude_authentication_failed')
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['error_code'], 'claude_authentication_failed')
+        self.assertIs(result['auth_reconnect'], True)
+        self.assertNotIn('provider_quota_exhausted', result)
+        self.assertEqual(worker.last_exit, provider_errors.AUTH_RECONNECT_EXIT_CODE)
+        self.assertEqual(len(client.completions), 1)
+        completion = client.completions[0]
+        self.assertEqual(completion['exit_code'], 1)
+        self.assertEqual(completion['error_code'], 'claude_authentication_failed')
+        self.assertIn('revoked the account briefly', completion['output'])
+        self.assertIn('message bus, and shared memory reconnect', completion['output'])
+
     def test_failed_completion_carries_structured_facts(self):
         # Before the model call: the hub may requeue safely.
         worker, client, adapter, _ = self.setup_worker()
@@ -518,6 +542,12 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(finish_exit('claude', {'outcome': 'failed', 'error_code': 'claude_quota_exhausted'},
                                      provider_errors.QUOTA_EXIT_CODE, stream), provider_errors.QUOTA_EXIT_CODE)
         self.assertEqual(stream.getvalue().splitlines(), ['claude worker exit 75: claude_quota_exhausted'])
+        stream = io.StringIO()
+        self.assertEqual(finish_exit('claude', {'outcome': 'failed', 'error_code': 'claude_authentication_failed'},
+                                     provider_errors.AUTH_RECONNECT_EXIT_CODE, stream),
+                         provider_errors.AUTH_RECONNECT_EXIT_CODE)
+        self.assertEqual(stream.getvalue().splitlines(),
+                         ['claude worker exit 76: claude_authentication_failed'])
 
         class Broken:
             def write(self, _):
@@ -528,6 +558,11 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(finish_exit('claude', {'outcome': 'failed', 'error_code': 'claude_quota_exhausted'},
                                      provider_errors.QUOTA_EXIT_CODE, Broken()), provider_errors.QUOTA_EXIT_CODE)
         self.assertEqual(finish_exit('grok', None, None, io.StringIO()), 1)
+
+    def test_claude_auth_revocation_is_a_reconnect_not_a_quota(self):
+        self.assertTrue(provider_errors.is_auth_reconnect('claude_authentication_failed'))
+        self.assertFalse(provider_errors.is_auth_reconnect('claude_quota_exhausted'))
+        self.assertFalse(provider_errors.is_quota('claude_authentication_failed'))
 
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):

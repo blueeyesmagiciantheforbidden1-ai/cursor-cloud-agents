@@ -101,13 +101,17 @@ def finish_exit(agent, result, last_exit, stream):
     """Process exit code for a finished run; one stderr line only on failure.
 
     0 for completed or idle_drained (nothing printed); QUOTA_EXIT_CODE when
-    the run recorded it, else 1. A failing stderr never changes the code:
-    a lost 75 would hide a quota park from the controller.
+    the run recorded a quota park; AUTH_RECONNECT_EXIT_CODE when Claude
+    revoked the account briefly. Anything else is 1. A failing stderr never
+    changes the code: a lost 75 or 76 would hide the park from the controller.
     """
     outcome = result.get('outcome') if isinstance(result, dict) else None
     if outcome in ('completed', 'idle_drained'):
         return 0
-    code = provider_errors.QUOTA_EXIT_CODE if last_exit == provider_errors.QUOTA_EXIT_CODE else 1
+    if last_exit in (provider_errors.QUOTA_EXIT_CODE, provider_errors.AUTH_RECONNECT_EXIT_CODE):
+        code = last_exit
+    else:
+        code = 1
     try:
         print(exit_line(agent, code, result), file=stream, flush=True)
     except (OSError, ValueError):
@@ -793,11 +797,19 @@ class Worker:
                 self.last_exit = 0
                 return outcome
             quota = provider_errors.is_quota(code)
-            self.last_exit = provider_errors.QUOTA_EXIT_CODE if quota else 1
+            auth_reconnect = provider_errors.is_auth_reconnect(code)
+            if quota:
+                self.last_exit = provider_errors.QUOTA_EXIT_CODE
+            elif auth_reconnect:
+                self.last_exit = provider_errors.AUTH_RECONNECT_EXIT_CODE
+            else:
+                self.last_exit = 1
             outcome.update(error_code=code, model_call_attempted=self.model_call_attempted,
                            claim_attempted=self.claim_attempted)
             if quota:
                 outcome['provider_quota_exhausted'] = True
+            if auth_reconnect:
+                outcome['auth_reconnect'] = True
             if self.completion_payload is not None:
                 outcome['completion_delivery'] = 'unconfirmed'
             elif self.lease_revoked:
@@ -809,6 +821,10 @@ class Worker:
                     text = ('The ' + self.settings.agent + ' worker could not answer: the provider refused the '
                             'model call because the account usage limit is exhausted (' + code + '). '
                             'Retry this room after the limit resets.')
+                elif auth_reconnect:
+                    text = ('The ' + self.settings.agent + ' worker could not answer: Claude revoked the '
+                            'account briefly (' + code + '). This room was not retried. The session, '
+                            'message bus, and shared memory reconnect after the account is restored.')
                 else:
                     text = ('The cloud worker stopped before it could deliver a verified answer (' + code + '). '
                             'It did not automatically repeat the model request.')

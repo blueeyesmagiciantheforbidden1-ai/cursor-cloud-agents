@@ -193,6 +193,29 @@ def record(hub, actor, data):
             state['revision'] += 1
             return copy.deepcopy(states[archive_key])
         return hub.store.mutate_states((key, archive_key), archive)
+    if operation == 'reconnect':
+        _fields(data, ('operation', 'workspace'))
+        if actor not in ('manager', *AGENTS):
+            raise HubError('A participant or manager credential is required', 403)
+        workspace = data['workspace']
+
+        def attach(state):
+            if not state:
+                state.update(schema_version=1, revision=0, lessons={})
+            lessons = state.get('lessons', {})
+            if not isinstance(lessons, dict):
+                raise HubError('Project memory is unreadable', 409)
+            # A brief Claude revocation closes the attach. Reconnecting reads
+            # the same document; it does not retire, archive, or rewrite lessons.
+            return {'workspace': workspace, 'revision': state.get('revision', 0),
+                    'lessons': len(lessons), 'reconnected': True}
+
+        attached = _mutate(hub, workspace, attach)
+        stored = hub.store.get_state(state_key(workspace))
+        lessons = stored.get('lessons', {})
+        return {'workspace': workspace, 'revision': stored.get('revision', 0),
+                'lessons': len(lessons) if isinstance(lessons, dict) else 0,
+                'reconnected': attached.get('reconnected') is True}
     if operation == 'retire':
         _fields(data, ('operation', 'workspace', 'lesson_id'))
         if actor != 'manager':
@@ -207,7 +230,7 @@ def record(hub, actor, data):
                 lesson.update(status='retired', updated_at=hub.clock())
             return lesson
         return _mutate(hub, data['workspace'], retire, revocation=True)
-    raise HubError('operation must be propose, review, retire, or archive')
+    raise HubError('operation must be propose, review, retire, archive, or reconnect')
 
 
 def read(hub, actor, workspace, *, cursor='', limit=5):

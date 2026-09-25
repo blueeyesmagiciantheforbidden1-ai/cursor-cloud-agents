@@ -17,6 +17,12 @@ SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
 # the controller can park the slot instead of spending retries on it.
 QUOTA_SUFFIX = '_quota_exhausted'
 QUOTA_EXIT_CODE = 75
+# Claude revoked the BlueEyes subscription for a short time. That is not a
+# quota park and not a credential quarantine: the local token file is unchanged.
+# The worker exits AUTH_RECONNECT_EXIT_CODE so the controller relaunches and
+# the session, message bus, and shared memory attach again.
+AUTH_RECONNECT_CODE = 'claude_authentication_failed'
+AUTH_RECONNECT_EXIT_CODE = 76
 
 
 class ProviderCodeError(Exception):
@@ -33,3 +39,7 @@ def error_code(error):
 
 def is_quota(code):
     return isinstance(code, str) and SAFE_CODE.fullmatch(code) is not None and code.endswith(QUOTA_SUFFIX)
+
+
+def is_auth_reconnect(code):
+    return code == AUTH_RECONNECT_CODE

@@ -42,6 +42,27 @@ class LearningTests(unittest.TestCase):
         data = dict(operation='review', room_id=room['id'], source_message=0, lesson_id=lesson['id'], verdict=supplied or verdict, quote=quote)
         return self.hub.learn('manager', data), data
 
+    def test_reconnect_keeps_shared_memory_after_a_brief_revocation(self):
+        lesson, _ = self.propose()
+        before = self.hub.store.get_state(state_key('project'))['revision']
+        attached = self.hub.learn('claude', dict(operation='reconnect', workspace='project'))
+        self.assertTrue(attached['reconnected'])
+        self.assertEqual(attached['lessons'], 1)
+        self.assertEqual(attached['revision'], before)
+        stored = self.hub.store.get_state(state_key('project'))
+        self.assertEqual(stored['lessons'][lesson['id']]['text'], self.text)
+        self.assertEqual(stored['revision'], before)
+        empty = self.hub.learn('manager', dict(operation='reconnect', workspace='other-desk'))
+        self.assertTrue(empty['reconnected'])
+        self.assertEqual(empty['lessons'], 0)
+        self.assertEqual(empty['revision'], 0)
+        again = self.hub.learn('claude', dict(operation='reconnect', workspace='other-desk'))
+        self.assertTrue(again['reconnected'])
+        self.assertEqual(again['revision'], 0)
+        self.assertEqual(again['lessons'], 0)
+        with self.assertRaises(HubError):
+            self.hub.learn('status', dict(operation='reconnect', workspace='project'))
+
     def test_lesson_survives_restart_and_is_shared_with_another_agent(self):
         lesson, _ = self.propose()
         self.review(lesson)

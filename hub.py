@@ -57,7 +57,10 @@ READ_STATE = HUB_DIR / "read_state.json"
 THREAD = HUB_DIR / "THREAD.md"
 
 MAX_BODY = 200_000
-KNOWN = ("claude", "cursor", "user", "all")
+# Fleet participants. Claude's brief account revocation drops in-process
+# waiters; the append-only log is the bus, and reconnect republishes it.
+PARTICIPANTS = ("claude", "cursor", "codex", "copilot", "grok", "user")
+KNOWN = (*PARTICIPANTS, "all")
 
 
 def now_iso() -> str:
@@ -233,15 +236,58 @@ def cmd_tail(args: argparse.Namespace) -> int:
     return 0
 
 
+def unread_counts(msgs: list[dict] | None = None) -> dict[str, int]:
+    msgs = load_all() if msgs is None else msgs
+    state = read_state()
+    counts = {}
+    for who in PARTICIPANTS:
+        if who == "user":
+            continue
+        counts[who] = len([
+            m for m in msgs
+            if addressed_to(m, who) and int(m.get("seq", 0)) > int(state.get(who, 0))
+        ])
+    return counts
+
+
+def reconnect_bus() -> dict:
+    """Reopen the message bus after a brief Claude revocation.
+
+    The log is not rewritten and read cursors are not cleared. When the log is
+    present, THREAD.md is rendered again so a dropped waiter attaches to the
+    same record. A missing log does not blank an existing thread: the JSONL
+    file is gitignored, and the rendered thread may be the only copy here.
+    """
+    ensure_dir()
+    if not LOG.exists():
+        if not THREAD.exists():
+            render_thread([])
+        return {"reconnected": True, "messages": None, "log_present": False,
+                "unread": {}, "log": str(LOG)}
+    msgs = load_all()
+    render_thread(msgs)
+    return {"reconnected": True, "messages": len(msgs), "log_present": True,
+            "unread": unread_counts(msgs), "log": str(LOG)}
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     msgs = load_all()
-    state = read_state()
     print(f"hub: {len(msgs)} message(s), log = {LOG}")
     if msgs:
         last = msgs[-1]
         print(f"latest: [{last['seq']}] {last['from']} -> {last['to']} {last['ts']}  {last.get('subject', '')}")
-    for who in ("claude", "cursor"):
-        n = len([m for m in msgs if addressed_to(m, who) and int(m.get("seq", 0)) > int(state.get(who, 0))])
+    for who, n in unread_counts(msgs).items():
+        print(f"  {who:<7} unread: {n}")
+    return 0
+
+
+def cmd_reconnect(args: argparse.Namespace) -> int:
+    status = reconnect_bus()
+    if status["messages"] is None:
+        print(f"bus reconnected: log not on this machine, thread left in place ({status['log']})")
+        return 0
+    print(f"bus reconnected: {status['messages']} message(s), log = {status['log']}")
+    for who, n in status["unread"].items():
         print(f"  {who:<7} unread: {n}")
     return 0
 
@@ -275,6 +321,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="counts and unread per participant")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("reconnect", help="republish the bus after a dropped Claude session")
+    sp.set_defaults(func=cmd_reconnect)
     return p
 
 
