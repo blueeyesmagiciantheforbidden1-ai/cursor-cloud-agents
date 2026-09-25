@@ -309,6 +309,124 @@ class ReportPayloadTests(unittest.TestCase):
         self.assertEqual(usage[0]['metric'], 'requests')
         self.assertEqual(usage[0]['observed_at'], QUOTA_OBSERVED_Z)
 
+    def test_report_success_sends_usage_once(self):
+        worker, client = self._worker('codex')
+        worker.ready = True
+        worker._last_turn_usage = CODEX_USAGE
+        worker._last_turn_observed_at = OBSERVED
+        worker.report(force=True)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0][0], '/v1/workers/report')
+        self.assertEqual(client.calls[0][1]['usage'], [{
+            'scope': 'session', 'metric': 'tokens', 'status': 'available',
+            'source': 'provider_cli', 'observed_at': OBSERVED, 'used': 17,
+        }])
+        self.assertEqual(worker.next_report, 1025.0)
+
+    def test_report_failure_with_usage_retries_once_without_usage(self):
+        worker, client = self._worker('codex')
+        worker.ready = True
+        worker._last_turn_usage = CODEX_USAGE
+        worker._last_turn_observed_at = OBSERVED
+        outcomes = [RuntimeError('rejected'), {'accepted': True}]
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            result = outcomes.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        client.post = post
+        worker.report(force=True)
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(client.calls[0][1]['usage'])
+        self.assertEqual(client.calls[1][1]['usage'], [])
+        self.assertEqual(worker.usage_rejected, 1)
+        self.assertTrue(all('span' in item for item in worker.spans))
+        self.assertEqual(worker.next_report, 1025.0)
+
+    def test_report_not_accepted_with_usage_retries(self):
+        worker, client = self._worker('codex')
+        worker.ready = True
+        worker._last_turn_usage = CODEX_USAGE
+        worker._last_turn_observed_at = OBSERVED
+        outcomes = [{'accepted': False}, {'accepted': True}]
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            return outcomes.pop(0)
+
+        client.post = post
+        worker.report(force=True)
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(client.calls[0][1]['usage'])
+        self.assertEqual(client.calls[1][1]['usage'], [])
+        self.assertEqual(worker.usage_rejected, 1)
+        self.assertTrue(all('span' in item for item in worker.spans))
+        self.assertEqual(worker.next_report, 1025.0)
+
+    def test_report_failure_without_usage_no_retry(self):
+        worker, client = self._worker()
+        worker.ready = True
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            raise RuntimeError('rejected')
+
+        client.post = post
+        with self.assertRaises(RuntimeError) as caught:
+            worker.report(force=True)
+        self.assertEqual(str(caught.exception), 'rejected')
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0][1]['usage'], [])
+        self.assertEqual(worker.spans, [])
+        self.assertEqual(worker.usage_rejected, 0)
+        self.assertEqual(worker.next_report, 0.0)
+
+    def test_report_both_attempts_fail_preserve_retry_exception(self):
+        worker, client = self._worker('codex')
+        worker.ready = True
+        worker._last_turn_usage = CODEX_USAGE
+        worker._last_turn_observed_at = OBSERVED
+        outcomes = [ValueError('first'), KeyError('second')]
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            raise outcomes.pop(0)
+
+        client.post = post
+        with self.assertRaises(KeyError) as caught:
+            worker.report(force=True)
+        self.assertEqual(caught.exception.args, ('second',))
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(client.calls[0][1]['usage'])
+        self.assertEqual(client.calls[1][1]['usage'], [])
+        self.assertEqual(worker.usage_rejected, 1)
+        self.assertTrue(all('span' in item for item in worker.spans))
+        self.assertEqual(worker.next_report, 0.0)
+
+    def test_heartbeat_true_when_usage_rejected_then_empty_ok(self):
+        worker, client = self._worker('codex')
+        worker.ready = True
+        worker._last_turn_usage = CODEX_USAGE
+        worker._last_turn_observed_at = OBSERVED
+        outcomes = [RuntimeError('rejected'), {'accepted': True}]
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            result = outcomes.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        client.post = post
+        self.assertTrue(worker.heartbeat())
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[1][1]['usage'], [])
+        self.assertEqual(worker.usage_rejected, 1)
+        self.assertTrue(all('span' in item for item in worker.spans))
+
 
 if __name__ == '__main__':
     unittest.main()

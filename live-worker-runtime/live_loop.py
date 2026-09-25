@@ -372,6 +372,7 @@ class Worker:
         self._capability_value = None
         self._last_turn_usage = None
         self._last_turn_observed_at = None
+        self.usage_rejected = 0
 
     def _capability(self):
         """Build the manifest once per run. Failure omits it; it never raises."""
@@ -488,8 +489,19 @@ class Worker:
             capability = None
         if capability_valid(capability):
             payload['capability'] = dict(capability)
-        receipt = self.client.post('/v1/workers/report', payload)
-        require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
+        try:
+            receipt = self.client.post('/v1/workers/report', payload)
+            require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
+        except Exception:
+            usage_rows = payload.get('usage')
+            if not isinstance(usage_rows, list) or not usage_rows:
+                raise
+            # Count only: dropped row count; never usage contents; never a span.
+            self.usage_rejected += len(usage_rows)
+            retry_payload = dict(payload)
+            retry_payload['usage'] = []
+            receipt = self.client.post('/v1/workers/report', retry_payload)
+            require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
         self.next_report = self.clock() + 25
 
     def heartbeat(self):
@@ -798,4 +810,6 @@ class Worker:
                 self.report(force=True)
             except Exception:
                 outcome['offline_report'] = 'unconfirmed'
+            if self.usage_rejected > 0:
+                outcome['usage_rejected'] = self.usage_rejected
             self.log(outcome)

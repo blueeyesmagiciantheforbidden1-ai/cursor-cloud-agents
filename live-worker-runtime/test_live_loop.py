@@ -1054,6 +1054,36 @@ class LoopTests(unittest.TestCase):
         self.assertLessEqual(measured.timestamp(), datetime.now(timezone.utc).timestamp())
         self.assert_hidden(logs, token, prompt, answer, 'SNAPSHOT-SECRET', 'PREFLIGHT-SECRET')
 
+    def test_outcome_carries_usage_rejected_when_hub_drops_usage(self):
+        worker, client, adapter, _ = self.setup_worker()
+        def execute(handle, prompt_text, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            return {
+                'text': adapter.answer, 'model': 'example', 'effort': 'max',
+                'usage': {
+                    'inputTokens': 123, 'outputTokens': 12,
+                    'reasoningTokens': 3, 'cachedReadTokens': 20,
+                },
+            }
+        adapter.execute = execute
+        dropped = [False]
+        original = client.post
+        def post(path, value):
+            if (path.endswith('/report') and isinstance(value.get('usage'), list)
+                    and value['usage'] and not dropped[0]):
+                dropped[0] = True
+                client.calls.append((path, copy.deepcopy(value)))
+                raise RuntimeError('usage rejected')
+            return original(path, value)
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertTrue(dropped[0])
+        self.assertEqual(result['usage_rejected'], worker.usage_rejected)
+        self.assertGreater(result['usage_rejected'], 0)
+        self.assertTrue(all('span' in item for item in result['spans']))
+        self.assertFalse(any(item.get('code') == 'usage_rejected' for item in result['spans']))
+
     def test_spans_for_a_pre_model_failure(self):
         logs = []
         token = 'lease-token-not-for-logs'
