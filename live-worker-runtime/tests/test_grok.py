@@ -871,6 +871,23 @@ class GrokAdapter(unittest.TestCase):
                 self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
                 g.close(handle)
 
+    def test_quota_refresh_reload_schema_drains_keeps_owner_verified(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                fixture.overrides['x.ai/billing'] = g.NativeError('native_internal_reload_schema')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(
+                        g.NativeError, '^grok_quota_refresh_transport_lost$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                g.close(handle)
+
     def test_quota_refresh_owner_mismatch_raises_and_close_skips_commit(self):
         clock = StepClock()
         fixture = Fixture()

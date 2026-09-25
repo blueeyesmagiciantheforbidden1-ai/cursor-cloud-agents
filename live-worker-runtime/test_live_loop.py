@@ -913,6 +913,48 @@ class LoopTests(unittest.TestCase):
         self.assertIn('close', adapter.calls)
         self.assertEqual(client.claims, 0)
 
+    def test_except_path_copilot_warm_session_lost_sets_drain_code(self):
+        # Second idle_drained return (~except): maintain raises a non-drain
+        # idle-session-loss code, close succeeds, drain_code records it.
+        worker, client, adapter, _ = self.setup_worker()
+        client.empty = True
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            raise CodeError('copilot_warm_session_lost')
+
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(result['drain_code'], 'copilot_warm_session_lost')
+        self.assertNotIn('error_code', result)
+        self.assertEqual(worker.last_exit, 0)
+        self.assertTrue(worker.cleaned)
+        self.assertEqual(client.claims, 0)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIn('close', adapter.calls)
+
+    def test_except_path_worker_stopping_before_claim_sets_drain_code(self):
+        # KeyboardInterrupt while idle (no claim) is worker_stopping on the
+        # same except-path idle_drained return, with drain_code set.
+        worker, client, adapter, _ = self.setup_worker()
+        client.empty = True
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            raise KeyboardInterrupt
+
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(result['drain_code'], 'worker_stopping')
+        self.assertNotIn('error_code', result)
+        self.assertEqual(worker.last_exit, 0)
+        self.assertTrue(worker.cleaned)
+        self.assertEqual(client.claims, 0)
+        self.assertEqual(client.completions, [])
+        self.assertIn('close', adapter.calls)
+
     def test_stop_during_maintain_does_not_claim(self):
         # warm_seconds still covers a task, so the short-window break does not
         # run. stopping set during maintain must still skip the claim.
