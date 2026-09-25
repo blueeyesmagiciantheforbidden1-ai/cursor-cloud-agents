@@ -741,7 +741,7 @@ class GrokAdapter(unittest.TestCase):
                 self.assertEqual(handle.preflight['quota'], old)
                 g.close(handle)
 
-    def test_quota_refresh_exhausted_does_not_raise(self):
+    def test_quota_refresh_exhausted_raises_quota_park(self):
         clock = StepClock()
         fixture = Fixture()
         with tempfile.TemporaryDirectory() as root:
@@ -753,10 +753,27 @@ class GrokAdapter(unittest.TestCase):
                 bad['config']['creditUsagePercent'] = 100
                 fixture.overrides['x.ai/billing'] = bad
                 handle.next_quota_refresh = clock.now
-                readiness = g.maintain(handle)
-                self.assertTrue(readiness['ready_for_project_prompt'])
+                with self.assertRaisesRegex(g.NativeError, '^grok_quota_exhausted$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(provider_errors.error_code(caught.exception), 'grok_quota_exhausted')
+                self.assertTrue(provider_errors.is_quota(provider_errors.error_code(caught.exception)))
                 self.assertEqual(handle.preflight['quota'], old)
-                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_quota_refresh_error_frame_exhausted_raises_quota_park(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                old = copy.deepcopy(handle.preflight['quota'])
+                fixture.overrides['x.ai/billing'] = g.NativeError('grok_quota_exhausted')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_quota_exhausted$'):
+                    g.maintain(handle)
+                self.assertEqual(handle.preflight['quota'], old)
                 g.close(handle)
 
     def test_quota_refresh_error_frame_keeps_old_row_and_retries_at_120s(self):
@@ -767,8 +784,10 @@ class GrokAdapter(unittest.TestCase):
                 _, handle = self.prepare(fixture, root)
                 clock.advance(handle.native.deadline - clock.now + 1)
                 old = copy.deepcopy(handle.preflight['quota'])
-                # Intact error frame: id matched, rpc_error_code → native_rpc_429.
-                fixture.overrides['x.ai/billing'] = g.NativeError('native_rpc_429')
+                # Intact error frame via rpc_error_code (negative JSON-RPC code).
+                negative = wire.rpc_error_code({'code': -32603, 'message': 'x'})
+                self.assertEqual(negative, 'native_rpc_-32603')
+                fixture.overrides['x.ai/billing'] = g.NativeError(negative)
                 handle.next_quota_refresh = clock.now
                 before = sum(1 for m, _ in fixture.calls if m == 'x.ai/billing')
                 readiness = g.maintain(handle)
@@ -780,11 +799,67 @@ class GrokAdapter(unittest.TestCase):
                 g.maintain(handle)
                 self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 1)
                 clock.advance(1)
-                fixture.overrides['x.ai/billing'] = g.NativeError('grok_quota_exhausted')
+                # Positive rpc code also swallows; native_rpc_failed likewise.
+                fixture.overrides['x.ai/billing'] = g.NativeError('native_rpc_429')
                 g.maintain(handle)
                 self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 2)
                 self.assertEqual(handle.preflight['quota'], old)
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                clock.advance(g.QUOTA_RETRY_SECONDS)
+                fixture.overrides['x.ai/billing'] = g.NativeError('native_rpc_failed')
+                g.maintain(handle)
+                self.assertEqual(sum(1 for m, _ in fixture.calls if m == 'x.ai/billing'), before + 3)
+                self.assertEqual(handle.preflight['quota'], old)
                 g.close(handle)
+
+    def test_quota_refresh_swallowed_codes_cover_negative_positive_and_failed(self):
+        negative = wire.rpc_error_code({'code': -32603, 'message': 'x'})
+        self.assertTrue(g._grok_quota_refresh_swallowed(g.NativeError(negative)))
+        self.assertTrue(g._grok_quota_refresh_swallowed(g.NativeError('native_rpc_429')))
+        self.assertTrue(g._grok_quota_refresh_swallowed(g.NativeError('native_rpc_failed')))
+        self.assertFalse(g._grok_quota_refresh_swallowed(g.NativeError('grok_quota_exhausted')))
+        self.assertFalse(g._grok_quota_refresh_swallowed(g.NativeError('native_tool_observed')))
+
+    def test_quota_refresh_passthrough_renew_heartbeat_and_tool(self):
+        cases = [
+            ('grok_broker_renew_rejected', 'fail'),
+            ('grok_hub_heartbeat_lost', 'retry'),
+            ('native_tool_observed', 'fail'),
+        ]
+        for code, fault in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
+                clock = StepClock()
+                fixture = Fixture()
+                with patch('time.monotonic', clock):
+                    _, handle = self.prepare(fixture, root)
+                    clock.advance(handle.native.deadline - clock.now + 1)
+                    fixture.overrides['x.ai/billing'] = g.NativeError(code)
+                    handle.next_quota_refresh = clock.now
+                    with self.assertRaisesRegex(g.NativeError, '^' + code + '$') as caught:
+                        g.maintain(handle)
+                    self.assertEqual(str(caught.exception), code)
+                    self.assertEqual(live_loop.maintain_fault(caught.exception), fault)
+                    g.close(handle)
+
+    def test_quota_refresh_owner_mismatch_raises_and_close_skips_commit(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                session, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                fixture.overrides['x.ai/auth/info'] = {
+                    'methodId': 'cached_token', 'email': 'another@example.com'}
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_owner_mismatch$'):
+                    g.maintain(handle)
+                self.assertFalse(handle.preflight['account']['native_owner_verified'])
+                with self.assertRaisesRegex(g.NativeError, 'owner_unverified_at_close|close_requires_reconciliation'):
+                    g.close(handle)
+                session.finish.assert_not_called()
+                session.broker.quarantine.assert_called()
+                self.assertEqual(fixture.events, ['stop'])
 
     def test_quota_refresh_transport_failure_propagates_from_maintain(self):
         clock = StepClock()
@@ -816,6 +891,114 @@ class GrokAdapter(unittest.TestCase):
                     g.maintain(handle)
                 self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
                 g.close(handle)
+
+    def test_worker_idle_quota_refresh_schema_failure_keeps_observed_at(self):
+        origin = 1_000_000.0
+        state = {'now': origin}
+
+        def now():
+            return state['now']
+
+        def sleep(seconds):
+            state['now'] += seconds
+
+        class IdleClient:
+            def __init__(self):
+                self.claims = 0
+
+            def post(self, path, value):
+                if str(path).endswith('/claim'):
+                    self.claims += 1
+                    return {'task': None}
+                return {'accepted': True, 'active': True, 'deadline': 10 ** 12, 'server_time': 1}
+
+            def get_room(self, room_id):
+                raise AssertionError(room_id)
+
+        fixture = Fixture()
+        captured = {}
+        real_prepare = g.prepare
+
+        def arm(session, heartbeat, deadline):
+            handle = real_prepare(session, heartbeat, deadline)
+            captured['observed_at'] = handle.preflight['quota']['observed_at']
+            captured['handle'] = handle
+            fixture.overrides['x.ai/billing'] = {'broken': True}
+            handle.next_quota_refresh = now()
+            return handle
+
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            client = IdleClient()
+            with patch.object(g, 'NativeProcess', fixture.factory), \
+                    patch.object(g, 'prepare', arm), \
+                    patch('time.monotonic', now):
+                worker = live_loop.Worker(
+                    live_loop.Settings('grok', 'grok-live', warm_seconds=300, poll_seconds=10),
+                    client, g, session, clock=now, sleep=sleep, log=lambda record: None)
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'idle_drained')
+            self.assertEqual(worker.last_exit, 0)
+            self.assertNotIn('error_code', result)
+            handle = captured['handle']
+            self.assertEqual(handle.preflight['quota']['observed_at'], captured['observed_at'])
+            billing_after_prepare = sum(1 for m, _ in fixture.calls if m == 'x.ai/billing')
+            # prepare (1) + due refresh + retry at +QUOTA_RETRY_SECONDS
+            self.assertGreaterEqual(billing_after_prepare, 3)
+            # Last swallowed refresh scheduled another retry 120s out from its tick.
+            self.assertGreaterEqual(handle.next_quota_refresh, origin + g.QUOTA_RETRY_SECONDS)
+
+    def test_worker_idle_quota_refresh_exhaustion_parks_without_claim(self):
+        origin = 1_000_000.0
+        state = {'now': origin}
+
+        def now():
+            return state['now']
+
+        def sleep(seconds):
+            state['now'] += seconds
+
+        class IdleClient:
+            def __init__(self):
+                self.claims = 0
+
+            def post(self, path, value):
+                if str(path).endswith('/claim'):
+                    self.claims += 1
+                    return {'task': None}
+                return {'accepted': True, 'active': True, 'deadline': 10 ** 12, 'server_time': 1}
+
+            def get_room(self, room_id):
+                raise AssertionError(room_id)
+
+        fixture = Fixture()
+        real_prepare = g.prepare
+
+        def arm(session, heartbeat, deadline):
+            handle = real_prepare(session, heartbeat, deadline)
+            bad = billing()
+            bad['config']['creditUsagePercent'] = 100
+            fixture.overrides['x.ai/billing'] = bad
+            handle.next_quota_refresh = now()
+            return handle
+
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            client = IdleClient()
+            with patch.object(g, 'NativeProcess', fixture.factory), \
+                    patch.object(g, 'prepare', arm), \
+                    patch('time.monotonic', now):
+                worker = live_loop.Worker(
+                    live_loop.Settings('grok', 'grok-live', warm_seconds=60, poll_seconds=10),
+                    client, g, session, clock=now, sleep=sleep, log=lambda record: None)
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'failed')
+            self.assertEqual(result['error_code'], 'grok_quota_exhausted')
+            self.assertTrue(result.get('provider_quota_exhausted'))
+            self.assertEqual(worker.last_exit, provider_errors.QUOTA_EXIT_CODE)
+            self.assertEqual(client.claims, 0)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+            session.finish.assert_called_once_with(native_stopped=True)
 
 
 class BillingPolicy(unittest.TestCase):

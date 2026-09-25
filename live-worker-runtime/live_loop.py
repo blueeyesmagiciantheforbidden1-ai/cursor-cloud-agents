@@ -37,14 +37,20 @@ def finite(value):
 
 
 def _hub_rejected_request(error):
-    """True only when the hub answered HTTP 400 (validation rejection).
+    """True only when the hub POST answered HTTP 400 (validation rejection).
 
-    HubClient.post raises WorkerError(... HTTP {code} ...) from HTTPError, so the
-    status lives on exc.__cause__.code. Direct HTTPError(400) also counts.
-    Non-400 HTTP, transport failures, and not-accepted receipts must not retry.
+    HubClient.post raises WorkerError('Hub request failed (HTTP {code})') from
+    HTTPError, so both the message prefix and __cause__.code must match. A
+    direct HTTPError(400) counts only when its url is the report path.
+    Identity-path WorkerErrors (GCE metadata 400) and other HTTP/transport
+    failures must not retry.
     """
     if isinstance(error, HTTPError) and getattr(error, 'code', None) == 400:
-        return True
+        url = getattr(error, 'url', None) or ''
+        return isinstance(url, str) and url.endswith('/v1/workers/report')
+    message = str(error) if error is not None else ''
+    if not message.startswith('Hub request failed (HTTP '):
+        return False
     cause = getattr(error, '__cause__', None)
     return isinstance(cause, HTTPError) and getattr(cause, 'code', None) == 400
 
@@ -515,16 +521,17 @@ class Worker:
             usage_rows = payload.get('usage')
             # Retry once with usage:[] ONLY on hub HTTP 400 with a non-empty usage
             # list (validation rejection of quota rows). Never on transport/5xx,
-            # other HTTP codes, LeaseLost, or a not-accepted receipt.
+            # other HTTP codes, LeaseLost, identity-path 400, or a not-accepted receipt.
             if (not isinstance(usage_rows, list) or not usage_rows
                     or not _hub_rejected_request(error)):
                 raise
-            # Count only: dropped row count; never usage contents; never a span.
-            self.usage_rejected += len(usage_rows)
             retry_payload = dict(payload)
             retry_payload['usage'] = []
             receipt = self.client.post('/v1/workers/report', retry_payload)
             require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
+            # Count only after the usage:[] retry is accepted; never usage contents;
+            # never a span. A failed retry leaves the counter unchanged.
+            self.usage_rejected += len(usage_rows)
         self.next_report = self.clock() + 25
 
     def heartbeat(self):
@@ -576,7 +583,9 @@ class Worker:
             try:
                 result = self.client.post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
                 require(result.get('room_id') == self.task['room_id'] and
-                        result.get('status') in ('completed', 'queued', 'failed'), 'completion_unconfirmed')
+                        result.get('status') in ('completed', 'queued', 'failed',
+                                                 'needs_reconciliation'),
+                        'completion_unconfirmed')
                 return
             except Exception:
                 if attempt == 2:
@@ -647,6 +656,9 @@ class Worker:
                 if idle_fault(error) != 'retry':
                     raise
             maintain_retries = 0
+            # Set only when maintain() raised a drain-classified exception.
+            # Warm-window end, stop, and late-claim drains omit the key.
+            drain_code = None
             while self.clock() < idle_deadline and not self.stopping:
                 try:
                     self.adapter.maintain(self.handle)
@@ -654,6 +666,7 @@ class Worker:
                 except Exception as error:
                     fault = maintain_fault(error)
                     if fault == 'drain':
+                        drain_code = provider_errors.error_code(error)
                         break
                     # A closed or quarantined handle must not be polled again,
                     # and retries are bounded. The original code stays the outcome.
@@ -755,6 +768,8 @@ class Worker:
                 self.last_exit = 0
                 return outcome
             outcome.update(outcome='idle_drained', model_call_attempted=False)
+            if drain_code is not None:
+                outcome['drain_code'] = drain_code
             self.last_exit = 0
             return outcome
         except (Exception, KeyboardInterrupt) as error:
@@ -790,6 +805,8 @@ class Worker:
                 code == 'worker_stopping' and self.task is None and not self.model_call_attempted)
             if idle_session_lost and self.cleaned:
                 outcome.update(outcome='idle_drained', model_call_attempted=False)
+                if code is not None:
+                    outcome['drain_code'] = code
                 self.last_exit = 0
                 return outcome
             quota = provider_errors.is_quota(code)

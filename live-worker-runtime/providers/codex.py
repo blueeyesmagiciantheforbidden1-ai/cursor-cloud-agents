@@ -124,6 +124,9 @@ class WarmRPC(transport.TurnRPC):
     """Original strict transport with serialized metadata on an idle thread."""
     # FixtureRPC skips __init__, so the retry slot has to exist on the class.
     renew_retry_at = None
+    # Set by poll_idle when it swallowed an idle hub loss; maintain() then skips
+    # this tick's quota refresh (the due renew would fail again inside it).
+    idle_hub_loss = False
 
     def __init__(self, *args, **kwargs):
         try:
@@ -207,6 +210,7 @@ class WarmRPC(transport.TurnRPC):
             # hub heartbeat leave that renew due, and do not fail the warm process.
             if not _idle_hub_loss(getattr(self, '_idle_handle', None), error):
                 raise
+            self.idle_hub_loss = True
         need(self.process.poll() is None, 'native_not_running')
         # Drain only already queued frames; no request or model call is issued.
         while True:
@@ -468,13 +472,18 @@ def prepare(session, heartbeat, deadline):
 def _refresh_quota(handle):
     """Re-measure quota for hub reports. Validation failures keep the last real row.
 
-    WarmRPC.request sets protocol_state='denied' on ANY exception (error frame,
-    id mismatch, tick/deadline, pre-send refusal), so every native.request
-    failure here is transport lost and drains via the fixed code below. Only
-    _quota(...) failures after a successful request are swallowed. Do not
-    restore protocol_state. Skip when the warm window is too short or the
-    transport is not idle-ready; leave next_quota_refresh due so the next
-    tick retries.
+    WarmRPC.request sets protocol_state='denied' on ANY exception, so a failed
+    refresh cannot continue on this handle. A coded LiveCodexError other than a
+    hub loss (broker renew rejected/failed, quota) is re-raised unchanged and
+    keeps its meaning. Everything else becomes codex_quota_refresh_transport_lost
+    (drain): the private transport's TransportError codes (native_rpc_rejected
+    for an error frame or a desync, deadline and tick codes), metadata/protocol
+    errors, uncoded exceptions, and a hub loss, which cannot be retried on a
+    'denied' transport. After a successful request: swallow ordinary
+    validation misses; raise codex_quota_exhausted for exhaustion; clear
+    owner_verified and raise on native_quota_account_mismatch. Do not restore
+    protocol_state. Skip when the warm window is too short or the transport is
+    not idle-ready; leave next_quota_refresh due so the next tick retries.
     """
     if time.monotonic() < handle.next_quota_refresh:
         return
@@ -488,14 +497,28 @@ def _refresh_quota(handle):
     native.deadline = min(handle.warm_deadline, time.monotonic() + 15)
     try:
         rates = native.request('account/rateLimits/read', {})
-    except Exception:
+    except Exception as error:
+        # Vetted codex codes (renew rejected/failed, quota) keep their meaning.
+        if (isinstance(error, LiveCodexError) and provider_errors.error_code(error) is not None
+                and not _idle_hub_loss(handle, error)):
+            raise
         # Protocol already 'denied'; drain idle without a controller strike.
         raise LiveCodexError('codex_quota_refresh_transport_lost') from None
     try:
         quota = _quota(rates, handle.session.lease.canonical_account_ref)
         handle.preflight['quota'] = quota
         handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
-    except Exception:
+    except Exception as error:
+        code = provider_errors.error_code(error)
+        if code == 'native_quota_account_mismatch':
+            # Idle owner-change policy: never commit after a failed owner proof.
+            handle.owner_verified = False
+            raise
+        # included_quota_exhausted / included_usage_unavailable → quota park.
+        if code in ('included_quota_exhausted', 'included_usage_unavailable'):
+            raise LiveCodexError('codex_quota_exhausted') from None
+        if code is not None and code.endswith('_quota_exhausted'):
+            raise
         # Keep last real observed_at; back off so a persistent validation miss
         # does not re-request on every idle poll.
         handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
@@ -509,6 +532,8 @@ def maintain(handle):
         # A failed renew attempt can take about 30s, and NativeRPC.tick checks
         # the deadline after renew (native_metadata_timeout).
         handle.native.deadline = min(handle.warm_deadline, time.monotonic() + 45)
+        skipped_refresh_for_hub_loss = False
+        handle.native.idle_hub_loss = False
         try:
             handle.native.poll_idle()
             if time.monotonic() >= handle.next_renew:
@@ -520,7 +545,11 @@ def maintain(handle):
             # miss stays due. A non-vetted broker failure still fails below.
             if not _idle_hub_loss(handle, error):
                 raise
-        _refresh_quota(handle)
+            # Skip refresh: a due renew inside rateLimits would fail again and
+            # turn a retried hub blip into a transport-lost drain.
+            skipped_refresh_for_hub_loss = True
+        if not skipped_refresh_for_hub_loss and not handle.native.idle_hub_loss:
+            _refresh_quota(handle)
         return handle.readiness
     except Exception as error:
         _fail(handle, error)

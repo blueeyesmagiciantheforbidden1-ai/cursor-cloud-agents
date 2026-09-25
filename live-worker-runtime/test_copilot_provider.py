@@ -624,27 +624,28 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(handle.owner_verified, verified)
             c.close(handle)
 
-    def test_quota_refresh_exhausted_does_not_raise(self):
+    def test_quota_refresh_exhausted_raises_quota_park(self):
         clock = StepClock()
         with patch('time.monotonic', clock):
             handle = self.prepare()
             bind_lease_clock(handle, clock)
             handle.native.next_renew = clock() + 10000
-            old = copy.deepcopy(handle.preflight['quota'])
             verified = handle.owner_verified
             handle.next_quota_refresh = clock()
+            # Hit copilot_included_allowance_exhausted (is_quota), not the
+            # unverified_or_exhausted path (used >= entitlement).
             exhausted = quota()
             exhausted['quotaSnapshots']['premium_interactions']['remainingPercentage'] = 0
-            exhausted['quotaSnapshots']['premium_interactions']['usedRequests'] = 20000
             handle.native.quota = exhausted
-            readiness = c.maintain(handle)
-            self.assertTrue(readiness['ready_for_project_prompt'])
-            self.assertEqual(handle.preflight['quota'], old)
+            with self.assertRaisesRegex(c.CopilotError, '^copilot_quota_exhausted$') as caught:
+                c.maintain(handle)
+            self.assertEqual(provider_errors.error_code(caught.exception), 'copilot_quota_exhausted')
+            self.assertTrue(provider_errors.is_quota(provider_errors.error_code(caught.exception)))
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
             self.assertEqual(handle.owner_verified, verified)
-            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
-            c.close(handle)
+            self.assertTrue(handle.finished)
 
-    def test_quota_refresh_error_frame_keeps_old_row_and_retries_at_120s(self):
+    def test_quota_refresh_error_frame_swallowed_retries_at_120s(self):
         clock = StepClock()
         with patch('time.monotonic', clock):
             handle = self.prepare()
@@ -660,7 +661,9 @@ class Lifecycle(unittest.TestCase):
                 if method == 'account.getQuota':
                     handle.native.index += 1
                     handle.native.calls.append((method, copy.deepcopy(params)))
-                    raise c.CopilotError('copilot_native_request_failed')
+                    err = c.CopilotError('copilot_native_request_failed')
+                    err.error_frame = True
+                    raise err
                 return real_request(method, params)
 
             handle.native.request = error_frame
@@ -674,6 +677,20 @@ class Lifecycle(unittest.TestCase):
             c.maintain(handle)
             self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 1)
             clock.advance(1)
+            c.maintain(handle)
+            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 2)
+            self.assertEqual(handle.owner_verified, verified)
+            self.assertFalse(handle.finished)
+            c.close(handle)
+
+    def test_quota_refresh_error_frame_quota_exhausted_parks(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            real_request = handle.native.request
 
             def exhausted_frame(method, params=None):
                 if method == 'account.getQuota':
@@ -683,12 +700,101 @@ class Lifecycle(unittest.TestCase):
                 return real_request(method, params)
 
             handle.native.request = exhausted_frame
-            c.maintain(handle)
-            self.assertEqual(sum(1 for m, _ in handle.native.calls if m == 'account.getQuota'), before + 2)
-            self.assertEqual(handle.preflight['quota'], old)
+            with self.assertRaisesRegex(c.CopilotError, '^copilot_quota_exhausted$') as caught:
+                c.maintain(handle)
+            self.assertTrue(provider_errors.is_quota(provider_errors.error_code(caught.exception)))
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertTrue(handle.finished)
+
+    def test_quota_refresh_id_mismatch_drains(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.native.next_renew = clock() + 10000
+            verified = handle.owner_verified
+            handle.next_quota_refresh = clock()
+            real_request = handle.native.request
+
+            def id_mismatch(method, params=None):
+                if method == 'account.getQuota':
+                    handle.native.index += 1
+                    handle.native.calls.append((method, copy.deepcopy(params)))
+                    # Untagged: same code as error frame, but no error_frame attr.
+                    raise c.CopilotError('copilot_native_request_failed')
+                return real_request(method, params)
+
+            handle.native.request = id_mismatch
+            with self.assertRaisesRegex(c.CopilotError, '^copilot_quota_refresh_transport_lost$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
             self.assertEqual(handle.owner_verified, verified)
-            self.assertFalse(handle.finished)
-            c.close(handle)
+            self.assertTrue(handle.finished)
+
+    def test_quota_refresh_vetted_passthrough_keeps_own_code(self):
+        codes = (
+            'copilot_broker_renew_failed', 'copilot_broker_renew_rejected',
+            'copilot_hub_heartbeat_lost', 'copilot_tools_forbidden',
+            'copilot_unexpected_pre_prompt_activity',
+            'copilot_unexpected_pre_prompt_assistant_message')
+        clock = StepClock()
+        for code in codes:
+            with self.subTest(code=code):
+                with patch('time.monotonic', clock):
+                    self._new_grant()
+                    handle = self.prepare()
+                    bind_lease_clock(handle, clock)
+                    handle.native.next_renew = clock() + 10000
+                    handle.next_quota_refresh = clock()
+                    real_request = handle.native.request
+
+                    def vetted(method, params=None, *, _code=code):
+                        if method == 'account.getQuota':
+                            handle.native.index += 1
+                            handle.native.calls.append((method, copy.deepcopy(params)))
+                            raise c.CopilotError(_code)
+                        return real_request(method, params)
+
+                    handle.native.request = vetted
+                    with self.assertRaisesRegex(c.CopilotError, '^' + code + '$') as caught:
+                        c.maintain(handle)
+                    self.assertEqual(provider_errors.error_code(caught.exception), code)
+                    self.assertNotEqual(str(caught.exception), 'copilot_quota_refresh_transport_lost')
+                    self.assertNotEqual(str(caught.exception), 'copilot_warm_session_lost')
+                    self.assertNotEqual(str(caught.exception), 'copilot_idle_maintain_failed')
+                    if code == 'copilot_hub_heartbeat_lost':
+                        self.assertFalse(handle.finished)
+                    else:
+                        self.assertTrue(handle.finished)
+
+    def test_quota_refresh_transport_codes_drain(self):
+        codes = (
+            'copilot_native_deadline_expired', 'copilot_native_rpc_closed',
+            'copilot_native_frame_limit', 'copilot_native_output_limit')
+        clock = StepClock()
+        for code in codes:
+            with self.subTest(code=code):
+                with patch('time.monotonic', clock):
+                    self._new_grant()
+                    handle = self.prepare()
+                    bind_lease_clock(handle, clock)
+                    handle.native.next_renew = clock() + 10000
+                    handle.next_quota_refresh = clock()
+                    real_request = handle.native.request
+
+                    def transport(method, params=None, *, _code=code):
+                        if method == 'account.getQuota':
+                            handle.native.index += 1
+                            handle.native.calls.append((method, copy.deepcopy(params)))
+                            raise c.CopilotError(_code)
+                        return real_request(method, params)
+
+                    handle.native.request = transport
+                    with self.assertRaisesRegex(
+                            c.CopilotError, '^copilot_quota_refresh_transport_lost$') as caught:
+                        c.maintain(handle)
+                    self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                    self.assertTrue(handle.finished)
 
     def test_quota_refresh_transport_failure_propagates_from_maintain(self):
         clock = StepClock()
@@ -1086,6 +1192,53 @@ class MidTurnQuota(unittest.TestCase):
         with self.assertRaises(c.CopilotError) as caught:
             native.request('account.getQuota')
         self.assertEqual(str(caught.exception), 'copilot_native_request_failed')
+        self.assertTrue(getattr(caught.exception, 'error_frame', False))
+
+    def test_jsonrpc_id_mismatch_is_untagged_request_failed(self):
+        native = bare_native()
+        native.write_frame = Mock()
+        native.frame = Mock(return_value={
+            'jsonrpc': '2.0', 'id': 99, 'result': {}})
+        with self.assertRaises(c.CopilotError) as caught:
+            native.request('account.getQuota')
+        self.assertEqual(str(caught.exception), 'copilot_native_request_failed')
+        self.assertFalse(getattr(caught.exception, 'error_frame', False))
+
+    def test_jsonrpc_missing_result_is_untagged_request_failed(self):
+        native = bare_native()
+        native.write_frame = Mock()
+        native.frame = Mock(return_value={'jsonrpc': '2.0', 'id': 1})
+        with self.assertRaises(c.CopilotError) as caught:
+            native.request('account.getQuota')
+        self.assertEqual(str(caught.exception), 'copilot_native_request_failed')
+        self.assertFalse(getattr(caught.exception, 'error_frame', False))
+
+
+class ExecuteErrorFrame(unittest.TestCase):
+    """execute() outcomes must not move: error frames still fail with the same code."""
+    setUp, tearDown, prepare = Lifecycle.setUp, Lifecycle.tearDown, Lifecycle.prepare
+
+    def test_execute_error_frame_still_fails_with_native_request_failed(self):
+        handle = self.prepare()
+        native = handle.native
+        real_request = native.request
+
+        def boom(method, params=None):
+            if method == 'account.getQuota' and native.index >= 7:
+                # Second getQuota is execute()'s _fresh_metadata path.
+                err = c.CopilotError('copilot_native_request_failed')
+                err.error_frame = True
+                native.index += 1
+                native.calls.append((method, copy.deepcopy(params)))
+                raise err
+            return real_request(method, params)
+
+        native.request = boom
+        with self.assertRaisesRegex(c.CopilotError, '^copilot_native_request_failed$') as caught:
+            c.execute(handle, 'project', time.monotonic() + 100)
+        self.assertEqual(str(caught.exception), 'copilot_native_request_failed')
+        self.assertTrue(handle.finished)
+        self.assertNotIn('session.send', [x[0] for x in native.calls])
 
 
 if __name__ == '__main__':

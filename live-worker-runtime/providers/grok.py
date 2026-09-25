@@ -18,6 +18,7 @@ import time
 from uuid import uuid4
 
 import broker_renew
+import provider_errors
 from ._grok_protocol import Native, NativeError, NativeStartupStopped, need, unwrap
 
 MODEL = 'grok-4.7'
@@ -251,6 +252,11 @@ def close(handle):
             handle.stopped_proven = True
             handle.native = None
         need(handle.stopped_proven, 'grok_native_stop_unconfirmed')
+        # A withdrawn owner proof (refresh/execute identity failure) must never
+        # publish credentials. Prepare failures before preflight still commit.
+        account = handle.preflight.get('account') if type(handle.preflight) is dict else None
+        need(not (type(account) is dict and account.get('native_owner_verified') is False),
+             'grok_owner_unverified_at_close')
         handle.credential_version = handle.session.finish(native_stopped=True)
         handle.finished = True
         return handle.credential_version
@@ -309,10 +315,31 @@ def prepare(session, heartbeat, deadline):
 
 
 # Intact error / missing-result frames from Native.request: id matched and the
-# frame was consumed; the stream stays in sync. native_rpc_<int> and
+# frame was consumed; the stream stays in sync. native_rpc_<int> (pos/neg) and
 # native_rpc_failed come from rpc_error_code(); native_result_missing from need().
+# Exhaustion (grok_quota_exhausted) is never swallowed: it parks via maintain().
 _GROK_QUOTA_REFRESH_SWALLOW = frozenset({
-    'grok_quota_exhausted', 'native_rpc_failed', 'native_result_missing',
+    'native_rpc_failed', 'native_result_missing',
+})
+
+# Raw transport/framing codes from Native.request/send. Only these (and uncoded
+# exceptions such as OSError) become grok_quota_refresh_transport_lost.
+_GROK_REFRESH_TRANSPORT_CODES = frozenset({
+    'native_deadline',  # send()/request() deadline need()
+    'native_error',  # request(): non-message event kind from reader
+    'native_eof',  # request(): reader eof event kind
+    'unexpected_response',  # request(): id mismatch / wrong reply
+    'native_object_required',  # request(): non-dict frame
+    'notification_limit',  # request(): notification buffer cap
+    'native_internal_reload_limit',  # request(): watcher ack budget
+    'native_write_failed',  # send(): stdin OSError/ValueError
+    'native_write_invalid_count',  # send(): bad write length
+    'native_flush_failed',  # send(): flush OSError/ValueError
+    'request_limit',  # send(): outbound message size cap
+})
+
+_GROK_REFRESH_IDENTITY_CODES = frozenset({
+    'grok_owner_mismatch', 'grok_account_blocked',
 })
 
 
@@ -320,19 +347,23 @@ def _grok_quota_refresh_swallowed(error):
     code = str(error) if isinstance(error, NativeError) else ''
     if code in _GROK_QUOTA_REFRESH_SWALLOW:
         return True
-    # native_rpc_<int> from rpc_error_code when error.code is an int.
-    return code.startswith('native_rpc_') and code[len('native_rpc_'):].isdigit()
+    # native_rpc_<int> from rpc_error_code; JSON-RPC codes are often negative.
+    if not code.startswith('native_rpc_'):
+        return False
+    tail = code[len('native_rpc_'):]
+    return bool(tail) and tail.removeprefix('-').isdigit()
 
 
 def _refresh_quota(handle):
     """Re-measure quota for hub reports. Validation failures keep the last real row.
 
-    Intact error frames and native_result_missing are swallowed like validation
-    failures (stream still sync). Everything else from request()/send() is
-    transport lost and drains via grok_quota_refresh_transport_lost.
-    native_extension_failed surfaces in unwrap() during validation and is
-    swallowed by the inner try. The prepare-era native.deadline is replaced
-    for the refresh window and restored after.
+    Intact non-exhaustion error frames and native_result_missing are swallowed
+    like schema validation failures (stream still sync). Vetted non-transport
+    codes (tools, broker renew, hub heartbeat, quota) pass through unchanged.
+    Uncoded exceptions and _GROK_REFRESH_TRANSPORT_CODES become
+    grok_quota_refresh_transport_lost. Exhaustion and identity failures raise.
+    The prepare-era native.deadline is replaced for the refresh window and
+    restored after.
     """
     if time.monotonic() < handle.next_quota_refresh:
         return
@@ -343,14 +374,29 @@ def _refresh_quota(handle):
         try:
             responses = _metadata_responses(native)
         except Exception as error:
+            code = provider_errors.error_code(error)
+            if code == 'grok_quota_exhausted':
+                raise
             if _grok_quota_refresh_swallowed(error):
                 handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
                 return
+            # Vetted codes outside the raw transport set keep live-loop meaning.
+            if code is not None and code not in _GROK_REFRESH_TRANSPORT_CODES:
+                raise
             raise NativeError('grok_quota_refresh_transport_lost') from None
         try:
             handle.preflight = _metadata_preflight(*responses)
             handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
-        except Exception:
+        except Exception as error:
+            code = provider_errors.error_code(error)
+            if code == 'grok_included_allowance_exhausted':
+                # Same park code execute()/rpc use for account exhaustion.
+                raise NativeError('grok_quota_exhausted') from None
+            if code in _GROK_REFRESH_IDENTITY_CODES:
+                account = handle.preflight.get('account') if type(handle.preflight) is dict else None
+                if type(account) is dict:
+                    account['native_owner_verified'] = False
+                raise
             # Keep last real observed_at; back off so a persistent validation
             # miss (including native_extension_failed) does not re-request
             # on every idle poll.

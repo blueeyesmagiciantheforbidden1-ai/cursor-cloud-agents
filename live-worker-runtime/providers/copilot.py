@@ -36,12 +36,23 @@ QUOTA_REFRESH_SECONDS = 600
 QUOTA_RETRY_SECONDS = 120
 # Idle refresh temporarily replaces the warm idle_deadline horizon (~4500 s).
 QUOTA_REFRESH_DEADLINE_SECONDS = 30
-# Intact error frames from Native.request: id matched / frame consumed.
-# copilot_native_request_failed also covers id mismatch and missing result, but
-# an id mismatch during refresh can only come from a stream already desynced
-# before the refresh, and execute() would fail on it anyway — so swallow both.
-_COPILOT_QUOTA_REFRESH_SWALLOW = frozenset({
-    'copilot_quota_exhausted', 'copilot_native_request_failed',
+# Raw transport / framing codes from Native.request / frame / _tick / write_frame
+# (and pump used by those). Untagged copilot_native_request_failed is id mismatch,
+# non-int id, or missing result — stream already desynced; drains on refresh.
+# Intact error frames set CopilotError.error_frame = True and are swallowed
+# separately (not via this set). OSError has no code and is also transport lost.
+_COPILOT_REFRESH_TRANSPORT_CODES = frozenset({
+    'copilot_native_deadline_expired',  # Native._tick
+    'copilot_native_rpc_closed',  # Native.frame (selector empty)
+    'copilot_native_frame_limit',  # Native.pump / drain buffer cap
+    'copilot_native_output_limit',  # Native.pump / drain total bytes
+    'copilot_rpc_header_limit',  # Native._take_frame
+    'copilot_rpc_length_invalid',  # Native._take_frame
+    'copilot_native_json_invalid',  # Native._take_frame
+    'copilot_native_frame_invalid',  # Native._take_frame
+    'copilot_native_input_closed',  # Native.write_frame
+    'copilot_outbound_frame_limit',  # Native.request body size
+    'copilot_native_request_failed',  # Native.request: untagged id/result miss
 })
 # Native.request caps at 24 calls (index < 24). Budget for idle quota refresh:
 #   prepare: connect + _fresh_metadata(3) + session.create + setAllowedModels
@@ -479,7 +490,12 @@ class Native:
                  'copilot_native_request_failed')
             if 'error' in value:
                 need(not _quota_exhausted_signal(value.get('error')), 'copilot_quota_exhausted')
-                raise CopilotError('copilot_native_request_failed')
+                # Intact error frame: id matched and frame consumed. Tag so idle
+                # refresh can swallow without treating id-mismatch the same way.
+                # execute() still sees the same code string.
+                error = CopilotError('copilot_native_request_failed')
+                error.error_frame = True
+                raise error
             need('result' in value, 'copilot_native_request_failed')
             if method == 'runtime.shutdown':
                 self.clean_shutdown = True
@@ -677,17 +693,21 @@ def _refresh_quota(handle):
     Quota-only: one account.getQuota request, then _billing. Never reads or
     writes owner_verified (close() publishes credentials only after identity
     proof; execute()'s _fresh_metadata still re-verifies the owner).
+    _billing has no canonical-account mismatch check against the response.
 
     Request arithmetic (Native.request cap 24): prepare uses 7, execute needs 7
     (including runtime.shutdown). Idle close() does not request shutdown.
     Each refresh is 1 request; 24 - 7 - 7 = 10 >= 7 idle-horizon refreshes.
     Skip when index + 1 + EXECUTE_RESERVE > 24.
 
-    Intact error frames (copilot_quota_exhausted / copilot_native_request_failed)
-    are swallowed like validation. Any other request() failure, including
-    deadline/OSError, becomes copilot_quota_refresh_transport_lost before
-    maintain()'s except (which would otherwise map OSError to
-    copilot_warm_session_lost).
+    Swallow: tagged intact error frames (error_frame=True) that are not quota
+    exhaustion, and post-response validation that is neither exhaustion nor
+    identity mismatch. Quota park: copilot_quota_exhausted (error frame or
+    _billing exhaustion) re-raises unchanged out of maintain(). Vetted codes
+    outside _COPILOT_REFRESH_TRANSPORT_CODES pass through unchanged. Transport
+    lost (untagged request_failed, deadlines, frame/output limits, OSError)
+    becomes copilot_quota_refresh_transport_lost before maintain()'s except
+    (which would otherwise map OSError to copilot_warm_session_lost).
     """
     if time.monotonic() < handle.next_quota_refresh:
         return
@@ -702,9 +722,14 @@ def _refresh_quota(handle):
             result = native.request('account.getQuota')
         except Exception as error:
             code = provider_errors.error_code(error)
-            if code in _COPILOT_QUOTA_REFRESH_SWALLOW:
+            # Intact error frame (id matched): swallow non-exhaustion only.
+            if (code == 'copilot_native_request_failed'
+                    and getattr(error, 'error_frame', False)):
                 handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS
                 return
+            # Quota park and every other vetted non-transport code: unchanged.
+            if code is not None and code not in _COPILOT_REFRESH_TRANSPORT_CODES:
+                raise
             # Convert before maintain()'s except remaps OSError / idle loss.
             raise CopilotError('copilot_quota_refresh_transport_lost') from None
         try:
@@ -715,7 +740,14 @@ def _refresh_quota(handle):
                 'same_process_account_model_quota': quota['native_usage_status'] == 'available',
             }
             handle.next_quota_refresh = time.monotonic() + QUOTA_REFRESH_SECONDS
-        except Exception:
+        except Exception as error:
+            code = provider_errors.error_code(error)
+            # Exhaustion from _billing (e.g. copilot_included_allowance_exhausted)
+            # → canonical quota-park code for maintain(). Schema/shape misses
+            # including unverified_or_exhausted (unlimited / bad entitlement)
+            # stay swallowed.
+            if provider_errors.is_quota(code) or code == 'copilot_included_allowance_exhausted':
+                raise CopilotError('copilot_quota_exhausted') from None
             # Keep last real observed_at; back off so a persistent validation miss
             # does not re-request on every idle poll.
             handle.next_quota_refresh = time.monotonic() + QUOTA_RETRY_SECONDS

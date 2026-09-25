@@ -344,6 +344,9 @@ class LoopTests(unittest.TestCase):
         worker, client, adapter, clock = self.setup_worker(); client.empty = True
         result = worker.run()
         self.assertEqual(result['outcome'], 'idle_drained'); self.assertEqual(clock.now, 160)
+        self.assertNotIn('drain_code', result)
+        self.assertNotIn('error_code', result)
+        self.assertEqual(worker.last_exit, 0)
         self.assertNotIn('execute', adapter.calls); self.assertIn('close', adapter.calls)
 
     def test_warm_window_expiry_drains_without_a_failure(self):
@@ -357,6 +360,7 @@ class LoopTests(unittest.TestCase):
         adapter.maintain = maintain
         result = worker.run()
         self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(result['drain_code'], 'warm_session_expired')
         self.assertNotIn('error_code', result)
         self.assertEqual(worker.last_exit, 0)
         self.assertEqual(adapter.calls.count('maintain'), 1)
@@ -413,6 +417,33 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(worker.last_exit, 1)
         self.assertNotIn('provider_quota_exhausted', result)
         self.assertIn('stopped before it could deliver', client.completions[0]['output'])
+
+    def test_maintain_quota_exhausted_parks_without_claim(self):
+        # Quota seen in maintain() (idle refresh) must park exit 75 and never claim.
+        # live_loop already maps is_quota codes from maintain to this path; no loop fix.
+        import io
+        from live_loop import finish_exit
+        for code in ('claude_quota_exhausted', 'grok_provider_quota_exhausted', 'included_quota_exhausted'):
+            with self.subTest(code=code):
+                worker, client, adapter, _ = self.setup_worker()
+                client.empty = True
+
+                def maintain(handle, code=code):
+                    adapter.calls.append('maintain')
+                    raise CodeError(code)
+
+                adapter.maintain = maintain
+                result = worker.run()
+                self.assertEqual(result['outcome'], 'failed')
+                self.assertEqual(result['error_code'], code)
+                self.assertIs(result['provider_quota_exhausted'], True)
+                self.assertEqual(worker.last_exit, provider_errors.QUOTA_EXIT_CODE)
+                self.assertEqual(
+                    finish_exit(worker.settings.agent, result, worker.last_exit, io.StringIO()),
+                    provider_errors.QUOTA_EXIT_CODE)
+                self.assertEqual(client.claims, 0)
+                self.assertNotIn('execute', adapter.calls)
+                self.assertIn('close', adapter.calls)
 
     def test_failed_completion_carries_structured_facts(self):
         # Before the model call: the hub may requeue safely.
@@ -1087,6 +1118,126 @@ class LoopTests(unittest.TestCase):
         self.assertTrue(all('span' in item for item in result['spans']))
         self.assertFalse(any(item.get('code') == 'usage_rejected' for item in result['spans']))
 
+    def test_usage_rejected_ignores_identity_path_http_400(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        worker, client, _, _ = self.setup_worker()
+        worker.ready = True
+        worker._last_turn_usage = {
+            'inputTokens': 123, 'outputTokens': 12,
+            'reasoningTokens': 3, 'cachedReadTokens': 20,
+        }
+        worker._last_turn_observed_at = '2026-01-01T00:00:00Z'
+
+        def make_identity_400():
+            try:
+                raise WorkerError(
+                    'Could not obtain the configured GCE service identity') from HTTPError(
+                    'http://metadata.google.internal/computeMetadata/v1/instance/'
+                    'service-accounts/default/identity', 400, 'Bad Request', None, None)
+            except WorkerError as exc:
+                return exc
+
+        first = make_identity_400()
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            raise first
+
+        client.post = post
+        with self.assertRaises(WorkerError) as caught:
+            worker.report(force=True)
+        self.assertIs(caught.exception, first)
+        self.assertEqual(worker.usage_rejected, 0)
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(client.calls[0][1]['usage'])
+
+    def test_usage_rejected_stays_zero_when_retry_fails(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        worker, client, _, _ = self.setup_worker()
+        worker.ready = True
+        worker._last_turn_usage = {
+            'inputTokens': 123, 'outputTokens': 12,
+            'reasoningTokens': 3, 'cachedReadTokens': 20,
+        }
+        worker._last_turn_observed_at = '2026-01-01T00:00:00Z'
+
+        def make_hub400():
+            try:
+                raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                    'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
+            except WorkerError as exc:
+                return exc
+
+        pending = [make_hub400(), make_hub400()]
+
+        def post(path, value):
+            client.calls.append((path, copy.deepcopy(value)))
+            raise pending.pop(0)
+
+        client.post = post
+        with self.assertRaises(WorkerError):
+            worker.report(force=True)
+        self.assertEqual(worker.usage_rejected, 0)
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(client.calls[0][1]['usage'])
+        self.assertEqual(client.calls[1][1]['usage'], [])
+
+    def test_usage_rejected_counts_rows_only_after_accepted_retry(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        worker, client, adapter, _ = self.setup_worker()
+
+        def execute(handle, prompt_text, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            return {
+                'text': adapter.answer, 'model': 'example', 'effort': 'max',
+                'usage': {
+                    'inputTokens': 123, 'outputTokens': 12,
+                    'reasoningTokens': 3, 'cachedReadTokens': 20,
+                },
+            }
+
+        adapter.execute = execute
+        dropped = [False]
+        row_count = [0]
+        original = client.post
+
+        def post(path, value):
+            if (path.endswith('/report') and isinstance(value.get('usage'), list)
+                    and value['usage'] and not dropped[0]):
+                dropped[0] = True
+                row_count[0] = len(value['usage'])
+                client.calls.append((path, copy.deepcopy(value)))
+                raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                    'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
+            return original(path, value)
+
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(worker.usage_rejected, row_count[0])
+        self.assertEqual(result['usage_rejected'], row_count[0])
+        self.assertGreater(row_count[0], 0)
+
+    def test_complete_accepts_needs_reconciliation(self):
+        worker, client, adapter, _ = self.setup_worker()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                client.calls.append((path, copy.deepcopy(value)))
+                client.completions.append(copy.deepcopy(value))
+                return {'room_id': ROOM, 'status': 'needs_reconciliation'}
+            return original(path, value)
+
+        client.post = post
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('completion_delivery', result)
+        self.assertEqual(len(client.completions), 1)
+
     def test_spans_for_a_pre_model_failure(self):
         logs = []
         token = 'lease-token-not-for-logs'
@@ -1389,56 +1540,6 @@ class LoopTests(unittest.TestCase):
                 self.assertLessEqual(age, 900, f'stale at send={send_at} observed_at={row["observed_at"]}')
         self.assertGreater(quota_reports, 0)
 
-    def test_idle_hour_refresh_failure_keeps_old_observed_at_and_stays_ready(self):
-        epoch = datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()
-
-        def iso(fake_now):
-            return datetime.fromtimestamp(epoch + fake_now, timezone.utc).isoformat().replace('+00:00', 'Z')
-
-        clock = Clock()
-        client = Client(clock)
-        client.empty = True
-        adapter = Adapter()
-        original_observed = iso(clock.now)
-
-        def prepare(session, heartbeat, deadline):
-            adapter.calls.append('prepare')
-            return SimpleNamespace(
-                state='ready',
-                next_quota_refresh=clock.now + 600,
-                preflight={
-                    'quota': {
-                        'observed_at': original_observed,
-                        'native_included_used_percent': 50,
-                        'native_usage_status': 'available',
-                        'period': {'start': iso(clock.now - 1000), 'end': iso(clock.now + 100000)},
-                    },
-                    'same_process_account_model_quota': True,
-                },
-            )
-
-        def maintain(handle):
-            adapter.calls.append('maintain')
-            if clock.now >= handle.next_quota_refresh:
-                try:
-                    raise RuntimeError('synthetic quota refresh failure')
-                except Exception:
-                    pass
-
-        adapter.prepare, adapter.maintain = prepare, maintain
-        worker = Worker(Settings('grok', 'grok-live', warm_seconds=3600), client, adapter,
-                        object(), clock=clock, sleep=clock.sleep, log=lambda record: None)
-        result = worker.run()
-        self.assertEqual(result['outcome'], 'idle_drained')
-        self.assertEqual(worker.last_exit, 0)
-        self.assertTrue(worker.ready or result['outcome'] == 'idle_drained')
-        idle_reports = [v for p, v in client.calls if p.endswith('/report') and v.get('status') == 'idle']
-        self.assertGreater(len(idle_reports), 0)
-        for payload in idle_reports:
-            for row in payload.get('usage') or []:
-                if row.get('metric') == 'quota_percent':
-                    self.assertEqual(row['observed_at'], original_observed)
-
     def test_quota_refresh_transport_lost_drains_without_a_strike(self):
         # Optional idle quota telemetry must never fail or strike a healthy agent.
         # Model on warm_session_expired: idle_drained / exit 0 / close / no error_code.
@@ -1458,6 +1559,7 @@ class LoopTests(unittest.TestCase):
                 adapter.maintain = maintain
                 result = worker.run()
                 self.assertEqual(result['outcome'], 'idle_drained')
+                self.assertEqual(result['drain_code'], code)
                 self.assertNotIn('error_code', result)
                 self.assertEqual(worker.last_exit, 0)
                 self.assertEqual(adapter.calls.count('maintain'), 1)

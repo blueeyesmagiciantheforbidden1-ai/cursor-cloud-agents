@@ -447,8 +447,8 @@ class CodexLive(unittest.TestCase):
         c.close(handle)
 
     def test_poll_idle_hub_loss_is_retried_until_a_task_is_claimed(self):
-        # maintain wraps poll_idle: a hub_lease_lost from the renew callback is an
-        # idle retry only while the warm handle is ready and unclaimed.
+        # maintain swallows hub_lease_lost from poll_idle/tick renew while the
+        # warm handle is ready and unclaimed; renew stays due for the next tick.
         handle = self.prepare()
         handle.next_renew = time.monotonic() + 1000
         due = handle.native.next_renew = time.monotonic() - 1
@@ -883,22 +883,88 @@ class CodexLive(unittest.TestCase):
             self.assertEqual(handle.native.protocol_state, 'thread_ready')
             c.close(handle)
 
-    def test_quota_refresh_exhausted_does_not_raise(self):
+    def test_swallowed_hub_loss_skips_quota_refresh_same_tick(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            due = handle.native.next_renew = clock() - 1
+            handle.next_quota_refresh = clock()
+            self.heartbeat.return_value = False
+            before = sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests)
+            readiness = c.maintain(handle)
+            self.assertTrue(readiness['ready_for_project_prompt'])
+            self.assertEqual(handle.state, 'ready')
+            self.assertEqual(handle.native.next_renew, due)
+            self.assertEqual(
+                sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before)
+            self.heartbeat.return_value = True
+            handle.next_quota_refresh = clock()
+            c.maintain(handle)
+            self.assertEqual(
+                sum(r['method'] == 'account/rateLimits/read' for r in self.native.requests), before + 1)
+            c.close(handle)
+
+    def test_quota_refresh_exhausted_raises_quota_park(self):
         clock = StepClock()
         with patch('time.monotonic', clock):
             handle = self.prepare()
             bind_lease_clock(handle, clock)
             handle.next_renew = clock() + 10000
             handle.native.next_renew = clock() + 10000
-            old = copy.deepcopy(handle.preflight['quota'])
             handle.next_quota_refresh = clock()
             self.native.rates = rates(100)
-            readiness = c.maintain(handle)
-            self.assertTrue(readiness['ready_for_project_prompt'])
-            self.assertEqual(handle.preflight['quota'], old)
-            self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_RETRY_SECONDS)
-            self.assertEqual(handle.native.protocol_state, 'thread_ready')
-            c.close(handle)
+            with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_exhausted$') as caught:
+                c.maintain(handle)
+            self.assertTrue(c.provider_errors.is_quota(str(caught.exception)))
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertNotEqual(handle.state, 'ready')
+            self.assertEqual(handle.credential_writeback, 'committed')
+
+    def test_quota_refresh_broker_renew_rejected_passes_through(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            original_send = handle.native._send
+
+            def failing_send(value=None, *, close=False):
+                if value is not None and value.get('method') == 'account/rateLimits/read':
+                    raise c.LiveCodexError('codex_broker_renew_rejected')
+                return original_send(value, close=close)
+
+            handle.native._send = failing_send
+            with self.assertRaisesRegex(c.LiveCodexError, '^codex_broker_renew_rejected$') as caught:
+                c.maintain(handle)
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertEqual(handle.native.protocol_state, 'denied')
+            self.assertNotEqual(handle.state, 'ready')
+
+    def test_quota_refresh_account_mismatch_clears_owner_and_refuses_commit(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            self.assertTrue(handle.owner_verified)
+            mismatched = rates(12)
+            mismatched['accountId'] = 'different-account-id'
+            self.native.rates = mismatched
+            with self.assertRaises(c.LiveCodexError) as caught:
+                c.maintain(handle)
+            self.assertIn(str(caught.exception), (
+                'native_quota_account_mismatch', 'credential_reconciliation_required'))
+            self.assertFalse(handle.owner_verified)
+            self.session.finish.assert_not_called()
+            self.session.broker.quarantine.assert_called()
+            self.assertEqual(handle.state, 'quarantined')
+            self.assertNotEqual(handle.credential_writeback, 'committed')
 
     def test_quota_refresh_transport_failure_propagates_from_maintain(self):
         clock = StepClock()

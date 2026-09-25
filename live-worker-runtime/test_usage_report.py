@@ -831,7 +831,8 @@ class ReportPayloadTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertTrue(client.calls[0][1]['usage'])
         self.assertEqual(client.calls[1][1]['usage'], [])
-        self.assertEqual(worker.usage_rejected, 1)
+        # Counted only after the retry is accepted (25c).
+        self.assertEqual(worker.usage_rejected, 0)
         self.assertTrue(all('span' in item for item in worker.spans))
         self.assertEqual(worker.next_report, 0.0)
 
