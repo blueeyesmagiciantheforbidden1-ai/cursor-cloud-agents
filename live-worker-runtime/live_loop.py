@@ -16,6 +16,7 @@ import re
 import time
 
 import provider_errors
+import usage_report
 
 # Process start for this interpreter. The capability manifest stamps it once.
 _PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
@@ -369,6 +370,8 @@ class Worker:
         self._attempt_key = None
         self._capability_ready = False
         self._capability_value = None
+        self._last_turn_usage = None
+        self._last_turn_observed_at = None
 
     def _capability(self):
         """Build the manifest once per run. Failure omits it; it never raises."""
@@ -464,11 +467,21 @@ class Worker:
     def report(self, *, force=False):
         if not force and self.clock() < self.next_report:
             return
+        try:
+            preflight = None
+            if self.handle is not None:
+                preflight = getattr(self.handle, 'preflight', None)
+            usage = usage_report.entries(
+                self.settings.agent, self._last_turn_usage, preflight, self._last_turn_observed_at)
+            if not isinstance(usage, list):
+                usage = []
+        except Exception:
+            usage = []
         payload = {'worker_id': self.settings.worker_id,
                    'status': 'busy' if self.task and self.ready else 'idle' if self.ready else 'offline',
                    'auth_status': 'verified' if self.ready else 'unknown',
                    'current_room_id': self.task.get('room_id') if self.task else None,
-                   'last_exit_code': self.last_exit, 'usage': []}
+                   'last_exit_code': self.last_exit, 'usage': usage}
         try:
             capability = self._capability()
         except Exception:
@@ -697,6 +710,8 @@ class Worker:
                 # and idempotent; it must never launch another native process.
                 self._close_for_span()
                 self.ready = False
+                self._last_turn_usage = reply.get('usage')
+                self._last_turn_observed_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                 self._complete_for_span(reply['text'], 0)
                 outcome.update(outcome='completed', room_id=self.task['room_id'],
                                model=reply.get('model'), effort=reply.get('effort'),
