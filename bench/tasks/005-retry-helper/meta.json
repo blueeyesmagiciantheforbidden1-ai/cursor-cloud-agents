@@ -1,0 +1,9 @@
+{
+  "id": "005-retry-helper",
+  "category": "feature",
+  "difficulty": 3,
+  "time_budget_s": 700,
+  "expected_files": ["retrykit/__init__.py", "retrykit/retry.py", "retrykit/errors.py"],
+  "multi_agent_suitable": true,
+  "notes": "Retry wrapper across modules; design around exceptions and attempts."
+}

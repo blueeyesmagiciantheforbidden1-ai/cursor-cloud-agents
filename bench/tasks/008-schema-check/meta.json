@@ -1,0 +1,13 @@
+{
+  "id": "008-schema-check",
+  "category": "feature",
+  "difficulty": 4,
+  "time_budget_s": 900,
+  "expected_files": [
+    "schemacheck/__init__.py",
+    "schemacheck/errors.py",
+    "schemacheck/validate.py"
+  ],
+  "multi_agent_suitable": true,
+  "notes": "Dict schema validator with typed fields and nested objects."
+}

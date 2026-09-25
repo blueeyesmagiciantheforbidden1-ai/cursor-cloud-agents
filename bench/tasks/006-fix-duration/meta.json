@@ -1,0 +1,9 @@
+{
+  "id": "006-fix-duration",
+  "category": "bugfix",
+  "difficulty": 3,
+  "time_budget_s": 600,
+  "expected_files": ["durationparse/__init__.py"],
+  "multi_agent_suitable": false,
+  "notes": "Parse compact duration strings to seconds."
+}

@@ -1,0 +1,9 @@
+{
+  "id": "009-tests-ledger",
+  "category": "test-writing",
+  "difficulty": 3,
+  "time_budget_s": 700,
+  "expected_files": ["tests/test_ledger.py"],
+  "multi_agent_suitable": false,
+  "notes": "Author thorough tests for an existing ledger module."
+}

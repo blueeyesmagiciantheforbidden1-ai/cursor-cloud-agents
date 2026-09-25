@@ -1,0 +1,9 @@
+{
+  "id": "007-lru-cache",
+  "category": "feature",
+  "difficulty": 4,
+  "time_budget_s": 900,
+  "expected_files": ["lrucache/__init__.py", "lrucache/cache.py"],
+  "multi_agent_suitable": true,
+  "notes": "Bounded LRU cache with get/set/delete and eviction order."
+}

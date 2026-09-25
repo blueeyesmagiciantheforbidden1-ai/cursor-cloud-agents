@@ -1,0 +1,9 @@
+{
+  "id": "001-fix-clamp",
+  "category": "bugfix",
+  "difficulty": 1,
+  "time_budget_s": 300,
+  "expected_files": ["clampkit/__init__.py"],
+  "multi_agent_suitable": false,
+  "notes": "Inclusive clamp with ValueError when low > high."
+}

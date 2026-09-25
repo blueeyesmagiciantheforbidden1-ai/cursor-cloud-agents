@@ -1,0 +1,9 @@
+{
+  "id": "010-fix-intervals",
+  "category": "bugfix",
+  "difficulty": 5,
+  "time_budget_s": 1200,
+  "expected_files": ["intervals/__init__.py", "intervals/merge.py", "intervals/overlap.py"],
+  "multi_agent_suitable": true,
+  "notes": "Merge intervals and overlap checks; several edge-case bugs."
+}

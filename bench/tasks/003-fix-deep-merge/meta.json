@@ -1,0 +1,9 @@
+{
+  "id": "003-fix-deep-merge",
+  "category": "bugfix",
+  "difficulty": 2,
+  "time_budget_s": 450,
+  "expected_files": ["dicttools/merge.py"],
+  "multi_agent_suitable": false,
+  "notes": "Deep merge must not mutate inputs; nested dicts merge recursively."
+}

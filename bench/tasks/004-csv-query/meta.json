@@ -1,0 +1,9 @@
+{
+  "id": "004-csv-query",
+  "category": "feature",
+  "difficulty": 3,
+  "time_budget_s": 600,
+  "expected_files": ["csvquery/__init__.py", "csvquery/query.py"],
+  "multi_agent_suitable": false,
+  "notes": "Filter and project CSV text by column equality."
+}
