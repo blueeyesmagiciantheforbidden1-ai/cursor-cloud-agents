@@ -520,7 +520,7 @@ class RegistryTest(unittest.TestCase):
     @unittest.skipUnless(GIT, "git is required")
     def test_cli_records_an_uncertified_receipt(self):
         work_root = os.path.join(self.root, "work")
-        args = ["--adapter", "grok", "--runner-id", "r-grok", "--work-root", work_root,
+        args = ["--adapter", "copilot", "--runner-id", "r-copilot", "--work-root", work_root,
                 "--registry", self.registry, "--timeout", "60"]
         with open(self.registry, "w", encoding="utf-8") as handle:
             handle.write("[]")
@@ -593,6 +593,20 @@ class AdapterTest(unittest.TestCase):
                              ["/opt/bin/codex", "exec", "--sandbox", "workspace-write", "--ephemeral",
                               "--color", "never", "-C", "/ws", "go"])
             self.assertTrue(claude.probe()["flags_verified"])
+
+    def test_grok_uses_only_locally_verified_flags(self):
+        with mock.patch.object(runner_cert, "_cli_version", return_value="grok 1.0.24"):
+            grok = runner_cert.make_adapter("grok")
+            grok._which = lambda name: "/opt/bin/grok"
+            self.assertEqual(grok.command("/ws", "go", ["/opt/bin/grok"]),
+                             ["/opt/bin/grok", "--output-format", "plain", "--permission-mode", "auto",
+                              "--disable-web-search", "--no-subagents", "--cwd", "/ws", "-p", "go"])
+            self.assertNotIn("--always-approve", grok.FLAGS)
+            info = grok.probe()
+            self.assertTrue(info["available"])
+            self.assertTrue(info["flags_verified"])
+        missing = runner_cert.GrokAdapter(which=lambda name: None)
+        self.assertEqual(missing.probe()["reason"], "cli_not_found")
 
     @unittest.skipUnless(os.name == "nt", "Windows command-line quoting")
     def test_windows_quoting_round_trips(self):

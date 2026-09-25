@@ -808,6 +808,29 @@ class CodexAdapter(CommandAdapter):
         return list(prefix) + list(self.FLAGS) + ["-C", workspace, prompt]
 
 
+class GrokAdapter(CommandAdapter):
+    name = "grok"
+    cli_name = "grok"
+    # Every flag is in `grok --help` of grok 1.0.24 (68e414c661e3) on dumpling.
+    # -p is single-turn headless. auto mirrors claude: the classifier runs safe
+    # calls and nothing waits for a person. No --always-approve, no web search,
+    # no subagents: the run stays one agent in one workspace.
+    flags_verified_against = "grok 1.0.24 (68e414c661e3)"
+    FLAGS = ("--output-format", "plain", "--permission-mode", "auto",
+             "--disable-web-search", "--no-subagents")
+
+    def __init__(self, which=shutil.which):
+        super().__init__()
+        self._which = which
+
+    def resolve(self):
+        prefix, path, reason = _resolve_cli(self._which, "grok", None)
+        return prefix, path, _cli_version(prefix) if prefix else None, reason
+
+    def command(self, workspace, prompt, prefix):
+        return list(prefix) + list(self.FLAGS) + ["--cwd", workspace, "-p", prompt]
+
+
 class UnverifiedCliAdapter(CommandAdapter):
     """Detection only. Its flags were never checked against a local --help,
     so it reports the CLI and never runs it (not even --version)."""
@@ -826,7 +849,7 @@ ADAPTERS = {
     "claude": ClaudeAdapter,
     "codex": CodexAdapter,
     "copilot": lambda: UnverifiedCliAdapter("copilot", "copilot"),
-    "grok": lambda: UnverifiedCliAdapter("grok", "grok"),
+    "grok": GrokAdapter,
 }
 
 
