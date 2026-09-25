@@ -1717,4 +1717,112 @@ class BrokerRenewGuardTests(unittest.TestCase):
         self.assertEqual(body.count('broker.acquire(broker.execution, request_id)'), 2)
 
 
+# runcrew agent_hub.core.HEARTBEAT_PHASES (MyHero F4). That hub answers 400 to
+# any other value, so the worker must never send one.
+HUB_PHASES = ('setup', 'model_call', 'finishing')
+
+
+class HeartbeatPhaseTests(unittest.TestCase):
+    """F4: each task heartbeat says where the worker is, for the hub's lost-worker policy.
+
+    setup: claimed, the model call has not started. model_call: the adapter is
+    executing. finishing: the model returned; close and completion delivery.
+    """
+
+    def run_worker(self, *, fail_execute=False, room_change=None):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        beat = {}
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare'); beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            self.assertTrue(beat['fn']()); self.assertTrue(beat['fn']())
+            if fail_execute: raise CodeError('grok_turn_failed')
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+        def close(handle):
+            adapter.calls.append('close'); beat['fn']()
+        adapter.prepare, adapter.execute, adapter.close = prepare, execute, close
+        client.room.update(room_change or {})
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        beats = [value for path, value in client.calls if path.endswith('/heartbeat')]
+        for value in beats:
+            self.assertEqual(set(value), {'lease_token', 'phase'})
+            self.assertEqual(value['lease_token'], 'lease')
+            self.assertIn(value['phase'], HUB_PHASES)
+        phases = [value['phase'] for value in beats]
+        # Never backwards: a later "setup" would tell the hub no model call started.
+        self.assertEqual(phases, sorted(phases, key=HUB_PHASES.index))
+        return result, phases, client
+
+    def test_phase_sequence_of_a_completed_task(self):
+        result, phases, client = self.run_worker()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'finishing'])
+        paths = [path for path, _ in client.calls]
+        last_beat = max(i for i, path in enumerate(paths) if path.endswith('/heartbeat'))
+        self.assertLess(last_beat, paths.index('/v1/tasks/' + ROOM + '/complete'))
+
+    def test_setup_only_while_the_model_call_never_started(self):
+        result, phases, client = self.run_worker(room_change={'purpose': 'improvement'})
+        self.assertEqual(result['error_code'], 'project_work_only')
+        self.assertEqual(phases, ['setup', 'setup'])
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+
+    def test_failed_model_call_stays_model_call(self):
+        result, phases, client = self.run_worker(fail_execute=True)
+        self.assertEqual(result['error_code'], 'grok_turn_failed')
+        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'model_call'])
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+
+    def test_no_phase_and_no_task_heartbeat_before_a_claim(self):
+        clock = Clock(); client = Client(clock); client.empty = True
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, Adapter(),
+                        object(), clock=clock, sleep=clock.sleep)
+        self.assertIsNone(worker.phase)
+        self.assertEqual(worker.run()['outcome'], 'idle_drained')
+        self.assertEqual([path for path, _ in client.calls if path.endswith('/heartbeat')], [])
+
+    def test_older_hub_ignores_the_phase_key(self):
+        """A hub from before F4 cannot answer 400 to "phase".
+
+        runcrew R3/R3.1 (95bb81c, agent_hub/server.py) routes a heartbeat as
+        hub.heartbeat(actor, room_id, data.get('lease_token')); body() accepts
+        any JSON object and reads no other key. The agent-hub on this test's
+        path routes it the same way; every body the worker sends is replayed
+        against it over loopback HTTP.
+        """
+        import tempfile
+        import threading
+        from http.server import ThreadingHTTPServer
+        from urllib.request import Request, urlopen
+        from agent_hub.core import AGENTS, Hub
+        from agent_hub.server import load_tokens, make_handler
+        from agent_hub.store import SQLiteStore
+        _, phases, _ = self.run_worker()
+        with tempfile.TemporaryDirectory() as root:
+            hub = Hub(SQLiteStore(Path(root) / 'hub.sqlite3'))
+            tokens = load_tokens(json.dumps({name: 'test-' + name + '-' + 'x' * 40 for name in ('manager', *AGENTS)}))
+            server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(hub, tokens))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                hub.create('manager', {'prompt': 'Phase compatibility', 'agents': ['grok']})
+                task = hub.claim('grok')['task']
+                for phase in phases:
+                    body = json.dumps({'lease_token': task['lease_token'], 'phase': phase}).encode()
+                    request = Request('http://127.0.0.1:%d/v1/tasks/%s/heartbeat' % (server.server_port, task['room_id']),
+                                      data=body, method='POST',
+                                      headers={'Content-Type': 'application/json', 'X-Hub-Token': tokens['grok']})
+                    with urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertIs(json.loads(response.read())['active'], True)
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
+                closer = getattr(hub.store, 'close', None)
+                if callable(closer): closer()
+
+
 if __name__ == '__main__': unittest.main()

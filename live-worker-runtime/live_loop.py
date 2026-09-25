@@ -173,6 +173,9 @@ class Settings:
 # The hub's worker label (agent_hub.core.WORKER_ID, telemetry.py report check).
 HUB_WORKER_ID = re.compile(r'[A-Za-z0-9_-]{1,48}')
 MAX_REPAIR_ERRORS, MAX_REPAIR_ERROR_TEXT = 8, 160
+# Heartbeat phase for the hub's lost-worker policy (agent_hub.core.HEARTBEAT_PHASES).
+# It only moves forward. A hub from before it reads only lease_token (R3.1 server.py).
+HEARTBEAT_PHASES = ('setup', 'model_call', 'finishing')
 
 
 def _repair_errors(task):
@@ -418,6 +421,8 @@ class Worker:
         self.lease_revoked = False
         self.claim_attempted = False
         self.model_call_attempted = False
+        # None until a task is claimed; then one of HEARTBEAT_PHASES.
+        self.phase = None
         self.completion_payload = None
         self.cleaned = False
         self.spans = []
@@ -569,7 +574,7 @@ class Worker:
         try:
             if self.task:
                 receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
-                                           {'lease_token': self.task['lease_token']})
+                                           self._heartbeat_body(self.task))
                 if not isinstance(receipt, dict) or receipt.get('active') is not True:
                     self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
                     return False
@@ -587,7 +592,7 @@ class Worker:
         require(type(timeout) is int and 30 <= timeout <= 900, 'task_timeout_invalid')
         started = self.clock()
         receipt = self.client.post('/v1/tasks/' + task['room_id'] + '/heartbeat',
-                                   {'lease_token': task['lease_token']})
+                                   self._heartbeat_body(task))
         if isinstance(receipt, dict) and receipt.get('active') is False:
             self.lease_revoked = True
         require(receipt.get('active') is True, 'task_lease_lost')
@@ -596,6 +601,17 @@ class Worker:
         remaining = min(timeout, deadline - now) - (self.clock() - started) - self.settings.completion_reserve
         require(remaining >= 5, 'task_deadline_insufficient')
         return self.clock() + remaining
+
+    def _heartbeat_body(self, task):
+        """lease_token, plus the phase once a task is claimed.
+
+        A hub with recovery "auto" treats a worker lost in "setup" as one whose
+        model call never started, so "setup" is sent strictly before execute.
+        """
+        body = {'lease_token': task['lease_token']}
+        if self.phase in HEARTBEAT_PHASES:
+            body['phase'] = self.phase
+        return body
 
     def _claim_body(self):
         """worker_id lets the hub record which execution holds the attempt.
@@ -761,6 +777,7 @@ class Worker:
                         claim_outcome, claim_task, claim_key = 'empty', None, None
                     else:
                         self.task = result['task']
+                        self.phase = 'setup'
                         self._attempt_key = attempt_key(
                             self.task.get('lease_token') if isinstance(self.task, dict) else None)
                         claim_outcome, claim_task, claim_key = 'ok', self.task, self._attempt_key
@@ -787,10 +804,14 @@ class Worker:
                 # instead: no model call, one structured failure completion.
                 if self.stopping:
                     raise LiveError('worker_stopping')
+                # Before execute, so no heartbeat can still say "setup" once
+                # the model call may have started.
+                self.phase = 'model_call'
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:
                     reply = self.adapter.execute(self.handle, prompt, deadline, task_kind='project')
+                    self.phase = 'finishing'
                     require(isinstance(reply, dict) and isinstance(reply.get('text'), str)
                             and 0 < len(reply['text'].encode()) <= 15000, 'agent_result_invalid')
                 except Exception as error:
