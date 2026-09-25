@@ -153,6 +153,11 @@ python -m unittest -v test_runner_cert
 The tests use no network and no real agent CLI. Fake adapters play an honest
 agent, one that guesses `OUTPUT.txt`, one that edits the tests or adds or
 deletes files, one that commits, one that leaves a symlink, one that fails the
-hidden cases, one that forges `TEST_RESULT.txt`, and one that sleeps past the
-timeout. Other tests cover the registry (fresh, expired, newest-decides,
-damaged), refused paths, cursor resolution and Windows argument quoting.
+hidden cases, one that forges `TEST_RESULT.txt`, and ones that skip one of the
+three files `write_files` needs. The timeout, crash and harness-error agents
+first do the whole task honestly, so only that gate can refuse them. Every
+certify test also checks that a receipt is certified exactly when `reasons`
+is empty. Other tests cover a `calc.py` that makes the trusted visible run skip
+or drop tests, the registry (fresh, expired, the expiry instant,
+newest-decides, damaged), refused paths, cursor resolution and Windows
+argument quoting.

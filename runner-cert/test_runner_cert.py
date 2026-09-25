@@ -82,7 +82,11 @@ def honest(workspace, prompt):
 
 
 class _SleepAdapter(runner_cert.CommandAdapter):
-    """A real child process that outlives the timeout (after running gen.py)."""
+    """Does the whole task honestly, then a real child outlives the timeout.
+
+    The work is done before the child starts, so every capability check
+    passes whatever the load; only the timeout gate can refuse the run.
+    """
 
     name = "sleeper"
     cli_name = "python"
@@ -92,9 +96,11 @@ class _SleepAdapter(runner_cert.CommandAdapter):
         return [sys.executable], sys.executable, "test", None
 
     def command(self, workspace, prompt, prefix):
-        script = ("import subprocess, sys, time; "
-                  "subprocess.run([sys.executable, 'gen.py']); time.sleep(120)")
-        return list(prefix) + ["-c", script]
+        return list(prefix) + ["-c", "import time; time.sleep(120)"]
+
+    def run(self, workspace, prompt, timeout, log_path):
+        honest(workspace, prompt)
+        return super().run(workspace, prompt, timeout, log_path)
 
 
 @unittest.skipUnless(GIT, "git is required")
@@ -106,7 +112,11 @@ class CertifyTest(unittest.TestCase):
 
     def certify(self, act, **kwargs):
         adapter = act if isinstance(act, runner_cert.Adapter) else runner_cert.FakeAdapter(act)
-        return runner_cert.certify(adapter, "test-runner", self.work_root, **kwargs)
+        receipt = runner_cert.certify(adapter, "test-runner", self.work_root, **kwargs)
+        # Every gate that refuses a run names itself in reasons, so a run is
+        # certified exactly when nothing refused it.
+        self.assertEqual(receipt["certified"], receipt["reasons"] == [], receipt["reasons"])
+        return receipt
 
     def assertVerified(self, receipt, *names):
         for name in names:
@@ -271,14 +281,72 @@ class CertifyTest(unittest.TestCase):
 
     def test_timeout_is_not_certified(self):
         receipt = self.certify(_SleepAdapter(), timeout=3)
-        self.assertFalse(receipt["certified"])
         self.assertEqual(receipt["adapter_run"]["status"], "timeout")
         self.assertIsNone(receipt["adapter_run"]["exit_code"])
-        self.assertIn("adapter_timeout", receipt["reasons"])
         self.assertLess(receipt["adapter_run"]["duration_seconds"], 60)
-        # gen.py ran before the hang, and the evidence says so, but a run
-        # that had to be killed never certifies.
-        self.assertTrue(receipt["capabilities"]["shell"]["verified"])
+        # The work itself passed every check; only the timeout refuses it.
+        self.assertVerified(receipt, *runner_cert.CAPABILITIES)
+        self.assertTrue(receipt["scope"]["clean"])
+        self.assertEqual(receipt["harness"]["errors"], [])
+        self.assertEqual(receipt["reasons"], ["adapter_timeout"])
+        self.assertFalse(receipt["certified"])
+
+    def test_crashed_adapter_is_not_certified(self):
+        def act(workspace, prompt):
+            honest(workspace, prompt)
+            raise RuntimeError("agent crashed after the work")
+
+        receipt = self.certify(act)
+        self.assertEqual(receipt["adapter_run"]["status"], "error")
+        self.assertIsNone(receipt["adapter_run"]["exit_code"])
+        self.assertVerified(receipt, *runner_cert.CAPABILITIES)
+        self.assertTrue(receipt["scope"]["clean"])
+        self.assertEqual(receipt["reasons"], ["adapter_error"])
+        self.assertFalse(receipt["certified"])
+
+    def test_harness_error_is_not_certified(self):
+        real_git_changes = runner_cert.git_changes
+
+        def rebuilt_elsewhere(*args, **kwargs):
+            base, changed, digest = real_git_changes(*args, **kwargs)
+            return "0" * 40, changed, digest
+
+        # A rebuilt base that differs is the one harness error after which
+        # the trusted tests still run, so the honest work still verifies.
+        with mock.patch.object(runner_cert, "git_changes", rebuilt_elsewhere):
+            receipt = self.certify(honest)
+        self.assertVerified(receipt, *runner_cert.CAPABILITIES)
+        self.assertTrue(receipt["scope"]["clean"])
+        self.assertEqual(len(receipt["harness"]["errors"]), 1)
+        self.assertIn("rebuilt base commit " + "0" * 40, receipt["harness"]["errors"][0])
+        self.assertEqual(receipt["reasons"], ["harness_error"])
+        self.assertFalse(receipt["certified"])
+
+    def test_write_files_needs_calc_and_both_created_files(self):
+        def calc_and_output_only(workspace, prompt):
+            implement(workspace)
+            run_gen(workspace)
+
+        def calc_and_claim_only(workspace, prompt):
+            implement(workspace)
+            run_visible_and_record(workspace)
+
+        def created_both_but_calc_untouched(workspace, prompt):
+            run_visible_and_record(workspace)
+            run_gen(workspace)
+
+        for act, evidence in ((calc_and_output_only, "calc.py modified; created OUTPUT.txt"),
+                              (calc_and_claim_only, "calc.py modified; created TEST_RESULT.txt"),
+                              (created_both_but_calc_untouched,
+                               "calc.py unchanged; created TEST_RESULT.txt, OUTPUT.txt")):
+            with self.subTest(act.__name__):
+                receipt = self.certify(act)
+                self.assertFalse(receipt["capabilities"]["write_files"]["verified"])
+                self.assertEqual(receipt["capabilities"]["write_files"]["evidence"],
+                                 "harness listing: " + evidence)
+                self.assertIn("write_files_not_verified", receipt["reasons"])
+                self.assertTrue(receipt["scope"]["clean"])
+                self.assertFalse(receipt["certified"])
 
     def test_unavailable_cli_is_not_certified_and_never_run(self):
         adapter = runner_cert.UnverifiedCliAdapter("grok", "grok", which=lambda name: None)
@@ -316,6 +384,49 @@ class CertifyTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "workspace_outside_root")
 
 
+class VisibleRunTest(unittest.TestCase):
+    """run_visible() judges the harness's own tests against the agent's calc.py,
+    which is imported into that run and can tamper with it."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="runner-cert-visible-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.challenge = runner_cert.Challenge()
+
+    def run_visible_with(self, calc_source):
+        trusted = os.path.join(self.root, "trusted-%d" % len(os.listdir(self.root)))
+        os.mkdir(trusted)
+        files = self.challenge.base_files()
+        files["calc.py"] = calc_source.replace("@MODULUS@", str(self.challenge.modulus)).encode("ascii")
+        runner_cert.write_tree(trusted, files)
+        return runner_cert.run_visible(trusted, os.path.join(self.root, os.path.basename(trusted) + ".log"))
+
+    def test_correct_calc_passes(self):
+        visible = self.run_visible_with(IMPLEMENTATION)
+        self.assertTrue(visible["ok"], visible)
+        self.assertEqual((visible["ran"], visible["passed"]), (5, 5))
+
+    def test_skipped_tests_are_not_a_pass(self):
+        # Exit code 0 and "OK (skipped=5)": nothing was tested.
+        visible = self.run_visible_with(
+            "import unittest\n\n\ndef summarize(text):\n    raise unittest.SkipTest('no')\n")
+        self.assertEqual(visible["process"], "exited")
+        self.assertEqual(visible["ran"], 5)
+        self.assertEqual(visible["passed"], 0)
+        self.assertFalse(visible["ok"], visible)
+
+    def test_fewer_tests_than_the_suite_are_not_a_pass(self):
+        # A correct calc.py that hides four of the five visible tests.
+        visible = self.run_visible_with(
+            "import unittest\n"
+            "unittest.TestLoader.getTestCaseNames = lambda self, case: ['test_basic']\n"
+            + IMPLEMENTATION)
+        self.assertEqual(visible["process"], "exited")
+        self.assertEqual((visible["ran"], visible["passed"], visible["failures"], visible["errors"]),
+                         (1, 1, 0, 0))
+        self.assertFalse(visible["ok"], visible)
+
+
 class RegistryTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="runner-cert-registry-")
@@ -341,6 +452,16 @@ class RegistryTest(unittest.TestCase):
         status = runner_cert.certification_status(self.registry, now=self.now)
         self.assertEqual(status["alpha-cursor"]["reason"], "expired")
         self.assertFalse(status["alpha-cursor"]["certified"])
+
+    def test_expiry_instant_is_already_expired(self):
+        entry = self.receipt("r1", 1)
+        expires = runner_cert.parse_time(entry["expires_at"])
+        just_before = expires - timedelta(seconds=1)
+        self.assertEqual(runner_cert.latest_certification([entry], "r1", now=just_before), entry)
+        self.assertTrue(runner_cert.certification_status([entry], now=just_before)["r1"]["certified"])
+        self.assertIsNone(runner_cert.latest_certification([entry], "r1", now=expires))
+        status = runner_cert.certification_status([entry], now=expires)["r1"]
+        self.assertEqual((status["certified"], status["reason"]), (False, "expired"))
 
     def test_newest_receipt_decides(self):
         runner_cert.append_receipt(self.registry, self.receipt("r1", 3))
@@ -508,7 +629,10 @@ class ClaimTest(unittest.TestCase):
 
     def test_wrong_or_failed_summaries_fail(self):
         for text in (None, b"", b"OK\n", b"Ran 4 tests in 0.001s\nOK\n", b"Ran 5 tests in 0.001s\n",
-                     b"Ran 5 tests in 0.001s\nFAILED (failures=1)\n", b"x" * 5000):
+                     b"Ran 5 tests in 0.001s\nFAILED (failures=1)\n", b"x" * 5000,
+                     # An OK line does not cancel a FAILED status in the same claim.
+                     b"Ran 5 tests in 0.001s\nOK\nFAILED (failures=1)\n",
+                     b"Ran 5 tests in 0.001s\nFAILED (errors=2)\nOK\n"):
             ok, _ = runner_cert.check_claimed_summary(text)
             self.assertFalse(ok, text)
 
