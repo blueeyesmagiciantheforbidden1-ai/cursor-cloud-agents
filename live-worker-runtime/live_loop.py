@@ -178,8 +178,9 @@ MAX_REPAIR_ERRORS, MAX_REPAIR_ERROR_TEXT = 8, 160
 def _repair_errors(task):
     """The hub's acceptance errors for this step's previous attempt, or None.
 
-    They are fixed hub-generated strings about the output's shape, never
-    another agent's text. Anything malformed is dropped, not forwarded.
+    They are short hub-generated strings about the output's shape. They can
+    quote up to 40 characters of an output key name, so they stay inside the
+    untrusted JSON context. Anything malformed is dropped, not forwarded.
     """
     repair = task.get('repair')
     if not isinstance(repair, dict):
