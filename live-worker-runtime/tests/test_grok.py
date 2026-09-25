@@ -861,6 +861,98 @@ class GrokAdapter(unittest.TestCase):
                 session.broker.quarantine.assert_called()
                 self.assertEqual(fixture.events, ['stop'])
 
+    def test_quota_refresh_auth_info_missing_email_keeps_verified_and_commits(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                fixture.overrides['x.ai/auth/info'] = {'methodId': 'cached_token'}
+                handle.next_quota_refresh = clock.now
+                readiness = g.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_quota_refresh_auth_info_wrong_method_id_with_owner_email_keeps_verified(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                fixture.overrides['x.ai/auth/info'] = {
+                    'methodId': 'other_method', 'email': g.OWNER}
+                handle.next_quota_refresh = clock.now
+                readiness = g.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_quota_refresh_auth_info_user_blocked_parks_keeps_verified_and_commits(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                fixture.overrides['x.ai/auth/info'] = {
+                    'methodId': 'cached_token', 'email': g.OWNER,
+                    'userBlockedReason': 'abuse'}
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_account_blocked_quota_exhausted$') as caught:
+                    g.maintain(handle)
+                code = provider_errors.error_code(caught.exception)
+                self.assertTrue(provider_errors.is_quota(code))
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_quota_refresh_auth_info_error_frame_keeps_owner_verified(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                negative = wire.rpc_error_code({'code': -32603, 'message': 'x'})
+                self.assertEqual(negative, 'native_rpc_-32603')
+                fixture.overrides['x.ai/auth/info'] = g.NativeError(negative)
+                handle.next_quota_refresh = clock.now
+                readiness = g.maintain(handle)
+                self.assertTrue(readiness['ready_for_project_prompt'])
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                self.assertEqual(handle.next_quota_refresh, clock.now + g.QUOTA_RETRY_SECONDS)
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
+    def test_quota_refresh_auth_info_deadline_drains_keeps_owner_verified(self):
+        clock = StepClock()
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            with patch('time.monotonic', clock):
+                _, handle = self.prepare(fixture, root)
+                clock.advance(handle.native.deadline - clock.now + 1)
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                fixture.overrides['x.ai/auth/info'] = g.NativeError('native_deadline')
+                handle.next_quota_refresh = clock.now
+                with self.assertRaisesRegex(g.NativeError, '^grok_quota_refresh_transport_lost$') as caught:
+                    g.maintain(handle)
+                self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
+                self.assertTrue(handle.preflight['account']['native_owner_verified'])
+                g.close(handle)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
     def test_quota_refresh_transport_failure_propagates_from_maintain(self):
         clock = StepClock()
         fixture = Fixture()

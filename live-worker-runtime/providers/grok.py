@@ -81,6 +81,16 @@ def _owner(value):
             'auth_method': 'cached_token', 'api_fallback': False}
 
 
+def _positive_owner_mismatch(auth_response):
+    """True only when auth/info names a different account email (not missing/malformed)."""
+    try:
+        value = unwrap(auth_response)
+        email = value.get('email')
+        return type(email) is str and bool(email) and email.lower() != OWNER
+    except Exception:
+        return False
+
+
 def _catalog(value):
     value = unwrap(value)
     rows = value.get('availableModels')
@@ -338,10 +348,6 @@ _GROK_REFRESH_TRANSPORT_CODES = frozenset({
     'request_limit',  # send(): outbound message size cap
 })
 
-_GROK_REFRESH_IDENTITY_CODES = frozenset({
-    'grok_owner_mismatch', 'grok_account_blocked',
-})
-
 
 def _grok_quota_refresh_swallowed(error):
     code = str(error) if isinstance(error, NativeError) else ''
@@ -361,7 +367,7 @@ def _refresh_quota(handle):
     like schema validation failures (stream still sync). Vetted non-transport
     codes (tools, broker renew, hub heartbeat, quota) pass through unchanged.
     Uncoded exceptions and _GROK_REFRESH_TRANSPORT_CODES become
-    grok_quota_refresh_transport_lost. Exhaustion and identity failures raise.
+    grok_quota_refresh_transport_lost. Exhaustion and positive owner-mismatch raise.
     The prepare-era native.deadline is replaced for the refresh window and
     restored after.
     """
@@ -392,7 +398,14 @@ def _refresh_quota(handle):
             if code == 'grok_included_allowance_exhausted':
                 # Same park code execute()/rpc use for account exhaustion.
                 raise NativeError('grok_quota_exhausted') from None
-            if code in _GROK_REFRESH_IDENTITY_CODES:
+            if code == 'grok_account_blocked':
+                # Still our account, but the provider refuses it: park the slot
+                # (exit 75) instead of claiming a turn that fails; close commits.
+                raise NativeError('grok_account_blocked_quota_exhausted') from None
+            # Quarantine only on a positive email mismatch. A missing email or a
+            # wrong methodId is an ordinary validation failure; execute()
+            # re-verifies before billing.
+            if code == 'grok_owner_mismatch' and _positive_owner_mismatch(responses[0]):
                 account = handle.preflight.get('account') if type(handle.preflight) is dict else None
                 if type(account) is dict:
                     account['native_owner_verified'] = False
