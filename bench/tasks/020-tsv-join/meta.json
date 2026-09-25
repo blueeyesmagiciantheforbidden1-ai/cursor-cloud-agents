@@ -1,0 +1,14 @@
+{
+  "id": "020-tsv-join",
+  "category": "multi-file",
+  "difficulty": 5,
+  "time_budget_s": 900,
+  "expected_files": [
+    "tsvjoin/__init__.py",
+    "tsvjoin/table.py",
+    "tsvjoin/join.py",
+    "tsvjoin/__main__.py"
+  ],
+  "multi_agent_suitable": true,
+  "notes": "TSV load/save, inner/left join, CLI."
+}

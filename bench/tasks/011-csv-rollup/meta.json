@@ -1,0 +1,12 @@
+{
+  "id": "011-csv-rollup",
+  "category": "feature",
+  "difficulty": 2,
+  "time_budget_s": 600,
+  "expected_files": [
+    "rollup/__init__.py",
+    "rollup/summarize.py"
+  ],
+  "multi_agent_suitable": false,
+  "notes": "Group-and-sum list-of-dicts; missing keys, mutation, sorting."
+}

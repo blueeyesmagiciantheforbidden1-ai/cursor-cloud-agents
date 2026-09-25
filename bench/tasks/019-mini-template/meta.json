@@ -1,0 +1,14 @@
+{
+  "id": "019-mini-template",
+  "category": "multi-file",
+  "difficulty": 4,
+  "time_budget_s": 900,
+  "expected_files": [
+    "minitemplate/__init__.py",
+    "minitemplate/filters.py",
+    "minitemplate/loader.py",
+    "minitemplate/engine.py"
+  ],
+  "multi_agent_suitable": true,
+  "notes": "Tiny {{var}} templates with filters and directory loader."
+}

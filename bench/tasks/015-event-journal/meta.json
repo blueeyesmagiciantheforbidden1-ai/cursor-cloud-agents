@@ -1,0 +1,14 @@
+{
+  "id": "015-event-journal",
+  "category": "multi-file",
+  "difficulty": 4,
+  "time_budget_s": 900,
+  "expected_files": [
+    "eventjournal/__init__.py",
+    "eventjournal/codec.py",
+    "eventjournal/store.py",
+    "eventjournal/cursor.py"
+  ],
+  "multi_agent_suitable": true,
+  "notes": "JSONL event journal: codec, append/read store, cursor files."
+}

@@ -1,0 +1,13 @@
+{
+  "id": "018-merge-records",
+  "category": "refactor",
+  "difficulty": 3,
+  "time_budget_s": 600,
+  "expected_files": [
+    "mergerec/__init__.py",
+    "mergerec/merge.py",
+    "mergerec/pipeline.py"
+  ],
+  "multi_agent_suitable": true,
+  "notes": "Deduplicate deep-merge logic used by two pipeline entry points."
+}

@@ -1,0 +1,14 @@
+{
+  "id": "014-textkit-split",
+  "category": "refactor",
+  "difficulty": 3,
+  "time_budget_s": 600,
+  "expected_files": [
+    "textkit/__init__.py",
+    "textkit/normalize.py",
+    "textkit/slugify.py",
+    "textkit/truncate.py"
+  ],
+  "multi_agent_suitable": true,
+  "notes": "Split monolith utils into modules and fix whitespace/slug/truncate edge cases."
+}

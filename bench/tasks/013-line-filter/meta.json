@@ -1,0 +1,13 @@
+{
+  "id": "013-line-filter",
+  "category": "feature",
+  "difficulty": 1,
+  "time_budget_s": 600,
+  "expected_files": [
+    "linefilter/__init__.py",
+    "linefilter/core.py",
+    "linefilter/__main__.py"
+  ],
+  "multi_agent_suitable": false,
+  "notes": "Substring line filter library + tiny CLI."
+}

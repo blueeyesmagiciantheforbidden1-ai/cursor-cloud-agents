@@ -1,0 +1,12 @@
+{
+  "id": "017-dot-paths",
+  "category": "feature",
+  "difficulty": 2,
+  "time_budget_s": 600,
+  "expected_files": [
+    "dotpaths/__init__.py",
+    "dotpaths/convert.py"
+  ],
+  "multi_agent_suitable": false,
+  "notes": "Flatten/expand nested dicts with dotted paths."
+}

@@ -1,0 +1,12 @@
+{
+  "id": "016-fixed-width",
+  "category": "feature",
+  "difficulty": 3,
+  "time_budget_s": 600,
+  "expected_files": [
+    "fixedwidth/__init__.py",
+    "fixedwidth/records.py"
+  ],
+  "multi_agent_suitable": false,
+  "notes": "Parse/format fixed-width records from a field schema."
+}
