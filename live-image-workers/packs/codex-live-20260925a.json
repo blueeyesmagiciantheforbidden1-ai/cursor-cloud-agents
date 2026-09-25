@@ -1,0 +1,147 @@
+{
+ "pack": "live-image-codex-live-20260925a-source",
+ "tree_sha256": null,
+ "files": [
+  {
+   "path": ".dockerignore",
+   "sha256": "14028132800c714bb124eeb6e543172676686c1991c2be5b5b6f514424841c85",
+   "inline_b64": "LmdpdApfX3B5Y2FjaGVfXwoqLnB5Ywo="
+  },
+  {
+   "path": ".gcloudignore",
+   "sha256": "14028132800c714bb124eeb6e543172676686c1991c2be5b5b6f514424841c85",
+   "inline_b64": "LmdpdApfX3B5Y2FjaGVfXwoqLnB5Ywo="
+  },
+  {
+   "path": "agent_hub/__init__.py",
+   "sha256": "5ec682a4ae99d3326888367b8f3cd707625594d31abde198903f7c2834c3097b",
+   "git": "cae15ed:agent-hub/agent_hub/__init__.py"
+  },
+  {
+   "path": "agent_hub/adapters.py",
+   "sha256": "864cff4a922154f3201b6895cb878721042107e39527916449782f0252b44c98",
+   "git": "cae15ed:agent-hub/agent_hub/adapters.py"
+  },
+  {
+   "path": "agent_hub/billing_policy.py",
+   "sha256": "f29b62865ad8b388ff494720a3bb44da04b8806c0d12e966070589142cbc397d",
+   "git": "cae15ed:agent-hub/agent_hub/billing_policy.py"
+  },
+  {
+   "path": "agent_hub/claude_runtime.py",
+   "sha256": "7d1171f029b824f5785c85988e26d399e7768fbc374633c3448a64d571ebe21f",
+   "git": "cae15ed:agent-hub/agent_hub/claude_runtime.py"
+  },
+  {
+   "path": "agent_hub/cloud_credential_broker.py",
+   "sha256": "31a6af3e26da6d9aed8e9b7d1c62d948e9e7c7d79adc071bfb05ff69e22150a5",
+   "git": "cae15ed:agent-hub/agent_hub/cloud_credential_broker.py"
+  },
+  {
+   "path": "agent_hub/core.py",
+   "sha256": "13ff890e3acc422513ae0548d826d383fe9ef496ff876d990c3c951c9fc372e6",
+   "git": "cae15ed:agent-hub/agent_hub/core.py"
+  },
+  {
+   "path": "agent_hub/credential_broker_service.py",
+   "sha256": "c5fecffb158bcc5a066d8d10695c7839ccf16628a4ff818e23ed7ff1b78457dd",
+   "git": "cae15ed:agent-hub/agent_hub/credential_broker_service.py"
+  },
+  {
+   "path": "agent_hub/learning.py",
+   "sha256": "f629a6055e8ce0c96f29ecd4ba80f897b6d8dda5c216419cbbc144769a19f17f",
+   "git": "cae15ed:agent-hub/agent_hub/learning.py"
+  },
+  {
+   "path": "agent_hub/model_policy.py",
+   "sha256": "1aaae94b6c9832b734816807d7a5f1992d930506566a85ffe85a63ae0e51235c",
+   "git": "cae15ed:agent-hub/agent_hub/model_policy.py"
+  },
+  {
+   "path": "agent_hub/model_runtime.py",
+   "sha256": "77d11f2a672f1f32f2a2db33a20fe2de083e917c29934346ae01b15d62cc4fa0",
+   "git": "cae15ed:agent-hub/agent_hub/model_runtime.py"
+  },
+  {
+   "path": "agent_hub/subscription_auth.py",
+   "sha256": "1afbfc062488b3748e3c48af2704ea7fa474ed2a1ea27c2878ad81fd7dd9fd00",
+   "git": "cae15ed:agent-hub/agent_hub/subscription_auth.py"
+  },
+  {
+   "path": "agent_hub/worker.py",
+   "sha256": "c5991466e14244db3d3152f50ffec1d54741449aac600a6d8d48d2e7bfb9c482",
+   "git": "cae15ed:agent-hub/agent_hub/worker.py"
+  },
+  {
+   "path": "cloudbuild.json",
+   "sha256": "d341486cfafc3765bffcd2be9ebd98fdc0e6ce95ae33afa30ded3454237cdc01",
+   "inline_b64": "eyJpbWFnZXMiOlsidXMtY2VudHJhbDEtZG9ja2VyLnBrZy5kZXYvcHJvamVjdC0wYzZkMzFmYS01MDllLTQxMTYtYTJjL3J1bmNyZXctaHViL2NvZGV4LXdvcmtlcjpsaXZlLTIwMjYwOTI1YSJdLCJvcHRpb25zIjp7ImxvZ2dpbmciOiJDTE9VRF9MT0dHSU5HX09OTFkifSwic3RlcHMiOlt7ImFyZ3MiOlsiYnVpbGQiLCItLXBsYXRmb3JtPWxpbnV4L2FtZDY0IiwiLXQiLCJ1cy1jZW50cmFsMS1kb2NrZXIucGtnLmRldi9wcm9qZWN0LTBjNmQzMWZhLTUwOWUtNDExNi1hMmMvcnVuY3Jldy1odWIvY29kZXgtd29ya2VyOmxpdmUtMjAyNjA5MjVhIiwiLiJdLCJuYW1lIjoiZ2NyLmlvL2Nsb3VkLWJ1aWxkZXJzL2RvY2tlciIsInRpbWVvdXQiOiI2MDBzIn1dLCJ0aW1lb3V0IjoiNzIwcyJ9Cg=="
+  },
+  {
+   "path": "Dockerfile",
+   "sha256": "0bd522744b5a39b5dbbc85f50d32afe922aa84b9ce9060a3ffe5cef6fb3a3779",
+   "inline_b64": "IyBMaXZlIGNvZGV4IHdvcmtlcjogdmVyaWZpZWQgYmFzZSArIHJlYWQtb25seSBsaXZlIHJ1bnRpbWUuIE5vIGNyZWRlbnRpYWwgaXMgYSBidWlsZCBpbnB1dC4KRlJPTSB1cy1jZW50cmFsMS1kb2NrZXIucGtnLmRldi9wcm9qZWN0LTBjNmQzMWZhLTUwOWUtNDExNi1hMmMvcnVuY3Jldy1odWIvY29kZXgtd29ya2VyQHNoYTI1Njo2YzE4YWI5NjI3OTc3MjU0ZTMzMTI5MTdiOGQ1Nzk5MmQ1ODE4YjljMDZkZDRlYzEwZGQ5YTg0ZmM2OWE3NjJkClVTRVIgMDowCkNPUFkgLS1jaG93bj0wOjAgYWdlbnRfaHViLyAvb3B0L3J1bmNyZXcvYXBwL2FnZW50X2h1Yi8KQ09QWSAtLWNob3duPTA6MCBsaXZlLyAvb3B0L3J1bmNyZXcvYXBwLwpSVU4gY3AgL29wdC9ydW5jcmV3L2NvZGV4LWNvbW1pc3Npb24vbWV0YWRhdGEucHkgL29wdC9ydW5jcmV3L2NvZGV4LWNvbW1pc3Npb24vcHJvdG9jb2xfZ2F0ZS5weSAvb3B0L3J1bmNyZXcvY29kZXgtY29tbWlzc2lvbi90cmFuc3BvcnQucHkgL29wdC9ydW5jcmV3L2NvZGV4LWNvbW1pc3Npb24vY3JlZGVudGlhbF9zdGF0ZS5weSAvb3B0L3J1bmNyZXcvYXBwLwpSVU4gY2htb2QgLVIgYS13IC9vcHQvcnVuY3Jldy9hcHAgJiYgZmluZCAvb3B0L3J1bmNyZXcvYXBwIC1uYW1lIF9fcHljYWNoZV9fIC1wcnVuZSAtZXhlYyBybSAtcmYge30gKwpFTlYgUFlUSE9ORE9OVFdSSVRFQllURUNPREU9MSBQWVRIT05VTkJVRkZFUkVEPTEgUlVOQ1JFV19MSVZFX1BST1ZJREVSPWNvZGV4CldPUktESVIgL29wdC9ydW5jcmV3L2FwcApVU0VSIDEwMDAxOjEwMDAxClJVTiBweXRob24gLUkgLUIgLW0gdW5pdHRlc3QgZGlzY292ZXIgLXMgL29wdC9ydW5jcmV3L2FwcC90ZXN0cyAtdCAvb3B0L3J1bmNyZXcvYXBwIC1wICJ0ZXN0X2NvZGV4LnB5IiAtcQpSVU4gcHl0aG9uIC1JIC1CIC1tIHVuaXR0ZXN0IGRpc2NvdmVyIC1zIC9vcHQvcnVuY3Jldy9hcHAgLXQgL29wdC9ydW5jcmV3L2FwcCAtcCAidGVzdF9saXZlX2xvb3AucHkiIC1xClJVTiBweXRob24gLUkgLUIgLW0gdW5pdHRlc3QgZGlzY292ZXIgLXMgL29wdC9ydW5jcmV3L2FwcCAtdCAvb3B0L3J1bmNyZXcvYXBwIC1wICJ0ZXN0X2R5bmFtaWNfYnJva2VyLnB5IiAtcQpSVU4gcHl0aG9uIC1JIC1CIC9vcHQvcnVuY3Jldy9hcHAvZW50cnlwb2ludC5weSAtLWNoZWNrCkVOVFJZUE9JTlQgWyJweXRob24iLCItSSIsIi1CIiwiL29wdC9ydW5jcmV3L2FwcC9lbnRyeXBvaW50LnB5Il0K"
+  },
+  {
+   "path": "live/broker_renew.py",
+   "sha256": "1196635bf943d5b000bff43f75b57498a41c07210e3f2b800ec7f2d343540cdb",
+   "git": "cae15ed:live-worker-runtime/broker_renew.py"
+  },
+  {
+   "path": "live/dynamic_broker.py",
+   "sha256": "182db3166a193d130165a97f0d675830f972ccf39e5526a151ddf8006cbe7a11",
+   "git": "cae15ed:live-worker-runtime/dynamic_broker.py"
+  },
+  {
+   "path": "live/entrypoint.py",
+   "sha256": "c413798324a83fceb353ac5ea47198f8d86f70c8c80ad016cfeba14486017a0e",
+   "git": "cae15ed:live-worker-runtime/entrypoint.py"
+  },
+  {
+   "path": "live/live_loop.py",
+   "sha256": "4ba5dfbe709f154db1cbfb54f7ec126284a0364a966cb417ced03985738489cb",
+   "git": "cae15ed:live-worker-runtime/live_loop.py"
+  },
+  {
+   "path": "live/provider_errors.py",
+   "sha256": "6e59c6e43fe789674242716ca239392a11471c34011206039f266bd4ec6a5da3",
+   "git": "cae15ed:live-worker-runtime/provider_errors.py"
+  },
+  {
+   "path": "live/providers/__init__.py",
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "git": "cae15ed:live-worker-runtime/providers/__init__.py"
+  },
+  {
+   "path": "live/providers/codex.py",
+   "sha256": "7b083a9d6c33fc8e6409cc2931f95ad42c757fcb68d9500d7e116b53b008e18a",
+   "git": "cae15ed:live-worker-runtime/providers/codex.py"
+  },
+  {
+   "path": "live/test_dynamic_broker.py",
+   "sha256": "fe14b16713a57da2de82f17773170cdf25a3003590e133f5fd3d6f1aff77f364",
+   "git": "cae15ed:live-worker-runtime/test_dynamic_broker.py"
+  },
+  {
+   "path": "live/test_live_loop.py",
+   "sha256": "52fefac74b29792221d0fc9f14a237540eec2d66a0b0d07957ad92972061df9e",
+   "git": "cae15ed:live-worker-runtime/test_live_loop.py"
+  },
+  {
+   "path": "live/tests/__init__.py",
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "git": "cae15ed:live-worker-runtime/tests/__init__.py"
+  },
+  {
+   "path": "live/tests/test_codex.py",
+   "git": "cae15ed:live-worker-runtime/tests/test_codex.py",
+   "owner_pin": true,
+   "placeholder_sha256": "6aee4a56061f363448aa595f21da7e3753b49956a0756f422546201159c6946b"
+  },
+  {
+   "path": "live/usage_report.py",
+   "sha256": "113d859745dad90a05aee5a8bb757bb1dc3eb4f5be760446a9571751a8cb3b56",
+   "git": "cae15ed:live-worker-runtime/usage_report.py"
+  }
+ ]
+}
