@@ -1,7 +1,7 @@
 """Offline first-LIVE Codex lifecycle tests; no native/provider/cloud execution."""
 import copy
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
@@ -836,8 +836,19 @@ class CodexLive(unittest.TestCase):
             handle.next_quota_refresh = clock()
             old = handle.preflight['quota']['observed_at']
             self.native.rates = rates(33)
-            c.maintain(handle)
+            # Pin the measurement time: on a fast host prepare and the refresh can
+            # fall in the same microsecond of the real clock.
+            fixed = datetime(2099, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+            class FakeDateTime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed
+
+            with patch('providers.codex.datetime', FakeDateTime):
+                c.maintain(handle)
             self.assertEqual(handle.preflight['quota']['included_used_percent'], 33)
+            self.assertEqual(handle.preflight['quota']['observed_at'], fixed.isoformat())
             self.assertNotEqual(handle.preflight['quota']['observed_at'], old)
             self.assertEqual(handle.next_quota_refresh, clock() + c.QUOTA_REFRESH_SECONDS)
             c.close(handle)
