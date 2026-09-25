@@ -39,6 +39,16 @@ FAILURE_BACKOFF_SECONDS = (120, 600)
 QUOTA_EXIT_CODE = 75
 QUOTA_PARK_BASE_SECONDS = 3600
 QUOTA_PARK_CAP_SECONDS = 14400
+# Process exit for claude_authentication_failed (provider_errors.AUTH_RECONNECT_EXIT_CODE).
+# A brief Claude revocation is not a strike and does not quarantine the lease.
+# The slot stays idle and relaunches on a short backoff so the session, the
+# message bus, and shared memory attach again. After AUTH_RECONNECT_LIMIT
+# clean releases the slot stops, so a still-revoked account cannot loop.
+AUTH_RECONNECT_EXIT_CODE = 76
+AUTH_RECONNECT_ERROR = 'claude_auth_revoked'
+AUTH_RECONNECT_BASE_SECONDS = 60
+AUTH_RECONNECT_CAP_SECONDS = 900
+AUTH_RECONNECT_LIMIT = 8
 
 
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
@@ -274,6 +284,11 @@ class Controller:
         # quota_parks cannot build an enormous integer.
         return min(QUOTA_PARK_CAP_SECONDS, QUOTA_PARK_BASE_SECONDS * 2 ** min(parks, 2))
 
+    def _auth_reconnect_seconds(self, prior):
+        if type(prior) is not int or prior < 0:
+            prior = 0
+        return min(AUTH_RECONNECT_CAP_SECONDS, AUTH_RECONNECT_BASE_SECONDS * 2 ** min(prior, 4))
+
     def save(self, state, version, **changes):
         result = {**state, **changes, 'updated_at': int(self.clock())}
         return result, self.store.cas(result, version)
@@ -306,6 +321,10 @@ class Controller:
                     if state.get('error') == 'provider_quota_exhausted':
                         return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
                                 'quota_parks': state.get('quota_parks', 0), 'generation': state['generation']}
+                    if state.get('error') == AUTH_RECONNECT_ERROR:
+                        return {'status': 'claude_auth_reconnecting', 'next_launch_at': state['next_launch_at'],
+                                'auth_reconnects': state.get('auth_reconnects', 0),
+                                'generation': state['generation']}
                     return {'status': 'replacement_cooldown', 'generation': state['generation']}
                 job = self.job(); previous = self.current_terminal(job, state)
                 release_uid = self.broker._read()[0].get('execution_uid')
@@ -391,6 +410,22 @@ class Controller:
                             last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                         return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
                                 'quota_parks': state['quota_parks'], 'generation': state['generation']}
+                    if exit_code == AUTH_RECONNECT_EXIT_CODE and released:
+                        prior = state.get('auth_reconnects', 0)
+                        if type(prior) is not int or prior < 0:
+                            prior = 0
+                        reconnects = prior + 1
+                        if reconnects > AUTH_RECONNECT_LIMIT:
+                            state, version = self.save(state, version, phase='blocked',
+                                auth_reconnects=reconnects, error='claude_auth_still_revoked')
+                            return {'status': 'blocked', 'generation': state['generation']}
+                        self.store.archive(state, execution)
+                        state, version = self.save(state, version, phase='idle', error=AUTH_RECONNECT_ERROR,
+                            auth_reconnects=reconnects,
+                            next_launch_at=int(self.clock()) + self._auth_reconnect_seconds(prior),
+                            last_execution=state['execution'], last_execution_uid=state['execution_uid'])
+                        return {'status': 'claude_auth_reconnecting', 'next_launch_at': state['next_launch_at'],
+                                'auth_reconnects': state['auth_reconnects'], 'generation': state['generation']}
                     failures = state.get('consecutive_failures', 0) + 1
                     if not released or failures >= MAX_CONSECUTIVE_FAILURES:
                         state, version = self.save(state, version, phase='blocked', consecutive_failures=failures,
@@ -410,6 +445,7 @@ class Controller:
                 self.store.archive(state, execution)
                 cleared = {key: value for key, value in state.items() if key != 'error'}
                 state, version = self.save(cleared, version, phase='idle', consecutive_failures=0, quota_parks=0,
+                    auth_reconnects=0,
                     last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                 continue
             raise ControllerError('unknown_controller_state')
@@ -432,7 +468,8 @@ class Controller:
         require(state is not None, 'controller_config_changed')
         # A quota park is idle, not stopped. Reset clears it so the next tick
         # can launch; any other idle slot is still slot_not_stopped.
-        parked = state.get('phase') == 'idle' and state.get('error') == 'provider_quota_exhausted'
+        parked = state.get('phase') == 'idle' and state.get('error') in (
+            'provider_quota_exhausted', AUTH_RECONNECT_ERROR)
         require(state.get('phase') in self.STOPPED or parked, 'slot_not_stopped')
         # Same re-key rule as tick. Intent phases are in STOPPED but are not
         # idle or blocked, so a template change while a launch is in flight
@@ -444,9 +481,10 @@ class Controller:
         # An operator reset grants a fresh failure budget and a fresh quota
         # park count. next_launch_at is removed only for a quota park; a
         # blocked slot keeps the launch interval.
-        drop = {'error', 'next_launch_at'} if parked else {'error'}
+        drop_launch = parked or state_error == 'claude_auth_still_revoked'
+        drop = {'error', 'next_launch_at'} if drop_launch else {'error'}
         cleared = {key: value for key, value in state.items() if key not in drop}
         state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'],
-                                    consecutive_failures=0, quota_parks=0)
+                                    consecutive_failures=0, quota_parks=0, auth_reconnects=0)
         cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
         return {'status': 'idle', 'cleared': cleared_code, 'from_phase': phase, 'generation': state['generation']}

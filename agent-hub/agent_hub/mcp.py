@@ -55,9 +55,9 @@ TOOLS = (
         "type": "object", "properties": {"workspace": {"type": "string"}, "cursor": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, "required": ["workspace"],
     }),
-    ("hub_learn", "Record a lesson or independent review using an exact quote from an existing completed agent message; or retire a lesson. This does not train model weights or deploy code.", {
+    ("hub_learn", "Record a lesson or independent review using an exact quote from an existing completed agent message; retire a lesson; or reconnect shared memory after a brief account revocation. This does not train model weights or deploy code.", {
         "type": "object", "properties": {
-            "operation": {"type": "string", "enum": ["propose", "review", "retire", "archive"]},
+            "operation": {"type": "string", "enum": ["propose", "review", "retire", "archive", "reconnect"]},
             "room_id": {"type": "string"}, "source_message": {"type": "integer", "minimum": 0, "maximum": 23},
             "text": {"type": "string"}, "kind": {"type": "string", "enum": ["practice", "project_fact", "failure"]},
             "lesson_id": {"type": "string"}, "verdict": {"type": "string", "enum": ["support", "reject"]},

@@ -762,6 +762,66 @@ class FleetReviewTests(unittest.TestCase):
                 self.assertNotIn('error', store.state)
                 self.assertEqual(cloud.run_count, 1)
 
+    def test_brief_claude_revocation_reconnects_without_a_strike(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        self.park_quota(cloud, broker, code=76)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'claude_auth_reconnecting')
+        self.assertEqual(result['auth_reconnects'], 1)
+        self.assertEqual(result['next_launch_at'], 1000 + 60)
+        self.assertEqual(store.state['consecutive_failures'], 2)
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertEqual(store.state['error'], 'claude_auth_revoked')
+        self.assertEqual(cloud.run_count, 1)
+        again = controller.tick()
+        self.assertEqual(again['status'], 'claude_auth_reconnecting')
+        self.assertEqual(cloud.run_count, 1)
+        # The account is back: the short park ends and the slot launches.
+        controller.clock = lambda: 1000 + 60
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:02:00Z',
+            reconciling=False, runningCount=0, succeededCount=1, failedCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.tick()
+        self.assertEqual(store.state['auth_reconnects'], 0)
+        self.assertEqual(store.state['consecutive_failures'], 0)
+        self.assertNotIn('error', store.state)
+
+    def test_claude_revocation_with_unreleased_credential_blocks(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker, code=76)
+        broker.state.update(phase='leased')
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(store.state.get('auth_reconnects', 0), 0)
+
+    def test_repeated_claude_revocation_stops_after_the_reconnect_budget(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        clock = 1000
+        for count in range(1, 9):
+            controller.clock = lambda now=clock: now
+            if count > 1:
+                self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+            self.park_quota(cloud, broker, code=76)
+            result = controller.tick()
+            self.assertEqual(result['status'], 'claude_auth_reconnecting')
+            self.assertEqual(result['auth_reconnects'], count)
+            clock = result['next_launch_at']
+        controller.clock = lambda now=clock: now
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.park_quota(cloud, broker, code=76)
+        blocked = controller.tick()
+        self.assertEqual(blocked['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'claude_auth_still_revoked')
+        self.assertEqual(store.state['auth_reconnects'], 9)
+        cleared = controller.reset()
+        self.assertEqual(cleared['status'], 'idle')
+        self.assertEqual(cleared['cleared'], 'claude_auth_still_revoked')
+        self.assertEqual(store.state['auth_reconnects'], 0)
+        self.assertNotIn('next_launch_at', store.state)
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+
     def test_reset_on_a_parked_slot_clears_the_park(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
         self.park_quota(cloud, broker)
