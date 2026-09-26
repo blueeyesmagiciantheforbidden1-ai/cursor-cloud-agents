@@ -51,3 +51,17 @@ Cursor was re-certified on the three hosts that hold no cloud credentials. Retin
 | light-cursor | True | 2026-09-26T00:20:15Z | e07cb4cf5608ac6a… | 2026-10-10T00:20:15Z |
 
 The three fingerprints differ. The earlier dumpling/retina hostname collision can no longer merge registry rows, because the registry now withdraws a certification when a known fingerprint changes.
+
+## Codex certification (2026-09-26, harness 6b10ae69…, codex-cli 0.153.4)
+
+Codex's Windows sandbox runs only inside an interactive desktop session. From SSH, a service, or an agent's session 0 it fails with `timed out ... connecting runner pipe-in` or `CryptUnprotectData failed`. A scheduled task `CodexDesktopRunner` (logon type Interactive: it runs only while the user is logged on and stores no password) runs `C:\codex-runner\codex_job.py` inside the logged-on session. It accepts only two fixed job types: `cert` (this harness) and `task` (`codex exec --sandbox workspace-write` in a workspace under `C:\cursor-tasks\` or `C:\runner-cert\work\`). The sandbox is never bypassed. Accounts: Retina and Demand use the blueeyes ChatGPT account; the user signed each host in by device code.
+
+| runner_id | certified | agent s |
+| --- | --- | --- |
+| dumpling-codex | **yes** | 42.1 |
+| retina-codex | **yes** | 73.4 |
+| light-codex | **yes** | 77.1 |
+| demand-codex | **yes** | 104.4 |
+| alpha-codex | no | 27.2: `CryptUnprotectData failed` even in the desktop session. The sandbox secrets in `~/.codex/.sandbox-secrets` date from 2026-05-18 and look stale, so they need re-provisioning (the user's decision) |
+
+Finding: retina's MachineGuid fingerprint (4cbad7fc…) equals demand's, although they are different machines. The images were probably cloned, so MachineGuid is not unique across this fleet either, and the runner_id must stay the identity key.
