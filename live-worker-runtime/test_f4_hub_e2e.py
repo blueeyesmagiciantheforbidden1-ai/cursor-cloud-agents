@@ -247,7 +247,7 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertEqual(audit2['last_phase'], 'model_call')
 
     def test_3_dies_during_execute_write_manual(self):
-        """EXPECTED (write room, manual recovery; auto not used at write risk here):
+        """EXPECTED (write room, manual recovery):
         After lease expiry: needs_reconciliation; never auto-retried (no retry_scheduled,
         recovery_audit empty because recovery is manual).
         """
@@ -261,6 +261,21 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertEqual(seen.get('recovery_audit'), [])
         self.assertNotEqual(seen['status'], 'retry_scheduled')
         self.assertEqual(seen['attempt_records'][-1].get('last_phase'), 'model_call')
+
+    def test_3b_dies_during_execute_write_auto_reconciles(self):
+        """EXPECTED (write room, recovery auto: the hub allows auto up to risk 1):
+        a loss after the acknowledged model_call beat may have left side effects,
+        so the policy reconciles (rule write_side_effects) and never retries.
+        """
+        room = self.create_room(workspace_mode='write', recovery='auto')
+        result, adapter = self.run_worker(die_at='execute')
+        self.assertIn('execute', adapter.calls)
+        self.assertTrue(result.get('model_call_attempted'))
+        seen = self.expire(room['id'])
+        self.assertEqual(seen['status'], 'needs_reconciliation')
+        audit = seen['recovery_audit'][-1]
+        self.assertEqual((audit['rule'], audit['decision'], audit['last_phase']),
+                         ('write_side_effects', 'reconcile', 'model_call'))
 
     def test_4_model_call_beat_lands_transport_error_skips_execute(self):
         """EXPECTED (confirming model_call beat reaches hub; worker sees transport error):
