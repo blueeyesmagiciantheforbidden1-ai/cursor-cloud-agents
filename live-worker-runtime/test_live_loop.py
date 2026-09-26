@@ -788,6 +788,45 @@ class LoopTests(unittest.TestCase):
         text = task_prompt(client.task, client.room, 'grok')
         for m in messages: self.assertIn(m['text'], text)
 
+    def test_failure_messages_are_not_previous_contributions(self):
+        """Prompt gets successes only; hub-facing claim/complete still see the full list."""
+        worker, client, adapter, _ = self.setup_worker()
+        success_a = {'agent': 'codex', 'text': 'first success', 'exit_code': 0}
+        failure = {'agent': 'claude', 'text': 'failed turn', 'exit_code': 1}
+        success_b = {'agent': 'cursor', 'text': 'second success', 'exit_code': 0}
+        messages = [success_a, failure, success_b]
+        client.task['messages'] = client.room['messages'] = messages
+        text = task_prompt(client.task, client.room, 'grok')
+        context = json.loads(text.split('\n\n', 1)[1])
+        self.assertEqual(context['previous_agent_contributions'], [success_a, success_b])
+        self.assertNotIn('failed turn', text)
+        # Worker must not recompute hub hashes from the filtered list: messages
+        # on the task/room stay full, and completion still echoes the claimed step.
+        self.assertEqual(client.task['messages'], messages)
+        self.assertEqual(client.room['messages'], messages)
+        client.task['step'] = client.room['step'] = 4
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(client.completions[0]['step'], 4)
+        self.assertEqual(adapter.calls.count('execute'), 1)
+
+    def test_failure_messages_do_not_count_toward_history_limit(self):
+        """30 stored messages with 10 failures → 20 contributions; no history_invalid."""
+        worker, client, _, _ = self.setup_worker()
+        messages = []
+        for i in range(30):
+            exit_code = 1 if i % 3 == 0 else 0  # 10 failures, 20 successes
+            messages.append({'agent': 'codex', 'text': 'msg-%d' % i, 'exit_code': exit_code})
+        self.assertEqual(sum(1 for m in messages if m['exit_code'] != 0), 10)
+        self.assertEqual(sum(1 for m in messages if m['exit_code'] == 0), 20)
+        client.task['messages'] = client.room['messages'] = messages
+        text = task_prompt(client.task, client.room, 'grok')
+        context = json.loads(text.split('\n\n', 1)[1])
+        self.assertEqual(len(context['previous_agent_contributions']), 20)
+        self.assertEqual([m['text'] for m in context['previous_agent_contributions']],
+                         [m['text'] for m in messages if m['exit_code'] == 0])
+        self.assertEqual(client.task['messages'], messages)
+
     def test_claim_sends_worker_id_and_completion_echoes_step(self):
         # MyHero MH-005: the hub records which execution held the attempt.
         worker, client, _, _ = self.setup_worker()
@@ -1817,9 +1856,11 @@ class HeartbeatPhaseTests(unittest.TestCase):
     def test_inactive_model_call_heartbeat_skips_execute(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post
+        model_call_beats = {'n': 0}
 
         def post(path, value):
             if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
                 client.calls.append((path, copy.deepcopy(value)))
                 return {'active': False, 'deadline': client.task['deadline'], 'server_time': 700}
             return original(path, value)
@@ -1834,13 +1875,40 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
         self.assertEqual(client.completions, [])
         self.assertIs(result['model_call_attempted'], False)
+        # active:false is a definite answer — do not retry the beat.
+        self.assertEqual(model_call_beats['n'], 1)
 
-    def test_model_call_heartbeat_transport_error_skips_execute(self):
+    def test_model_call_heartbeat_transport_error_then_success_runs_execute(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post
+        model_call_beats = {'n': 0}
 
         def post(path, value):
             if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                if model_call_beats['n'] == 1:
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise OSError('network')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertIs(result['model_call_attempted'], True)
+        self.assertGreaterEqual(model_call_beats['n'], 2)
+        self.assertEqual(worker.phase, 'finishing')
+
+    def test_model_call_heartbeat_two_transport_errors_skips_execute(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+        model_call_beats = {'n': 0}
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
                 client.calls.append((path, copy.deepcopy(value)))
                 raise OSError('network')
             return original(path, value)
@@ -1852,17 +1920,45 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertNotIn('execute', adapter.calls)
         self.assertIs(result['model_call_attempted'], False)
         self.assertNotEqual(result.get('outcome'), 'completed')
+        self.assertEqual(model_call_beats['n'], 2)
         # What the hub receives decides pre_model vs post_model (Demand review).
         self.assertEqual(len(client.completions), 1)
         self.assertIs(client.completions[0]['model_call_attempted'], False)
         self.assertEqual(client.completions[0]['error_code'], 'native_or_connection_failure')
 
-    def test_malformed_model_call_heartbeat_answer_skips_execute(self):
+    def test_model_call_heartbeat_retry_after_lost_ack(self):
+        """First beat landed at the hub; ack was lost; retry gets active:true once."""
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post
+        model_call_beats = {'n': 0}
 
         def post(path, value):
             if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                if model_call_beats['n'] == 1:
+                    # Land the beat, then fail the worker's transport (lost ack).
+                    original(path, value)
+                    raise OSError('simulated transport loss after hub accepted model_call')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertIs(result['model_call_attempted'], True)
+        # Loop beat + retry before execute; further beats may come from execute/close.
+        self.assertGreaterEqual(model_call_beats['n'], 2)
+
+    def test_malformed_model_call_heartbeat_answer_skips_execute(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+        model_call_beats = {'n': 0}
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
                 client.calls.append((path, copy.deepcopy(value)))
                 return ['not', 'an', 'object']
             return original(path, value)
@@ -1875,6 +1971,8 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertIs(result['model_call_attempted'], False)
         self.assertEqual(len(client.completions), 1)
         self.assertIs(client.completions[0]['model_call_attempted'], False)
+        # Malformed answer is not a transport error — do not retry.
+        self.assertEqual(model_call_beats['n'], 1)
 
     def test_worker_stopping_before_phase_flip_stays_setup(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
@@ -1921,15 +2019,15 @@ class HeartbeatPhaseTests(unittest.TestCase):
         import threading
         from http.server import ThreadingHTTPServer
         from urllib.request import Request, urlopen
+        import agent_hub
         import agent_hub.core as agent_hub_core
         from agent_hub.core import AGENTS, Hub
-        try:
-            from agent_hub.server import load_tokens, make_handler
-        except ImportError:
-            # Worker images ship agent_hub/ without server.py, and their
-            # Dockerfile runs this module: skip there, never fail the build.
-            # The dev layout (vendored ../agent-hub) always has it.
-            self.skipTest('agent_hub.server is not shipped in the worker image')
+        # Skip only when server.py is absent (worker image). If the file exists
+        # but the import is broken, this test must ERROR — not skip silently.
+        server_path = Path(agent_hub.__file__).resolve().parent / 'server.py'
+        if not server_path.is_file():
+            self.skipTest('agent_hub/server.py is not shipped in the worker image')
+        from agent_hub.server import load_tokens, make_handler
         from agent_hub.store import SQLiteStore
         # Pin: this vendored hub is pre-F4. If it gains heartbeat_phase, this
         # test would silently stop proving old-hub compatibility.

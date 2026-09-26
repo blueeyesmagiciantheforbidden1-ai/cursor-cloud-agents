@@ -209,14 +209,25 @@ def task_prompt(task, room, agent):
     prompt = task.get('prompt')
     require(isinstance(prompt, str) and 0 < len(prompt.encode()) <= 8000, 'prompt_invalid')
     messages = task.get('messages')
-    require(isinstance(messages, list) and len(messages) <= 24, 'history_invalid')
-    for item in messages:
+    require(isinstance(messages, list), 'history_invalid')
+    # Defence in depth: failure messages are not previous contributions. Legacy
+    # hub rooms (and rooms written by an old hub after a rollback) can store
+    # exit_code != 0 entries; those stay on the claimed/full list the hub hashes
+    # (input_sha256 / predecessor_count) and this worker echoes, but must not
+    # reach the model. Filter is prompt-only — task['messages'] is not mutated.
+    contributions = [item for item in messages
+                     if not (isinstance(item, dict) and 'exit_code' in item
+                             and item['exit_code'] != 0)]
+    # The 24-entry history_invalid guard and the byte budget below count only
+    # the entries actually sent to the model.
+    require(len(contributions) <= 24, 'history_invalid')
+    for item in contributions:
         require(isinstance(item, dict) and item.get('agent') in ('grok', 'codex', 'copilot', 'claude', 'cursor')
                 and isinstance(item.get('text'), str) and type(item.get('exit_code')) is int,
                 'history_invalid')
     # JSON preserves boundaries. Previous model output is context, never a new
     # administrator instruction or permission to execute tools.
-    context = {'user_request': prompt, 'previous_agent_contributions': messages,
+    context = {'user_request': prompt, 'previous_agent_contributions': contributions,
                'learning_context': task.get('learning_context', {})}
     repair = _repair_errors(task)
     retry_note = ''
@@ -810,8 +821,27 @@ class Worker:
                 # Loop-level guarantee: one acknowledged model_call heartbeat
                 # before adapter.execute. Adapters used to do this privately;
                 # without it a worker lost mid-call could still look like setup.
-                receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
-                                           self._heartbeat_body(self.task))
+                # Exactly one transport retry (short sleep inside the task
+                # deadline). active:false and malformed answers are not retried.
+                # phase stays 'model_call' across the retry and never goes back
+                # to setup. model_call_attempted flips only after active:true.
+                receipt = None
+                for beat_attempt in range(2):
+                    try:
+                        receipt = self.client.post(
+                            '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                            self._heartbeat_body(self.task))
+                    except Exception as error:
+                        if beat_attempt == 0 and idle_fault(error) == 'retry':
+                            delay = 1
+                            # Same floor as checked_deadline: keep completion_reserve
+                            # and at least 5s after the wait.
+                            require(self.clock() + delay + 5 < deadline,
+                                    'task_deadline_insufficient')
+                            self.sleep(delay)
+                            continue
+                        raise
+                    break
                 if isinstance(receipt, dict) and receipt.get('active') is False:
                     self.lease_revoked = True
                 # Same path as checked_deadline: task_lease_lost; lease_revoked
