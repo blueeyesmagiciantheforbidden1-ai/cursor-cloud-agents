@@ -215,6 +215,8 @@ def task_prompt(task, room, agent):
     # exit_code != 0 entries; those stay on the claimed/full list the hub hashes
     # (input_sha256 / predecessor_count) and this worker echoes, but must not
     # reach the model. Filter is prompt-only — task['messages'] is not mutated.
+    # A legacy entry whose exit_code is present but not 0 (including a non-int
+    # value) is dropped here rather than failing the task as history_invalid.
     contributions = [item for item in messages
                      if not (isinstance(item, dict) and 'exit_code' in item
                              and item['exit_code'] != 0)]
@@ -834,8 +836,9 @@ class Worker:
                     except Exception as error:
                         if beat_attempt == 0 and idle_fault(error) == 'retry':
                             delay = 1
-                            # Same floor as checked_deadline: keep completion_reserve
-                            # and at least 5s after the wait.
+                            # deadline comes from checked_deadline, which already
+                            # subtracted completion_reserve; keep at least 5 s more
+                            # after the wait, the same floor it enforces.
                             require(self.clock() + delay + 5 < deadline,
                                     'task_deadline_insufficient')
                             self.sleep(delay)
