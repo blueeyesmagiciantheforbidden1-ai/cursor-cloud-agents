@@ -5,6 +5,7 @@ from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import json
+import os
 import sys
 import threading
 import time
@@ -36,7 +37,13 @@ def _load_hub_validate_document():
     global HUB_VALIDATE_SOURCE
     import importlib.util
     import types
-    runcrew_ah = Path(__file__).resolve().parents[2] / 'runcrew' / 'agent_hub'
+    # Same convention as test_workspace_runner: RUNCREW_AGENT_HUB is runcrew's
+    # source/agent-hub; a sibling runcrew/ is the offline tarball layout.
+    roots = [os.environ.get('RUNCREW_AGENT_HUB'), Path(__file__).resolve().parents[2] / 'runcrew']
+    runcrew_ah = next((Path(r) / 'agent_hub' for r in roots
+                       if r and (Path(r) / 'agent_hub' / 'fleet_readiness.py').is_file()), None)
+    if runcrew_ah is None:
+        return None
     pkg_name = '_t65_runcrew_agent_hub'
     if pkg_name not in sys.modules:
         pkg = types.ModuleType(pkg_name)
@@ -521,6 +528,8 @@ class PublisherBehaviourTests(unittest.TestCase):
         self.assertEqual(result['grok']['status'], 'ok')
 
 
+@unittest.skipIf(hub_validate_document is None,
+                 'runcrew agent_hub not found: set RUNCREW_AGENT_HUB to runcrew source/agent-hub')
 class RealHttpPublishTests(unittest.TestCase):
     """End-to-end POST against a real local HTTP server (no fake post)."""
 
