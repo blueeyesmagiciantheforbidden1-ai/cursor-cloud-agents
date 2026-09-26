@@ -807,6 +807,19 @@ class Worker:
                 # Before execute, so no heartbeat can still say "setup" once
                 # the model call may have started.
                 self.phase = 'model_call'
+                # Loop-level guarantee: one acknowledged model_call heartbeat
+                # before adapter.execute. Adapters used to do this privately;
+                # without it a worker lost mid-call could still look like setup.
+                receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                                           self._heartbeat_body(self.task))
+                if isinstance(receipt, dict) and receipt.get('active') is False:
+                    self.lease_revoked = True
+                # Same path as checked_deadline: task_lease_lost; lease_revoked
+                # skips completion. model_call_attempted is False here — the hub
+                # never confirmed model_call (or revoked the lease) and execute
+                # was never entered. Transport errors from post raise before the
+                # flag flips for the same reason.
+                require(receipt.get('active') is True, 'task_lease_lost')
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:

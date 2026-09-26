@@ -1760,7 +1760,8 @@ class HeartbeatPhaseTests(unittest.TestCase):
     def test_phase_sequence_of_a_completed_task(self):
         result, phases, client = self.run_worker()
         self.assertEqual(result['outcome'], 'completed')
-        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'finishing'])
+        # setup (deadline) + loop model_call before execute + two in execute + finishing.
+        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'model_call', 'finishing'])
         paths = [path for path, _ in client.calls]
         last_beat = max(i for i, path in enumerate(paths) if path.endswith('/heartbeat'))
         self.assertLess(last_beat, paths.index('/v1/tasks/' + ROOM + '/complete'))
@@ -1774,7 +1775,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
     def test_failed_model_call_stays_model_call(self):
         result, phases, client = self.run_worker(fail_execute=True)
         self.assertEqual(result['error_code'], 'grok_turn_failed')
-        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'model_call'])
+        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'model_call', 'model_call'])
         self.assertIs(client.completions[0]['model_call_attempted'], True)
 
     def test_no_phase_and_no_task_heartbeat_before_a_claim(self):
@@ -1784,6 +1785,105 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertIsNone(worker.phase)
         self.assertEqual(worker.run()['outcome'], 'idle_drained')
         self.assertEqual([path for path, _ in client.calls if path.endswith('/heartbeat')], [])
+
+    def test_loop_model_call_heartbeat_precedes_execute(self):
+        """The loop acknowledges model_call before adapter.execute is entered."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        order = []
+        original = client.post
+
+        def post(path, value):
+            receipt = original(path, value)
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                if receipt.get('active') is True:
+                    order.append('heartbeat(model_call) acknowledged')
+            return receipt
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            order.append('execute entered')
+            adapter.calls.append('execute')
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        client.post = post
+        adapter.execute = execute
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        self.assertEqual(worker.run()['outcome'], 'completed')
+        self.assertIn('heartbeat(model_call) acknowledged', order)
+        self.assertIn('execute entered', order)
+        self.assertLess(order.index('heartbeat(model_call) acknowledged'),
+                        order.index('execute entered'))
+
+    def test_inactive_model_call_heartbeat_skips_execute(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                client.calls.append((path, copy.deepcopy(value)))
+                return {'active': False, 'deadline': client.task['deadline'], 'server_time': 700}
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertEqual(result['error_code'], 'task_lease_lost')
+        self.assertTrue(worker.lease_revoked)
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertEqual(client.completions, [])
+        self.assertIs(result['model_call_attempted'], False)
+
+    def test_model_call_heartbeat_transport_error_skips_execute(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                client.calls.append((path, copy.deepcopy(value)))
+                raise OSError('network')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertNotEqual(result.get('outcome'), 'completed')
+
+    def test_worker_stopping_before_phase_flip_stays_setup(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        beat = {}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare'); beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        def close(handle):
+            adapter.calls.append('close')
+            if 'fn' in beat:
+                beat['fn']()
+
+        adapter.prepare, adapter.close = prepare, close
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+
+        def get_room(room):
+            worker.stopping = True
+            return copy.deepcopy(client.room)
+
+        client.get_room = get_room
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'worker_stopping')
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertNotIn('execute', adapter.calls)
+        beats = [value for path, value in client.calls if path.endswith('/heartbeat')]
+        phases = [value['phase'] for value in beats]
+        self.assertTrue(phases)
+        self.assertTrue(all(phase == 'setup' for phase in phases))
+        self.assertNotIn('model_call', phases)
 
     def test_older_hub_ignores_the_phase_key(self):
         """A hub from before F4 cannot answer 400 to "phase".
@@ -1798,9 +1898,13 @@ class HeartbeatPhaseTests(unittest.TestCase):
         import threading
         from http.server import ThreadingHTTPServer
         from urllib.request import Request, urlopen
+        import agent_hub.core as agent_hub_core
         from agent_hub.core import AGENTS, Hub
         from agent_hub.server import load_tokens, make_handler
         from agent_hub.store import SQLiteStore
+        # Pin: this vendored hub is pre-F4. If it gains heartbeat_phase, this
+        # test would silently stop proving old-hub compatibility.
+        self.assertFalse(hasattr(agent_hub_core, 'heartbeat_phase'))
         _, phases, _ = self.run_worker()
         with tempfile.TemporaryDirectory() as root:
             hub = Hub(SQLiteStore(Path(root) / 'hub.sqlite3'))
