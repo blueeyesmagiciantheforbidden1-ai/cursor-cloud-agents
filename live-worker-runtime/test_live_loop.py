@@ -2060,6 +2060,86 @@ class HeartbeatPhaseTests(unittest.TestCase):
                     self.assertEqual(len(client.completions), 1)
                     self.assertIs(client.completions[0]['model_call_attempted'], False)
 
+    def test_metadata_identity_409_does_not_revoke_task_lease(self):
+        """Identity-path HTTP 409 is not LeaseLost; failure still completes."""
+        import io
+        import uuid
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+        from agent_hub.core import Hub
+        from agent_hub.store import SQLiteStore
+        from agent_hub.worker import Config, HubClient
+
+        class Response(io.BytesIO):
+            headers = {'Metadata-Flavor': 'Google'}
+
+        clock = Clock()
+        scratch = Path(__file__).resolve().parents[1] / 'scratch'
+        scratch.mkdir(exist_ok=True)
+        hub = Hub(SQLiteStore(scratch / ('test-meta409-' + uuid.uuid4().hex + '.sqlite3')),
+                  clock=lambda: 700 + clock() - 100)
+        hub.create('manager', {'prompt': 'Identity conflict must still complete', 'agents': ['grok']})
+        fake = Client(clock)
+        fake.task.update(deadline=700 + 275 + 25, timeout_seconds=275 + 25)
+        record = fake.post
+
+        def hub_post(path, value):
+            record(path, value)
+            if path.endswith('/claim'):
+                return hub.claim('grok')
+            if path.endswith('/heartbeat'):
+                return hub.heartbeat('grok', path.split('/')[3], value['lease_token'])
+            if path.endswith('/complete'):
+                return hub.complete('grok', path.split('/')[3], value)
+            return {'accepted': True}
+
+        fake.post = hub_post
+        fake.get_room = lambda room_id: hub.get('grok', room_id)
+        config = Config('https://hub.example', 'grok', 'fake', 'FAKE', {},
+                        cloud_run_auth_mode='metadata')
+        client = HubClient(config)
+        client.get_room = fake.get_room
+        identity = {'conflict': False}
+
+        class Metadata:
+            def open(self, request, timeout):
+                if identity['conflict']:
+                    identity['conflict'] = False
+                    raise HTTPError(request.full_url, 409, 'unrelated metadata conflict', {}, None)
+                return Response(b'fake-identity')
+
+        class Opener:
+            def open(self, request, timeout):
+                path = request.full_url.removeprefix(config.hub_url)
+                value = json.loads(request.data)
+                result = fake.post(path, value)
+                return Response(json.dumps(result).encode())
+
+        client.opener = Opener()
+        original_post = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and value.get('phase') == 'model_call':
+                client.identity_token = None
+                identity['conflict'] = True
+            return original_post(path, value)
+
+        client.post = post
+        adapter = Adapter()
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        with patch('agent_hub.worker.build_opener', return_value=Metadata()):
+            result = worker.run()
+        self.assertFalse(worker.lease_revoked)
+        self.assertNotEqual(result.get('completion_delivery'), 'skipped_lease_revoked')
+        self.assertEqual(len(fake.completions), 1)
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertEqual(result['error_code'], 'native_or_connection_failure')
+        room = hub.get('grok', worker.task['room_id'])
+        self.assertEqual(room['status'], 'failed')
+        self.assertGreater(len(room['messages']), 0)
+
     def test_model_call_heartbeat_connection_error_retries_once(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post
@@ -2080,6 +2160,35 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(result['outcome'], 'completed')
         self.assertEqual(adapter.calls.count('execute'), 1)
         self.assertEqual(model_call_beats['n'], 2)
+        self.assertIs(result['model_call_attempted'], True)
+
+    def test_model_call_heartbeat_wrapped_timeout_retries_once(self):
+        """WorkerError wrapping TimeoutError is transport — one sleep, then success."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+        model_call_beats = {'n': 0}
+        sleeps = []
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                if model_call_beats['n'] == 1:
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise self._hub_shaped_error('timeout')
+            return original(path, value)
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.sleep(seconds)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(model_call_beats['n'], 2)
+        self.assertEqual(sleeps, [1])
         self.assertIs(result['model_call_attempted'], True)
 
     def test_model_call_heartbeat_http_5xx_retries_once(self):
@@ -2134,6 +2243,39 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(model_call_beats['n'], 1)
         self.assertEqual(sleeps, [])
         self.assertEqual(result['error_code'], 'task_deadline_insufficient')
+
+    def test_model_call_heartbeat_post_sleep_guard_rejects_oversleep(self):
+        """First guard passes; scheduler oversleep fails the post-sleep re-check."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        # remaining = 35 → now+1+10+5=116 < 135 passes; after sleep+oversleep
+        # clock=126 and 126+10+5=141 is not < 135.
+        client.task['deadline'] = 700 + 60
+        client.task['timeout_seconds'] = 60
+        original = client.post
+        model_call_beats = {'n': 0}
+        sleeps = []
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                client.calls.append((path, copy.deepcopy(value)))
+                raise self._hub_shaped_error('timeout')
+            return original(path, value)
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.sleep(seconds + 25)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertEqual(model_call_beats['n'], 1)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(result['error_code'], 'task_deadline_insufficient')
+        self.assertEqual(len(client.completions), 1)
 
     def test_model_call_heartbeat_ack_too_late_skips_execute(self):
         """After active:true, fewer than 5 s to deadline → no execute, flag stays false."""

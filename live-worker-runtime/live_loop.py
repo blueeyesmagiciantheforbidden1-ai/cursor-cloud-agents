@@ -16,6 +16,8 @@ import re
 import time
 from urllib.error import HTTPError, URLError
 
+from agent_hub.worker import LeaseLost
+
 import provider_errors
 import usage_report
 
@@ -871,9 +873,10 @@ class Worker:
                             '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                             self._heartbeat_body(self.task))
                     except Exception as error:
-                        # HTTP 409 (LeaseLost): definitive lease loss — no retry,
-                        # skip completion attempts against the dead lease.
-                        if _http_status(error) == 409:
+                        # LeaseLost is HubClient's typed signal for a task-
+                        # endpoint 409. Do not infer lease loss from HTTP 409
+                        # in an arbitrary cause (e.g. metadata identity refresh).
+                        if isinstance(error, LeaseLost):
                             self.lease_revoked = True
                             raise LiveError('task_lease_lost') from error
                         if beat_attempt == 0 and is_task_heartbeat_transport_error(error):
