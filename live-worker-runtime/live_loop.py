@@ -819,6 +819,10 @@ class Worker:
                 # never confirmed model_call (or revoked the lease) and execute
                 # was never entered. Transport errors from post raise before the
                 # flag flips for the same reason.
+                # If this fails, phase stays 'model_call' on purpose: the beat
+                # may have landed, and phase never moves backwards. Later beats
+                # then read as a model_call loss (read-only retry once, write
+                # room reconcile), the safe side. Do not "fix" it by resetting.
                 # A malformed (non-object) answer is not a confirmation either.
                 require(isinstance(receipt, dict) and receipt.get('active') is True, 'task_lease_lost')
                 self.model_call_attempted = True

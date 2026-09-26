@@ -1852,6 +1852,10 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertNotIn('execute', adapter.calls)
         self.assertIs(result['model_call_attempted'], False)
         self.assertNotEqual(result.get('outcome'), 'completed')
+        # What the hub receives decides pre_model vs post_model (Demand review).
+        self.assertEqual(len(client.completions), 1)
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+        self.assertEqual(client.completions[0]['error_code'], 'native_or_connection_failure')
 
     def test_malformed_model_call_heartbeat_answer_skips_execute(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
@@ -1869,6 +1873,8 @@ class HeartbeatPhaseTests(unittest.TestCase):
         result = worker.run()
         self.assertNotIn('execute', adapter.calls)
         self.assertIs(result['model_call_attempted'], False)
+        self.assertEqual(len(client.completions), 1)
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
 
     def test_worker_stopping_before_phase_flip_stays_setup(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
