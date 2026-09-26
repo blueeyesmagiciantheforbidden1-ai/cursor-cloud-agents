@@ -39,3 +39,15 @@ Harness `5fc48914…` is a4d805d. Harness `efedec52…` is 5d92e8b (the grok ada
 - Grok: `grok login --device-code` on dumpling/demand/retina, then rerun `--adapter grok`. The user needs to do this. The adapter is now pinned to grok 1.0.24 (Light's review), so demand's 1.0.13 needs `grok update` first. Until then it reports `cli_flags_unverified` and is never run.
 - Copilot: install the CLI and check its flags with `--help`, then write an adapter.
 - Cursor on Alpha: `cursor-agent login`, then rerun.
+
+## Re-certification with machine fingerprints (2026-09-26, harness 6b10ae69…, cursor-cloud-agents 25efbe1)
+
+Cursor was re-certified on the three hosts that hold no cloud credentials. Retina was skipped at its session's request: it holds the runcrew deploy gcloud configs, and Cursor runs unsandboxed. Each row below is the `--export` object the hub accepts (runcrew `tests/test_myhero_cert_interop.py` pins these exact exports).
+
+| runner_id | certified | finished_at | machine fingerprint | expires_at |
+| --- | --- | --- | --- | --- |
+| dumpling-cursor | True | 2026-09-26T00:20:05Z | bec9b0d5b33164cd… | 2026-10-10T00:20:05Z |
+| demand-cursor | True | 2026-09-26T00:20:36Z | 4cbad7fc1ffb1766… | 2026-10-10T00:20:36Z |
+| light-cursor | True | 2026-09-26T00:20:15Z | e07cb4cf5608ac6a… | 2026-10-10T00:20:15Z |
+
+The three fingerprints differ. The earlier dumpling/retina hostname collision can no longer merge registry rows, because the registry now withdraws a certification when a known fingerprint changes.
