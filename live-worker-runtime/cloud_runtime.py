@@ -14,6 +14,7 @@ from agent_hub.cloud_credential_broker import (DATABASE, GoogleREST, CloudCreden
                                               MutationUncertain, Conflict, BrokerError)
 from dynamic_broker import parse_config
 from fleet_controller import Controller, ControllerError, SAFE_CODE, digest
+from fleet_readiness_publisher import FleetReadinessPublisher, publish_after_tick
 
 
 class Google:
@@ -126,6 +127,8 @@ class Runtime:
             self.controllers.append(Controller(policy, config['slots'][policy.profile.provider],
                 StateStore(policy, google), google, CloudCredentialBroker(policy.profile)))
         self.lock = threading.Lock()
+        # Off by default (RUNCREW_FLEET_READINESS_PUBLISH); one POST per fleet tick.
+        self.readiness_publisher = FleetReadinessPublisher.from_env()
 
     def tick(self):
         if not self.lock.acquire(blocking=False): return {'status': 'tick_in_progress'}
@@ -152,6 +155,10 @@ class Runtime:
                     # No raw exception, execution environment, grant, token or
                     # provider credential is ever returned or logged.
                     result[name] = {'status': 'controller_attention_required', 'exception': type(error).__name__}
+            try:
+                publish_after_tick(self.controllers, self.readiness_publisher)
+            except Exception:
+                pass
             print(json.dumps({'kind': 'runcrew_fleet_tick', 'workers': result}), flush=True)
             return result
         finally:

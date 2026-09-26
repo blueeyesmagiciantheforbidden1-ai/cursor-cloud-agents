@@ -1,18 +1,21 @@
 """Best-effort advisory fleet readiness POST to the hub (C2, controller side).
 
-Posts POST /v1/fleet/readiness. Off by default. Never reads runcrew_fleet_state;
-the controller supplies slot snapshots after a tick. Failures are counted,
-sanitized log events only and must not affect CAS, launch, or tick results.
+Posts POST /v1/fleet/readiness. Off by default. Reads each controller's
+state-store document and optional Cloud Run execution get (bounded); never
+reads the hub's runcrew_fleet_state / fleet-readiness store. Failures are
+counted, sanitized log events only and must not affect CAS, launch, or tick
+results.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from fleet_controller import SAFE_CODE, map_readiness_phase
 
@@ -21,12 +24,18 @@ READINESS_PATH = '/v1/fleet/readiness'
 SCHEMA = 1
 # Short timeout so a hung hub cannot stall the controller tick.
 POST_TIMEOUT_SECONDS = 2.5
+# Bound store.read / cloud.get under the Runtime lock so a hung backend cannot
+# stall every fleet tick; skip the publish when either call times out.
+SNAPSHOT_TIMEOUT_SECONDS = 1.0
 MAX_AGENTS = 16
 MAX_AGENT_KEY = 32
-MAX_REASON_CODE = 100
+# Mirrored from runcrew/agent_hub/fleet_readiness.py (MAX_REASON_CODE, MAX_EXECUTION_ID,
+# _REASON_CODE, _EXECUTION_ID).
+MAX_REASON_CODE = 64
 MAX_EXECUTION_ID = 64
 AGENT_KEY = re.compile(r'[a-z][a-z0-9_]{0,31}')
-EXECUTION_ID = re.compile(r'[A-Za-z0-9._:/-]{1,64}')
+REASON_CODE = re.compile(r'[a-z0-9_]{1,64}')
+EXECUTION_ID = re.compile(r'[A-Za-z0-9._:-]{1,64}')
 # Fields that must never appear in a readiness body (secrets / grants / raw state).
 FORBIDDEN_PAYLOAD_KEYS = frozenset({
     'grant', 'grant_sha256', 'token', 'password', 'secret', 'credential',
@@ -44,10 +53,19 @@ HUB_URL_FALLBACK_ENV = 'HUB_URL'
 TOKEN_ENV = 'RUNCREW_HUB_CONTROLLER_TOKEN'
 TICK_SECONDS_ENV = 'RUNCREW_TICK_SECONDS'
 DEFAULT_TICK_SECONDS = 60
+# Hub POST /v1/fleet/readiness accepts manager or fleet; the controller token's
+# principal is fleet, so X-Hub-Agent must be fleet (see runcrew/agent_hub/server.py).
+HUB_AGENT_HEADER = 'fleet'
+# Hub reason_code is required and must match REASON_CODE; use this when the
+# slot has no error (hub has no null form for reason_code on POST).
+DEFAULT_REASON_CODE = 'ok'
 
 
-class NoRedirect(object):
-    def redirect_request(self, *args, **kwargs):
+class NoRedirect(HTTPRedirectHandler):
+    # Pattern from cca/agent-hub/agent_hub/worker.py — build_opener requires an
+    # HTTPRedirectHandler subclass, not a bare object with redirect_request.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A redirect must never forward a controller credential to another host.
         return None
 
 
@@ -56,6 +74,12 @@ def ttl_for_tick_interval(tick_seconds):
     if type(tick_seconds) is not int or tick_seconds < 1:
         tick_seconds = DEFAULT_TICK_SECONDS
     return max(30, min(600, 3 * tick_seconds))
+
+
+def slot_agent_key(controller):
+    """Hub agents[] key: provider_profile so multi-profile fleets do not collide."""
+    profile = controller.policy.profile
+    return '%s_%s' % (profile.provider, profile.profile)
 
 
 def _opaque_execution_id(state, execution=None):
@@ -75,12 +99,13 @@ def _opaque_execution_id(state, execution=None):
 
 
 def _reason_code(state):
+    """Hub requires reason_code as [a-z0-9_]{1,64}; no null on POST."""
     if not isinstance(state, dict):
-        return None
+        return DEFAULT_REASON_CODE
     code = state.get('error')
-    if isinstance(code, str) and SAFE_CODE.fullmatch(code) and len(code) <= MAX_REASON_CODE:
+    if isinstance(code, str) and REASON_CODE.fullmatch(code) and len(code) <= MAX_REASON_CODE:
         return code
-    return None
+    return DEFAULT_REASON_CODE
 
 
 def agent_readiness_entry(state, execution=None, *, clock=time.time):
@@ -121,8 +146,8 @@ def build_readiness_document(agents, *, published_at, ttl_seconds):
         if type(entry['since']) is not int or entry['since'] < 0:
             raise ValueError('since_invalid')
         reason = entry['reason_code']
-        if reason is not None and not (isinstance(reason, str) and SAFE_CODE.fullmatch(reason)
-                                       and len(reason) <= MAX_REASON_CODE):
+        if not (isinstance(reason, str) and REASON_CODE.fullmatch(reason)
+                and len(reason) <= MAX_REASON_CODE):
             raise ValueError('reason_code_invalid')
         execution = entry['execution']
         if execution is not None and not (isinstance(execution, str)
@@ -191,7 +216,7 @@ def post_readiness(hub_url, token, document, *, timeout=POST_TIMEOUT_SECONDS, op
         headers={
             'Content-Type': 'application/json',
             'X-Hub-Token': token,
-            'X-Hub-Agent': 'controller',
+            'X-Hub-Agent': HUB_AGENT_HEADER,
         },
         method='POST',
     )
@@ -260,19 +285,44 @@ class FleetReadinessPublisher:
             return None
 
 
-def publish_after_tick(controllers, publisher):
+def _call_with_timeout(fn, timeout_seconds):
+    """Run fn in a daemon thread; return (value, timed_out)."""
+    box = {'value': None, 'error': None}
+
+    def run():
+        try:
+            box['value'] = fn()
+        except Exception as error:
+            box['error'] = error
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        return None, True
+    if box['error'] is not None:
+        raise box['error']
+    return box['value'], False
+
+
+def publish_after_tick(controllers, publisher, *, snapshot_timeout=SNAPSHOT_TIMEOUT_SECONDS):
     """After a multi-slot tick: one POST covering every controller. Best-effort.
 
     Intended for the fleet Runtime tick loop. Controllers are not mutated.
+    Store/cloud reads are bounded; on timeout the publish is skipped.
     """
     if publisher is None or not publisher.active():
         return None
     slot_states = {}
     executions = {}
     for controller in controllers:
-        name = controller.policy.profile.provider
+        name = slot_agent_key(controller)
         try:
-            state, _ = controller.store.read()
+            state_pair, timed_out = _call_with_timeout(controller.store.read, snapshot_timeout)
+            if timed_out:
+                _log_failure(publisher.log, 'snapshot_timeout', publisher.failures)
+                return None
+            state, _ = state_pair
         except Exception:
             state = {'phase': 'unknown', 'updated_at': int(publisher.clock())}
         if state is None:
@@ -281,7 +331,15 @@ def publish_after_tick(controllers, publisher):
         execution_name = state.get('execution') if isinstance(state, dict) else None
         if isinstance(execution_name, str) and execution_name:
             try:
-                executions[name] = controller.cloud.get(execution_name)
+                execution, timed_out = _call_with_timeout(
+                    lambda n=execution_name, c=controller: c.cloud.get(n),
+                    snapshot_timeout,
+                )
+                if timed_out:
+                    _log_failure(publisher.log, 'snapshot_timeout', publisher.failures)
+                    return None
+                if execution is not None:
+                    executions[name] = execution
             except Exception:
                 pass
     return publisher.publish_slots(slot_states, executions=executions)

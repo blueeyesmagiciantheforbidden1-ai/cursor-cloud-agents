@@ -90,7 +90,16 @@ def map_readiness_phase(slot_phase, execution=None):
     if slot_phase == 'grant_intent':
         return 'starting'
     if slot_phase == 'active':
-        if execution is not None and not execution_started(execution):
+        # Missing execution (e.g. cloud.get failed and was swallowed) is unknown,
+        # never ready. A completed or failed execution must also never map to ready.
+        if not isinstance(execution, dict):
+            return 'unknown'
+        if bool(execution.get('completionTime')) and not execution.get('reconciling'):
+            return 'unknown'
+        failed = execution.get('failedCount', 0)
+        if type(failed) is int and failed > 0:
+            return 'unknown'
+        if not execution_started(execution):
             return 'starting'
         return 'ready'
     return 'unknown'
@@ -146,7 +155,8 @@ class Controller:
         self.policy, self.slot, self.store, self.cloud, self.broker = policy, slot, store, cloud, broker
         self.bindings = binding_store or BindingStore(policy)
         self.grant_factory, self.clock = grant_factory, clock
-        # Optional advisory hub publisher (off unless injected / env-enabled).
+        # Retained for call-site compat; publish is once per fleet tick from
+        # cloud_runtime.Runtime (not per controller — hub replaces the whole doc).
         self.readiness_publisher = readiness_publisher
         require(set(slot) == {'job_uid', 'template_sha256', 'enabled'} and type(slot['enabled']) is bool
                 and re.fullmatch(r'[a-f0-9-]{36}', slot['job_uid'])
@@ -333,22 +343,7 @@ class Controller:
         return result, self.store.cas(result, version)
 
     def tick(self):
-        # Publish hook: after each tick, best-effort advisory readiness. A
-        # failure never changes the tick result, CAS state, or launch path.
-        result = self._tick()
-        self._publish_readiness_after_tick()
-        return result
-
-    def _publish_readiness_after_tick(self):
-        publisher = self.readiness_publisher
-        if publisher is None:
-            return
-        try:
-            from fleet_readiness_publisher import publish_after_tick
-            publish_after_tick([self], publisher)
-        except Exception:
-            # Publisher is best-effort; never break the tick path.
-            pass
+        return self._tick()
 
     def _tick(self):
         if not self.slot['enabled']:

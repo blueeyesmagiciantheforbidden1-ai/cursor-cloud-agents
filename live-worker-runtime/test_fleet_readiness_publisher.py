@@ -1,27 +1,74 @@
-"""Offline tests for advisory fleet readiness publishing (T41 / C2 controller side)."""
+"""Offline tests for advisory fleet readiness publishing (T41 / T65 / C2 controller side)."""
 from __future__ import annotations
 
 from copy import deepcopy
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import json
 import sys
+import threading
+import time
 import unittest
 from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent
-HUB = Path(__file__).resolve().parents[2] / 'runcrew'
 SOURCE = Path('C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e7f-992bfc4740b3/agent-hub')
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(HUB))
 sys.path.insert(0, str(SOURCE))
 
 from fleet_controller import Controller, digest, map_readiness_phase, execution_started  # noqa: E402
 from fleet_readiness_publisher import (  # noqa: E402
-    AGENT_ENTRY_KEYS, DOCUMENT_KEYS, FORBIDDEN_PAYLOAD_KEYS, FleetReadinessPublisher,
-    agent_readiness_entry, build_readiness_document, document_from_slots,
-    publish_after_tick, ttl_for_tick_interval,
+    AGENT_ENTRY_KEYS, DOCUMENT_KEYS, FORBIDDEN_PAYLOAD_KEYS, EXECUTION_ID, MAX_REASON_CODE,
+    REASON_CODE, FleetReadinessPublisher, NoRedirect, agent_readiness_entry,
+    build_readiness_document, document_from_slots, publish_after_tick,
+    ttl_for_tick_interval,
 )
 from test_dynamic_broker import POLICY  # noqa: E402
+
+# Both cca/agent-hub and runcrew ship package name agent_hub; putting runcrew
+# first breaks worker imports (UpstreamUnavailable etc.). Import by loading the
+# runcrew module file under an isolated package name.
+HUB_VALIDATE_SOURCE = ''
+
+
+def _load_hub_validate_document():
+    global HUB_VALIDATE_SOURCE
+    import importlib.util
+    import types
+    runcrew_ah = Path(__file__).resolve().parents[2] / 'runcrew' / 'agent_hub'
+    pkg_name = '_t65_runcrew_agent_hub'
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [str(runcrew_ah)]
+        sys.modules[pkg_name] = pkg
+    # Minimal core stub: fleet_readiness only needs AGENTS and HubError.
+    core_name = pkg_name + '.core'
+    if core_name not in sys.modules:
+        core = types.ModuleType(core_name)
+
+        class HubError(Exception):
+            def __init__(self, message, status=400):
+                Exception.__init__(self, message)
+                self.status = status
+
+        core.HubError = HubError
+        core.AGENTS = ('codex', 'claude', 'cursor', 'copilot', 'grok')
+        sys.modules[core_name] = core
+    fr_path = runcrew_ah / 'fleet_readiness.py'
+    fr_name = pkg_name + '.fleet_readiness'
+    spec = importlib.util.spec_from_file_location(fr_name, fr_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[fr_name] = mod
+    spec.loader.exec_module(mod)
+    HUB_VALIDATE_SOURCE = (
+        'importlib load of runcrew/agent_hub/fleet_readiness.py under isolated package '
+        '_t65_runcrew_agent_hub (cca and runcrew both use agent_hub)'
+    )
+    return mod.validate_document
+
+
+hub_validate_document = _load_hub_validate_document()
 
 PRIOR_UID = '11111111-1111-1111-1111-111111111111'
 NEXT_UID = '22222222-2222-2222-2222-222222222222'
@@ -168,7 +215,15 @@ class PhaseMappingTests(unittest.TestCase):
         ('active', {'uid': NEXT_UID, 'startTime': ''}, 'starting'),
         ('active', {'uid': NEXT_UID, 'runningCount': 1}, 'ready'),
         ('active', {'uid': NEXT_UID, 'startTime': '2026-09-26T12:00:00Z'}, 'ready'),
-        ('active', None, 'ready'),
+        # unknown execution (failed cloud.get) must not become ready
+        ('active', None, 'unknown'),
+        # completed / failed must never map to ready
+        ('active', {'uid': NEXT_UID, 'runningCount': 0, 'completionTime': '2026-09-26T12:00:00Z',
+                    'succeededCount': 1}, 'unknown'),
+        ('active', {'uid': NEXT_UID, 'runningCount': 0, 'startTime': '2026-09-26T11:00:00Z',
+                    'completionTime': '2026-09-26T12:00:00Z', 'succeededCount': 1}, 'unknown'),
+        ('active', {'uid': NEXT_UID, 'runningCount': 0, 'failedCount': 1}, 'unknown'),
+        ('active', {'uid': NEXT_UID, 'runningCount': 1, 'failedCount': 1}, 'unknown'),
         ('blocked', None, 'blocked'),
         ('blocked', {'runningCount': 1}, 'blocked'),
         ('not_a_phase', None, 'unknown'),
@@ -179,6 +234,14 @@ class PhaseMappingTests(unittest.TestCase):
         for slot_phase, execution, expected in self.TABLE:
             with self.subTest(slot_phase=slot_phase, execution=execution):
                 self.assertEqual(map_readiness_phase(slot_phase, execution), expected)
+
+    def test_unknown_completed_failed_never_ready(self):
+        self.assertNotEqual(map_readiness_phase('active', None), 'ready')
+        self.assertEqual(map_readiness_phase('active', None), 'unknown')
+        completed = {'uid': NEXT_UID, 'completionTime': 't', 'runningCount': 0, 'succeededCount': 1}
+        self.assertNotEqual(map_readiness_phase('active', completed), 'ready')
+        failed = {'uid': NEXT_UID, 'failedCount': 1, 'runningCount': 0}
+        self.assertNotEqual(map_readiness_phase('active', failed), 'ready')
 
     def test_execution_started_helper(self):
         self.assertFalse(execution_started(None))
@@ -194,7 +257,7 @@ class PayloadContractTests(unittest.TestCase):
                 'codex': {
                     'phase': 'idle',
                     'since': 1000,
-                    'reason_code': None,
+                    'reason_code': 'ok',
                     'execution': None,
                 },
                 'claude': {
@@ -221,10 +284,9 @@ class PayloadContractTests(unittest.TestCase):
         self.assertEqual(ttl_for_tick_interval(300), 600)
 
     def test_rejects_extra_top_level_or_agent_fields_via_builder(self):
-        # build_readiness_document only accepts the contract keys per agent.
         with self.assertRaises(ValueError):
             build_readiness_document(
-                {'codex': {'phase': 'idle', 'since': 1, 'reason_code': None,
+                {'codex': {'phase': 'idle', 'since': 1, 'reason_code': 'ok',
                            'execution': None, 'grant': 'secret'}},
                 published_at=1, ttl_seconds=30,
             )
@@ -249,7 +311,6 @@ class PayloadContractTests(unittest.TestCase):
         for key in ('grant', 'grant_sha256', 'super-secret-grant-value', 'token', 'password'):
             self.assertNotIn(key, blob)
         self.assertNotIn('grant', doc['agents']['codex'])
-        # reason_code may mention credential_unreleased; that is a short code, not a secret.
         self.assertEqual(doc['agents']['codex']['reason_code'], 'worker_failed_credential_unreleased')
         self.assertEqual(doc['agents']['codex']['execution'], NEXT_UID)
         self.assertEqual(set(doc['agents']['codex']), AGENT_ENTRY_KEYS)
@@ -270,6 +331,38 @@ class PayloadContractTests(unittest.TestCase):
             'reason_code': 'launch_without_execution',
             'execution': None,
         })
+
+    def test_reason_code_null_becomes_ok(self):
+        entry = agent_readiness_entry({'phase': 'idle', 'updated_at': 1})
+        self.assertEqual(entry['reason_code'], 'ok')
+        self.assertIsInstance(entry['reason_code'], str)
+        self.assertTrue(REASON_CODE.fullmatch(entry['reason_code']))
+
+    def test_reason_code_boundary_64_accepted_65_refused(self):
+        ok = 'x' * 64
+        self.assertEqual(len(ok), 64)
+        doc = build_readiness_document(
+            {'codex': {'phase': 'idle', 'since': 1, 'reason_code': ok, 'execution': None}},
+            published_at=1, ttl_seconds=30,
+        )
+        self.assertEqual(doc['agents']['codex']['reason_code'], ok)
+        too_long = 'x' * 65
+        self.assertEqual(len(too_long), 65)
+        with self.assertRaises(ValueError):
+            build_readiness_document(
+                {'codex': {'phase': 'idle', 'since': 1, 'reason_code': too_long, 'execution': None}},
+                published_at=1, ttl_seconds=30,
+            )
+        self.assertEqual(MAX_REASON_CODE, 64)
+
+    def test_execution_id_with_slash_refused(self):
+        self.assertIsNone(EXECUTION_ID.fullmatch('a/b'))
+        with self.assertRaises(ValueError):
+            build_readiness_document(
+                {'codex': {'phase': 'idle', 'since': 1, 'reason_code': 'ok',
+                           'execution': 'projects/x/executions/y'}},
+                published_at=1, ttl_seconds=30,
+            )
 
 
 class PublisherBehaviourTests(unittest.TestCase):
@@ -322,8 +415,10 @@ class PublisherBehaviourTests(unittest.TestCase):
         self.assertEqual(hub.calls[0]['document'], doc)
         self.assertEqual(doc['ttl_seconds'], 180)
         self.assertEqual(set(doc['agents']), {'codex', 'claude'})
+        self.assertEqual(doc['agents']['codex']['reason_code'], 'ok')
 
-    def test_one_post_per_tick_with_fake_hub_client(self):
+    def test_controller_tick_does_not_publish(self):
+        """Per-controller publish removed; hub replaces the whole document."""
         hub = FakeHubClient()
         publisher = FleetReadinessPublisher(
             enabled=True, hub_url='http://127.0.0.1:9', token='controller-token',
@@ -337,18 +432,7 @@ class PublisherBehaviourTests(unittest.TestCase):
         )
         result = controller.tick()
         self.assertEqual(result['status'], 'job_running_readiness_separate')
-        self.assertEqual(len(hub.calls), 1)
-        doc = hub.calls[0]['document']
-        self.assertEqual(set(doc), DOCUMENT_KEYS)
-        self.assertEqual(doc['schema'], 1)
-        self.assertIn(POLICY.profile.provider, doc['agents'])
-        agent = doc['agents'][POLICY.profile.provider]
-        self.assertEqual(set(agent), AGENT_ENTRY_KEYS)
-        self.assertEqual(agent['phase'], 'starting')
-        self.assertEqual(agent['execution'], NEXT_UID)
-        blob = json.dumps(doc)
-        self.assertNotIn('grant', blob)
-        self.assertNotIn(store.state.get('grant') or 'no-grant-present', blob)
+        self.assertEqual(hub.calls, [])
 
     def test_post_failure_leaves_tick_result_unchanged(self):
         hub = FakeHubClient()
@@ -368,6 +452,8 @@ class PublisherBehaviourTests(unittest.TestCase):
         self.assertEqual(result['status'], 'job_running_readiness_separate')
         self.assertEqual(store.state['phase'], 'active')
         self.assertEqual(cloud.run_count, 1)
+        # Publish is fleet-level; a failed publish_after_tick must not affect tick.
+        publish_after_tick([controller], publisher)
         self.assertEqual(publisher.failures['count'], 1)
         self.assertEqual(len(logs), 1)
         event = json.loads(logs[0])
@@ -394,25 +480,176 @@ class PublisherBehaviourTests(unittest.TestCase):
             enabled=True, hub_url='http://127.0.0.1:9', token='tok',
             tick_seconds=40, post=hub, clock=lambda: 9000,
         )
-        # Two slot snapshots, one POST.
         doc = publish_after_tick(
-            [_FakeController('codex', {'phase': 'idle', 'updated_at': 1}),
+            [_FakeController('codex', {'phase': 'idle', 'updated_at': 1}, profile='ryan'),
              _FakeController('claude', {'phase': 'blocked', 'updated_at': 2,
-                                        'error': 'launch_without_execution'})],
+                                        'error': 'launch_without_execution'}, profile='ryan')],
             publisher,
         )
         self.assertEqual(len(hub.calls), 1)
         self.assertEqual(hub.calls[0]['document']['ttl_seconds'], 120)
-        self.assertEqual(set(doc['agents']), {'codex', 'claude'})
-        self.assertEqual(doc['agents']['codex']['phase'], 'idle')
-        self.assertEqual(doc['agents']['claude']['phase'], 'blocked')
+        self.assertEqual(set(doc['agents']), {'codex_ryan', 'claude_ryan'})
+        self.assertEqual(doc['agents']['codex_ryan']['phase'], 'idle')
+        self.assertEqual(doc['agents']['claude_ryan']['phase'], 'blocked')
+
+    def test_runtime_tick_one_post_three_slots_keyed_with_profile(self):
+        hub = FakeHubClient()
+        publisher = FleetReadinessPublisher(
+            enabled=True, hub_url='http://127.0.0.1:9', token='tok',
+            tick_seconds=60, post=hub, clock=lambda: 7000,
+        )
+        controllers = [
+            _FakeController('codex', {'phase': 'idle', 'updated_at': 1}, profile='ryan'),
+            _FakeController('claude', {'phase': 'idle', 'updated_at': 2}, profile='blueeyes'),
+            _FakeController('grok', {'phase': 'blocked', 'updated_at': 3,
+                                     'error': 'launch_without_execution'}, profile='ryan'),
+        ]
+        from cloud_runtime import Runtime
+        runtime = Runtime.__new__(Runtime)
+        runtime.lock = threading.Lock()
+        runtime.controllers = controllers
+        runtime.readiness_publisher = publisher
+        result = runtime.tick()
+        self.assertEqual(len(hub.calls), 1)
+        doc = hub.calls[0]['document']
+        expected = {'codex_ryan', 'claude_blueeyes', 'grok_ryan'}
+        self.assertEqual(set(doc['agents']), expected)
+        for key in expected:
+            self.assertIn('_', key)
+        self.assertEqual(result['codex']['status'], 'ok')
+        self.assertEqual(result['claude']['status'], 'ok')
+        self.assertEqual(result['grok']['status'], 'ok')
+
+
+class RealHttpPublishTests(unittest.TestCase):
+    """End-to-end POST against a real local HTTP server (no fake post)."""
+
+    def setUp(self):
+        self.hits = []
+        self.redirect_targets = []
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', '0'))
+                body = self.rfile.read(length)
+                agent = self.headers.get('X-Hub-Agent')
+                parent.hits.append({
+                    'path': self.path,
+                    'agent': agent,
+                    'token': self.headers.get('X-Hub-Token'),
+                    'body': body,
+                })
+                if self.path == '/redirect-source':
+                    self.send_response(302)
+                    self.send_header('Location', 'http://127.0.0.1:%d/v1/fleet/readiness' % parent.server.server_port)
+                    self.end_headers()
+                    return
+                if self.path != '/v1/fleet/readiness':
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                if agent != 'fleet':
+                    self.send_response(403)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"agent_mismatch"}')
+                    return
+                try:
+                    data = json.loads(body.decode('utf-8'))
+                    hub_validate_document(data, time.time())
+                except Exception as error:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': str(error)}).encode())
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            def do_GET(self):
+                parent.redirect_targets.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+        self.server = HTTPServer(('127.0.0.1', 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_port
+        self.base = 'http://127.0.0.1:%d' % self.port
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_real_publish_succeeds_end_to_end(self):
+        self.assertTrue(HUB_VALIDATE_SOURCE.startswith('import'))
+        publisher = FleetReadinessPublisher(
+            enabled=True, hub_url=self.base, token='fleet-token-for-local-test',
+            tick_seconds=60, clock=lambda: int(time.time()),
+        )
+        # Hub AGENTS are provider names; e2e uses those so validate_document accepts.
+        doc = publisher.publish_slots({
+            'codex': {'phase': 'idle', 'updated_at': int(time.time())},
+            'claude': {'phase': 'blocked', 'updated_at': int(time.time()),
+                       'error': 'launch_without_execution'},
+        })
+        self.assertIsNotNone(doc)
+        self.assertEqual(len(self.hits), 1)
+        self.assertEqual(self.hits[0]['agent'], 'fleet')
+        self.assertEqual(self.hits[0]['path'], '/v1/fleet/readiness')
+        body = json.loads(self.hits[0]['body'].decode())
+        self.assertEqual(body['agents']['codex']['reason_code'], 'ok')
+        self.assertEqual(body['agents']['claude']['reason_code'], 'launch_without_execution')
+
+    def test_redirect_not_followed(self):
+        # POST to a path that 302s; NoRedirect must not follow to /v1/fleet/readiness.
+        document = build_readiness_document(
+            {'codex': {'phase': 'idle', 'since': int(time.time()), 'reason_code': 'ok',
+                       'execution': None}},
+            published_at=int(time.time()),
+            ttl_seconds=30,
+        )
+        body = json.dumps(document, separators=(',', ':')).encode()
+        request = Request(
+            self.base + '/redirect-source',
+            data=body,
+            headers={
+                'Content-Type': 'application/json',
+                'X-Hub-Token': 'fleet-token-for-local-test',
+                'X-Hub-Agent': 'fleet',
+            },
+            method='POST',
+        )
+        opener = build_opener(ProxyHandler({}), NoRedirect())
+        hits_before = len(self.hits)
+        try:
+            with opener.open(request, timeout=2.5) as response:
+                self.assertEqual(response.status, 302)
+        except HTTPError as error:
+            self.assertEqual(error.code, 302)
+        readiness_hits = [h for h in self.hits[hits_before:] if h['path'] == '/v1/fleet/readiness']
+        self.assertEqual(readiness_hits, [])
+        source_hits = [h for h in self.hits[hits_before:] if h['path'] == '/redirect-source']
+        self.assertEqual(len(source_hits), 1)
 
 
 class _FakeController:
-    def __init__(self, provider, state):
-        self.policy = type('P', (), {'profile': type('F', (), {'provider': provider})()})()
+    def __init__(self, provider, state, profile='ryan'):
+        self.policy = type('P', (), {
+            'profile': type('F', (), {'provider': provider, 'profile': profile})(),
+        })()
         self.store = type('S', (), {'read': lambda self: (deepcopy(state), 1)})()
         self.cloud = type('C', (), {'get': lambda self, name: None})()
+
+    def tick(self):
+        return {'status': 'ok'}
 
 
 if __name__ == '__main__':
