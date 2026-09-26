@@ -489,8 +489,8 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
         _materialize(spec["base_snapshot"], workspace, bound)
         env = _environment(control)
         child_env = _child_environment(workspace, {} if task_env is None else task_env)
-        # Test scratch (HOME/TMP) sits beside the workspace, not in it, so test
-        # side files never enter the result commit; it is discarded with the run.
+        # Test scratch (HOME/TMP) and the disposable test-work tree sit beside
+        # the receipt workspace; both are discarded with the run.
         test_home = run / "test-home"
         test_home.mkdir()
         test_env = _child_environment(workspace, {} if task_env is None else task_env, home=test_home)
@@ -514,18 +514,30 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
         result["model_call_attempted"] = True
         _provider(provider_fn, workspace, text,
                   min(deadline, time.monotonic() + bound["provider_seconds"]), child_env, bound)
-        _snapshot(workspace, bound)
+        # Commit the provider result BEFORE tests so test side effects never
+        # enter the receipt. Tests run in a disposable sibling copy.
+        pre_test = _snapshot(workspace, bound)
+        git_run("add", "--all", "--force")
+        git_run("commit", "--allow-empty", "-m", "result")
+        result_commit = git_run("rev-parse", "HEAD").decode().strip()
+        test_work = run / "test-work"
+        test_work.mkdir()
+        for name, (data, executable) in pre_test.items():
+            target = test_work.joinpath(*_relative(name))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as stream:
+                stream.write(data)
+            target.chmod(0o755 if executable else 0o644)
         try:
-            code, _ = _command(argv, workspace, test_env,
+            code, _ = _command(argv, test_work, test_env,
                                min(deadline, time.monotonic() + bound["test_seconds"]), bound["bytes"], bound)
         except RunnerError as failure:
             if str(failure) == "command_timeout":
                 raise RunnerError("test_timeout") from None
             raise
-        _snapshot(workspace, bound)
-        git_run("add", "--all", "--force")
-        git_run("commit", "--allow-empty", "-m", "result")
-        result_commit = git_run("rev-parse", "HEAD").decode().strip()
+        # Tripwire: tests must not touch the receipt workspace at all.
+        post_test = _snapshot(workspace, bound)
+        _need(post_test == pre_test, "test_mutated_workspace")
         try:
             patch = git_run("diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames",
                             "--unified=3", base_commit, result_commit, "--", cap=bound["diff_bytes"])

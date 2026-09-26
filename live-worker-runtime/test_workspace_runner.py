@@ -112,6 +112,11 @@ def forged_receipt(workspace, task_text, deadline):
     print(json.dumps(forged))
 
 
+def write_receipt_path(workspace, task_text, deadline):
+    edit(workspace, task_text, deadline)
+    (workspace / "receipt_workspace").write_text(str(workspace), encoding="utf-8")
+
+
 def hub_validator():
     # Load runcrew under a private package name: do not accidentally validate
     # against cca/agent-hub when that is already imported by another suite.
@@ -194,6 +199,39 @@ class WorkspaceRunnerTests(unittest.TestCase):
         self.assertEqual(result["runner_receipt"]["files_changed"], 1)
         self.assertNotIn(b"__pycache__", result["diff"])
         self.assertNotIn(b"leftover-", result["diff"])
+
+    def test_test_cwd_artifacts_and_edits_stay_out_of_the_receipt(self):
+        # Demand probe: pytest cache, coverage, and a test-mutated model file
+        # must not enter files_changed or the receipt diff.
+        (self.base / "messy_test.py").write_text(
+            "from pathlib import Path\n"
+            "Path('.pytest_cache').mkdir()\n"
+            "Path('.pytest_cache/v').write_text('cache')\n"
+            "Path('.coverage').write_text('cov')\n"
+            "Path('answer.txt').write_text('changed\\nappended by test\\n')\n"
+            "Path('answer.txt').unlink()\n",
+            encoding="utf-8")
+        self.spec["test_command"] = [sys.executable, "messy_test.py"]
+        result = self.run_task()
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(result["runner_receipt"]["files_changed"], 1)
+        self.assertIn(b"-base\n+changed\n", result["diff"].replace(b"\r\n", b"\n"))
+        self.assertNotIn(b"appended by test", result["diff"])
+        self.assertNotIn(b".pytest_cache", result["diff"])
+        self.assertNotIn(b".coverage", result["diff"])
+
+    def test_test_mutating_real_workspace_fails_closed(self):
+        # Tripwire: a test that reaches the receipt workspace by absolute path
+        # must fail with test_mutated_workspace.
+        (self.base / "mutate_receipt.py").write_text(
+            "from pathlib import Path\n"
+            "target = Path(Path('receipt_workspace').read_text(encoding='utf-8'))\n"
+            "target.joinpath('mutated_by_test.txt').write_text('no')\n",
+            encoding="utf-8")
+        self.spec["test_command"] = [sys.executable, "mutate_receipt.py"]
+        result = self.run_task(write_receipt_path)
+        self.assertEqual(result["error_code"], "test_mutated_workspace", result)
+        self.assertIsNone(result["diff"])
 
     def test_requested_secret_names_refused(self):
         for key in ("aTOKENb", "secret", "KEY", "PASSWORD", "CREDENTIAL", "HUB_X",
