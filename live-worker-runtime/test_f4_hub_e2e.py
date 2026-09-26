@@ -278,8 +278,8 @@ class F4HubE2ETests(unittest.TestCase):
                          ('write_side_effects', 'reconcile', 'model_call'))
 
     def test_4_model_call_beat_lands_transport_error_skips_execute(self):
-        """EXPECTED (confirming model_call beat reaches hub; worker sees transport error):
-        execute never runs; completion has model_call_attempted False; hub classifies
+        """EXPECTED (both confirming model_call beats reach the hub; the worker sees a
+        transport error each time, so its one retry is used up): execute never runs; completion has model_call_attempted False; hub classifies
         the attempt pre_model and requeues (retry_scheduled); not post_model /
         needs_reconciliation.
         """
@@ -292,8 +292,9 @@ class F4HubE2ETests(unittest.TestCase):
             if (path.endswith('/heartbeat') and isinstance(value, dict)
                     and value.get('phase') == 'model_call'):
                 model_call_beats['n'] += 1
-                if model_call_beats['n'] == 1:
-                    # Land the beat at the hub, then fail the worker's transport.
+                if model_call_beats['n'] <= 2:
+                    # Land the beat at the hub, then fail the worker's transport
+                    # (twice: the worker retries the beat once).
                     original(path, value)
                     raise OSError('simulated transport loss after hub accepted model_call')
             return original(path, value)
@@ -315,6 +316,35 @@ class F4HubE2ETests(unittest.TestCase):
         # After pre_model requeue the lease is gone; phase was recorded on the attempt.
         self.assertEqual(record.get('last_phase'), 'model_call')
         self.assertIsNone(raw_after_beat_path.get('lease'))
+
+    def test_4b_lost_ack_then_retry_succeeds_runs_execute_once(self):
+        """EXPECTED (the first model_call beat lands but its ack is lost; the one
+        retry is acknowledged): execute runs exactly once, the room completes,
+        and the attempt succeeded with last_phase finishing (never back to setup).
+        """
+        room = self.create_room(recovery='auto')
+        client = LoopbackClient(self.base, self.tokens[self.agent], self.agent)
+        original = client.post
+        beats = {'n': 0}
+
+        def post(path, value):
+            if (path.endswith('/heartbeat') and isinstance(value, dict)
+                    and value.get('phase') == 'model_call'):
+                beats['n'] += 1
+                if beats['n'] == 1:
+                    original(path, value)
+                    raise OSError('simulated lost ack after hub accepted model_call')
+            return original(path, value)
+
+        client.post = post
+        result, adapter = self.run_worker(client=client, die_at=None)
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(result.get('outcome'), 'completed')
+        seen = self.seen(room['id'])
+        self.assertEqual(seen['status'], 'completed')
+        record = seen['attempt_records'][-1]
+        self.assertEqual(record.get('outcome'), 'succeeded')
+        self.assertEqual(record.get('last_phase'), 'finishing')
 
     def test_5_happy_path_finishing(self):
         """EXPECTED (normal completion):
