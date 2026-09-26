@@ -227,11 +227,14 @@ def _provider(provider_fn, workspace, text, deadline, env, bound):
     _need(code == 0, codes.get(code, "provider_error"))
 
 
-def _child_environment(workspace, task_env):
+def _child_environment(workspace, task_env, home=None):
     _need(type(task_env) is dict, "invalid_task_env")
-    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(workspace),
-           "TMP": str(workspace), "TEMP": str(workspace), "TMPDIR": str(workspace),
-           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    home = str(workspace if home is None else home)
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": home,
+           "TMP": home, "TEMP": home, "TMPDIR": home,
+           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+           # Interpreter caches are build artifacts, never part of a receipt diff.
+           "PYTHONDONTWRITEBYTECODE": "1"}
     if os.name == "nt":
         for key in ("SYSTEMROOT", "COMSPEC"):
             if key in os.environ:
@@ -486,6 +489,11 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
         _materialize(spec["base_snapshot"], workspace, bound)
         env = _environment(control)
         child_env = _child_environment(workspace, {} if task_env is None else task_env)
+        # Test scratch (HOME/TMP) sits beside the workspace, not in it, so test
+        # side files never enter the result commit; it is discarded with the run.
+        test_home = run / "test-home"
+        test_home.mkdir()
+        test_env = _child_environment(workspace, {} if task_env is None else task_env, home=test_home)
         git = shutil.which("git")
         _need(git is not None, "git_unavailable")
         def git_run(*args, cap=None):
@@ -508,7 +516,7 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
                   min(deadline, time.monotonic() + bound["provider_seconds"]), child_env, bound)
         _snapshot(workspace, bound)
         try:
-            code, _ = _command(argv, workspace, child_env,
+            code, _ = _command(argv, workspace, test_env,
                                min(deadline, time.monotonic() + bound["test_seconds"]), bound["bytes"], bound)
         except RunnerError as failure:
             if str(failure) == "command_timeout":

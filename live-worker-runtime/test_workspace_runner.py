@@ -180,6 +180,21 @@ class WorkspaceRunnerTests(unittest.TestCase):
                                             limits={}, task_env={"TASK_MESSAGE": "safe"})
         self.assertEqual(result["status"], "succeeded", result)
 
+    def test_test_side_files_stay_out_of_the_receipt(self):
+        # A realistic test command imports workspace code and leaves a temp file;
+        # neither bytecode caches nor test scratch may enter the result commit.
+        (self.base / "calc.py").write_text("VALUE = 'base'\n")
+        (self.base / "check_calc.py").write_text(
+            "import tempfile\nimport calc\n"
+            "tempfile.mkstemp(prefix='leftover-')\n"
+            "assert open('answer.txt').read() == 'changed\\n'\n")
+        self.spec["test_command"] = [sys.executable, "-c", "import check_calc"]
+        result = self.run_task()
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(result["runner_receipt"]["files_changed"], 1)
+        self.assertNotIn(b"__pycache__", result["diff"])
+        self.assertNotIn(b"leftover-", result["diff"])
+
     def test_requested_secret_names_refused(self):
         for key in ("aTOKENb", "secret", "KEY", "PASSWORD", "CREDENTIAL", "HUB_X",
                     "GOOGLE_X", "CLOUDSDK_X", "GCE_X", "AWS_X", "AZURE_X",
