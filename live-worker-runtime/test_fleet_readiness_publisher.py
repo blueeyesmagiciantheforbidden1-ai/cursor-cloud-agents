@@ -15,20 +15,6 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HUB))
 sys.path.insert(0, str(SOURCE))
 
-# The cca checkout expects a newer cloud_credential_broker (UpstreamUnavailable,
-# UPSTREAM_*). The workspace runcrew hub is an older post-deploy snapshot; the
-# absolute SOURCE path from the original packager is absent here. Patch the
-# missing symbols so offline controller tests can import.
-import agent_hub.cloud_credential_broker as _ccb  # noqa: E402
-if not hasattr(_ccb, 'UpstreamUnavailable'):
-    class UpstreamUnavailable(_ccb.BrokerError):
-        pass
-    _ccb.UpstreamUnavailable = UpstreamUnavailable
-if not hasattr(_ccb, 'UPSTREAM_BUDGET_SECONDS'):
-    _ccb.UPSTREAM_BUDGET_SECONDS = 8
-if not hasattr(_ccb, 'UPSTREAM_HTTP_STATUSES'):
-    _ccb.UPSTREAM_HTTP_STATUSES = frozenset({502, 503, 504})
-
 from fleet_controller import Controller, digest, map_readiness_phase, execution_started  # noqa: E402
 from fleet_readiness_publisher import (  # noqa: E402
     AGENT_ENTRY_KEYS, DOCUMENT_KEYS, FORBIDDEN_PAYLOAD_KEYS, FleetReadinessPublisher,
