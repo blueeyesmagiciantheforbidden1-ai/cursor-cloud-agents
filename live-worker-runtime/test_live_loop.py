@@ -795,15 +795,19 @@ class LoopTests(unittest.TestCase):
         failure = {'agent': 'claude', 'text': 'failed turn', 'exit_code': 1}
         success_b = {'agent': 'cursor', 'text': 'second success', 'exit_code': 0}
         messages = [success_a, failure, success_b]
-        client.task['messages'] = client.room['messages'] = messages
+        expected = copy.deepcopy(messages)
+        client.task['messages'] = copy.deepcopy(messages)
+        client.room['messages'] = copy.deepcopy(messages)
         text = task_prompt(client.task, client.room, 'grok')
         context = json.loads(text.split('\n\n', 1)[1])
-        self.assertEqual(context['previous_agent_contributions'], [success_a, success_b])
+        self.assertEqual(context['previous_agent_contributions'],
+                         [copy.deepcopy(success_a), copy.deepcopy(success_b)])
         self.assertNotIn('failed turn', text)
         # Worker must not recompute hub hashes from the filtered list: messages
         # on the task/room stay full, and completion still echoes the claimed step.
-        self.assertEqual(client.task['messages'], messages)
-        self.assertEqual(client.room['messages'], messages)
+        self.assertEqual(len(client.task['messages']), len(expected))
+        self.assertEqual(client.task['messages'], expected)
+        self.assertEqual(client.room['messages'], expected)
         client.task['step'] = client.room['step'] = 4
         result = worker.run()
         self.assertEqual(result['outcome'], 'completed')
@@ -817,15 +821,19 @@ class LoopTests(unittest.TestCase):
         for i in range(30):
             exit_code = 1 if i % 3 == 0 else 0  # 10 failures, 20 successes
             messages.append({'agent': 'codex', 'text': 'msg-%d' % i, 'exit_code': exit_code})
+        expected = copy.deepcopy(messages)
         self.assertEqual(sum(1 for m in messages if m['exit_code'] != 0), 10)
         self.assertEqual(sum(1 for m in messages if m['exit_code'] == 0), 20)
-        client.task['messages'] = client.room['messages'] = messages
+        client.task['messages'] = copy.deepcopy(messages)
+        client.room['messages'] = copy.deepcopy(messages)
         text = task_prompt(client.task, client.room, 'grok')
         context = json.loads(text.split('\n\n', 1)[1])
         self.assertEqual(len(context['previous_agent_contributions']), 20)
         self.assertEqual([m['text'] for m in context['previous_agent_contributions']],
-                         [m['text'] for m in messages if m['exit_code'] == 0])
-        self.assertEqual(client.task['messages'], messages)
+                         [m['text'] for m in expected if m['exit_code'] == 0])
+        self.assertEqual(len(client.task['messages']), len(expected))
+        self.assertEqual(client.task['messages'], expected)
+        self.assertEqual(client.room['messages'], expected)
 
     def test_claim_sends_worker_id_and_completion_echoes_step(self):
         # MyHero MH-005: the hub records which execution held the attempt.
@@ -1882,6 +1890,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post
         model_call_beats = {'n': 0}
+        sleeps = []
 
         def post(path, value):
             if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
@@ -1891,14 +1900,20 @@ class HeartbeatPhaseTests(unittest.TestCase):
                     raise OSError('network')
             return original(path, value)
 
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.sleep(seconds)
+
         client.post = post
         worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
-                        object(), clock=clock, sleep=clock.sleep)
+                        object(), clock=clock, sleep=sleep)
         result = worker.run()
         self.assertEqual(result['outcome'], 'completed')
         self.assertEqual(adapter.calls.count('execute'), 1)
         self.assertIs(result['model_call_attempted'], True)
-        self.assertGreaterEqual(model_call_beats['n'], 2)
+        # Exactly one transport retry: two pre-execute model_call beats, one 1s sleep.
+        self.assertEqual(model_call_beats['n'], 2)
+        self.assertEqual(sleeps, [1])
         self.assertEqual(worker.phase, 'finishing')
 
     def test_model_call_heartbeat_two_transport_errors_skips_execute(self):
@@ -1949,7 +1964,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(adapter.calls.count('execute'), 1)
         self.assertIs(result['model_call_attempted'], True)
         # Loop beat + retry before execute; further beats may come from execute/close.
-        self.assertGreaterEqual(model_call_beats['n'], 2)
+        self.assertEqual(model_call_beats['n'], 2)
 
     def test_malformed_model_call_heartbeat_answer_skips_execute(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
@@ -1973,6 +1988,179 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertIs(client.completions[0]['model_call_attempted'], False)
         # Malformed answer is not a transport error — do not retry.
         self.assertEqual(model_call_beats['n'], 1)
+
+    def _hub_shaped_error(self, kind):
+        """Exceptions shaped like HubClient.post — type/status only, no message parsing."""
+        from urllib.error import HTTPError, URLError
+        from agent_hub.worker import LeaseLost, WorkerError
+        if kind == 'connection':
+            try:
+                raise WorkerError('Hub connection failed') from URLError('connection refused')
+            except WorkerError as exc:
+                return exc
+        if kind == 'timeout':
+            try:
+                raise WorkerError('Hub connection failed') from TimeoutError('timed out')
+            except WorkerError as exc:
+                return exc
+        if kind == 'invalid_json':
+            try:
+                raise WorkerError('Hub returned invalid JSON') from ValueError('Expecting value')
+            except WorkerError as exc:
+                return exc
+        if kind == 'non_object':
+            return WorkerError('Hub response must be a JSON object')
+        try:
+            raise WorkerError(f'Hub request failed (HTTP {kind})') from HTTPError(
+                'http://hub/v1/tasks/' + ROOM + '/heartbeat', kind, 'err', {}, None)
+        except WorkerError as exc:
+            if kind == 409:
+                try:
+                    raise LeaseLost('The hub revoked or expired this task lease') from exc.__cause__
+                except LeaseLost as lost:
+                    return lost
+            return exc
+
+    def test_model_call_heartbeat_http_4xx_and_malformed_json_never_retry(self):
+        """409/403/400 and parse failures fail immediately — no retry, no execute."""
+        from agent_hub.worker import LeaseLost, WorkerError
+        cases = (
+            (409, LeaseLost, 'task_lease_lost', True),
+            (403, WorkerError, 'native_or_connection_failure', False),
+            (400, WorkerError, 'native_or_connection_failure', False),
+            ('invalid_json', WorkerError, 'native_or_connection_failure', False),
+            ('non_object', WorkerError, 'native_or_connection_failure', False),
+        )
+        for kind, exc_type, error_code, revoked in cases:
+            with self.subTest(kind=kind):
+                clock = Clock(); client = Client(clock); adapter = Adapter()
+                original = client.post
+                model_call_beats = {'n': 0}
+
+                def post(path, value, _kind=kind):
+                    if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                        model_call_beats['n'] += 1
+                        client.calls.append((path, copy.deepcopy(value)))
+                        raise self._hub_shaped_error(_kind)
+                    return original(path, value)
+
+                client.post = post
+                worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                                object(), clock=clock, sleep=clock.sleep)
+                result = worker.run()
+                self.assertNotIn('execute', adapter.calls)
+                self.assertIs(result['model_call_attempted'], False)
+                self.assertEqual(model_call_beats['n'], 1)
+                self.assertEqual(result['error_code'], error_code)
+                self.assertEqual(worker.lease_revoked, revoked)
+                if revoked:
+                    self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+                    self.assertEqual(client.completions, [])
+                else:
+                    self.assertEqual(len(client.completions), 1)
+                    self.assertIs(client.completions[0]['model_call_attempted'], False)
+
+    def test_model_call_heartbeat_connection_error_retries_once(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+        model_call_beats = {'n': 0}
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                if model_call_beats['n'] == 1:
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise self._hub_shaped_error('connection')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(model_call_beats['n'], 2)
+        self.assertIs(result['model_call_attempted'], True)
+
+    def test_model_call_heartbeat_http_5xx_retries_once(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+        model_call_beats = {'n': 0}
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                if model_call_beats['n'] == 1:
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise self._hub_shaped_error(503)
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(model_call_beats['n'], 2)
+
+    def test_model_call_heartbeat_retry_skipped_when_deadline_too_close(self):
+        """now + delay + request_timeout + 5 must fit under deadline, else no retry."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        # remaining = 16 → prepare's clock+5 < deadline passes; retry needs
+        # delay(1)+HUB_POST_TIMEOUT(10)+5 = 16 more seconds and must not.
+        client.task['deadline'] = 700 + 41
+        client.task['timeout_seconds'] = 41
+        original = client.post
+        model_call_beats = {'n': 0}
+        sleeps = []
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                client.calls.append((path, copy.deepcopy(value)))
+                raise OSError('network')
+            return original(path, value)
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.sleep(seconds)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertEqual(model_call_beats['n'], 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result['error_code'], 'task_deadline_insufficient')
+
+    def test_model_call_heartbeat_ack_too_late_skips_execute(self):
+        """After active:true, fewer than 5 s to deadline → no execute, flag stays false."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        # remaining = 16 → prepare ok; ack burns 12 s so only 4 s remain.
+        client.task['deadline'] = 700 + 41
+        client.task['timeout_seconds'] = 41
+        original = client.post
+        model_call_beats = {'n': 0}
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                model_call_beats['n'] += 1
+                clock.sleep(12)
+                return original(path, value)
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertEqual(model_call_beats['n'], 1)
+        self.assertEqual(result['error_code'], 'task_deadline_insufficient')
+        self.assertEqual(len(client.completions), 1)
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
 
     def test_worker_stopping_before_phase_flip_stays_setup(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()

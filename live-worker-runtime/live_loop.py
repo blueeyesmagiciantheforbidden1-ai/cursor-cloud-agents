@@ -14,10 +14,15 @@ import math
 import os
 import re
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import provider_errors
 import usage_report
+
+# HubClient.post opener timeout (agent_hub.worker.HubClient.post). Used when
+# budgeting a model_call heartbeat retry so the second POST cannot eat the
+# reserved execute window.
+HUB_POST_TIMEOUT_SECONDS = 10
 
 # Process start for this interpreter. The capability manifest stamps it once.
 _PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
@@ -87,6 +92,36 @@ def idle_fault(error):
     if code is None or code in _IDLE_RETRY_CODES:
         return 'retry'
     return 'fail'
+
+
+def _http_status(error):
+    """HTTP status from error or its __cause__, else None. Never reads message text."""
+    for candidate in (error, getattr(error, '__cause__', None)):
+        if isinstance(candidate, HTTPError):
+            code = getattr(candidate, 'code', None)
+            if type(code) is int:
+                return code
+    return None
+
+
+def is_task_heartbeat_transport_error(error):
+    """True only for connection/timeout/DNS loss or HTTP 5xx on a task heartbeat.
+
+    HubClient.post wraps transport as WorkerError from OSError/URLError, and
+    HTTP failures as WorkerError (or LeaseLost for 409) from HTTPError.
+    HTTPError subclasses URLError/OSError, so HTTP responses must be classified
+    by status before any OSError check. 4xx, JSON/shape failures, and anything
+    else are not transport and must not be retried.
+    """
+    status = _http_status(error)
+    if status is not None:
+        return 500 <= status <= 599
+    for candidate in (error, getattr(error, '__cause__', None)):
+        if isinstance(candidate, HTTPError):
+            continue
+        if isinstance(candidate, (OSError, URLError)):
+            return True
+    return False
 
 
 def exit_line(agent, exit_code, outcome):
@@ -824,9 +859,11 @@ class Worker:
                 # before adapter.execute. Adapters used to do this privately;
                 # without it a worker lost mid-call could still look like setup.
                 # Exactly one transport retry (short sleep inside the task
-                # deadline). active:false and malformed answers are not retried.
+                # deadline). Only connection/timeout/DNS/5xx retry; 4xx,
+                # LeaseLost/409, active:false, and malformed answers do not.
                 # phase stays 'model_call' across the retry and never goes back
-                # to setup. model_call_attempted flips only after active:true.
+                # to setup. model_call_attempted flips only after active:true
+                # and a remaining execute floor of 5 s.
                 receipt = None
                 for beat_attempt in range(2):
                     try:
@@ -834,14 +871,28 @@ class Worker:
                             '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                             self._heartbeat_body(self.task))
                     except Exception as error:
-                        if beat_attempt == 0 and idle_fault(error) == 'retry':
+                        # HTTP 409 (LeaseLost): definitive lease loss — no retry,
+                        # skip completion attempts against the dead lease.
+                        if _http_status(error) == 409:
+                            self.lease_revoked = True
+                            raise LiveError('task_lease_lost') from error
+                        if beat_attempt == 0 and is_task_heartbeat_transport_error(error):
                             delay = 1
-                            # deadline comes from checked_deadline, which already
-                            # subtracted completion_reserve; keep at least 5 s more
-                            # after the wait, the same floor it enforces.
-                            require(self.clock() + delay + 5 < deadline,
-                                    'task_deadline_insufficient')
+                            # deadline is from checked_deadline (already net of
+                            # completion_reserve). Budget the sleep, the client's
+                            # fixed POST timeout, and the same 5 s execute floor.
+                            require(
+                                self.clock() + delay + HUB_POST_TIMEOUT_SECONDS + 5
+                                < deadline,
+                                'task_deadline_insufficient')
                             self.sleep(delay)
+                            # Re-check after sleeping: scheduler delay can push
+                            # the second POST past the budget even when the
+                            # pre-sleep check passed.
+                            require(
+                                self.clock() + HUB_POST_TIMEOUT_SECONDS + 5
+                                < deadline,
+                                'task_deadline_insufficient')
                             continue
                         raise
                     break
@@ -858,6 +909,9 @@ class Worker:
                 # room reconcile), the safe side. Do not "fix" it by resetting.
                 # A malformed (non-object) answer is not a confirmation either.
                 require(isinstance(receipt, dict) and receipt.get('active') is True, 'task_lease_lost')
+                # Ack arrived but too little execute budget remains: fail before
+                # flipping the flag or entering execute.
+                require(deadline - self.clock() >= 5, 'task_deadline_insufficient')
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:
