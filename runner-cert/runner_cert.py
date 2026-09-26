@@ -45,6 +45,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 MACHINE_FP_PREFIX = "runner-cert-machine-v1:"
+CURSOR_VERSION_DIR = re.compile(r"\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7,40}")
 
 SUITE = "runner-cert-v1"
 HARNESS_VERSION = "1"
@@ -759,7 +760,10 @@ class CursorAdapter(CommandAdapter):
                 or os.path.join(os.path.expanduser("~"), "AppData", "Local"))
         base = os.path.join(root, "cursor-agent", "versions")
         try:
-            names = sorted((entry.name for entry in os.scandir(base) if entry.is_dir()), reverse=True)
+            # Dated folders only: an auto-update unpacks into versions\dist-package
+            # first, and that name sorts above every date (seen on retina).
+            names = sorted((entry.name for entry in os.scandir(base)
+                            if entry.is_dir() and CURSOR_VERSION_DIR.fullmatch(entry.name)), reverse=True)
         except OSError:
             return None, None, None, "cli_not_found"
         for name in names:  # newest first, as the launcher picks it
@@ -1382,7 +1386,13 @@ def fingerprint_changed(receipts, runner_id, newest=None):
     previous = _previous_certified(receipts, runner_id, newest)
     if previous is None:
         return False
-    return _machine_fingerprint(newest) != _machine_fingerprint(previous)
+    before = _machine_fingerprint(previous)
+    if before is None:
+        # The previous receipt predates fingerprints (or could not read one):
+        # nothing to compare, so upgrading the harness does not de-certify.
+        return False
+    # A known machine that now differs, or can no longer be identified.
+    return _machine_fingerprint(newest) != before
 
 
 def _judge(receipt, now):

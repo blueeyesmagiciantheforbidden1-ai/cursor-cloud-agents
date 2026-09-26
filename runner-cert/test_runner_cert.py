@@ -400,6 +400,18 @@ class CertifyTest(unittest.TestCase):
         printed = json.loads("".join(call.args[0] for call in out.write.call_args_list))
         self.assertTrue(printed["test-runner"]["fingerprint_changed"])
 
+    def test_fingerprint_upgrade_and_lost_identity(self):
+        # A receipt from before fingerprints does not de-certify the first new one.
+        registry = os.path.join(self.root, "registry.json")
+        self.certify(honest, registry=registry, windows_machine_reader=lambda: None)
+        self.certify(honest, registry=registry, windows_machine_reader=lambda: "machine-A")
+        self.assertIsNotNone(runner_cert.latest_certification(registry, "test-runner"))
+        self.assertFalse(runner_cert.certification_status(registry)["test-runner"]["fingerprint_changed"])
+        # A known machine that can no longer be identified must re-certify.
+        self.certify(honest, registry=registry, windows_machine_reader=lambda: None)
+        self.assertIsNone(runner_cert.latest_certification(registry, "test-runner"))
+        self.assertTrue(runner_cert.certification_status(registry)["test-runner"]["fingerprint_changed"])
+
     def test_unavailable_cli_is_not_certified_and_never_run(self):
         adapter = runner_cert.UnverifiedCliAdapter("grok", "grok", which=lambda name: None)
         receipt = self.certify(adapter)
@@ -677,7 +689,7 @@ class AdapterTest(unittest.TestCase):
     def test_cursor_resolves_newest_version_like_the_bus_worker(self):
         versions = os.path.join(self.root, "cursor-agent", "versions")
         for name, complete in (("2026.09.18-aaaaaaa", True), ("2026.09.23-bbbbbbb", True),
-                               ("2026.09.30-ccccccc", False)):
+                               ("2026.09.30-ccccccc", False), ("dist-package", True)):
             folder = os.path.join(versions, name)
             os.makedirs(folder)
             for file_name in ("index.js", "node.exe") if complete else ("node.exe",):
