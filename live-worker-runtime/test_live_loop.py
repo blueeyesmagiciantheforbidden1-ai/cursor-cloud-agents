@@ -1853,6 +1853,23 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertIs(result['model_call_attempted'], False)
         self.assertNotEqual(result.get('outcome'), 'completed')
 
+    def test_malformed_model_call_heartbeat_answer_skips_execute(self):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'model_call':
+                client.calls.append((path, copy.deepcopy(value)))
+                return ['not', 'an', 'object']
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIs(result['model_call_attempted'], False)
+
     def test_worker_stopping_before_phase_flip_stays_setup(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         beat = {}

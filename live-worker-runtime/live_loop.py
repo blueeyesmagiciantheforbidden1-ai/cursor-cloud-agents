@@ -819,7 +819,8 @@ class Worker:
                 # never confirmed model_call (or revoked the lease) and execute
                 # was never entered. Transport errors from post raise before the
                 # flag flips for the same reason.
-                require(receipt.get('active') is True, 'task_lease_lost')
+                # A malformed (non-object) answer is not a confirmation either.
+                require(isinstance(receipt, dict) and receipt.get('active') is True, 'task_lease_lost')
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:
