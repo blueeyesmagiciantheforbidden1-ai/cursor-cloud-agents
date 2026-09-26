@@ -1,16 +1,17 @@
 """Disabled, offline MH-003 prototype. Requires Python 3.10+ and git.
 
-Only trusted, importable (multiprocessing-spawn compatible) fake providers and
+Only trusted, importable (subprocess-import compatible) fake providers and
 trusted local test commands are supported. Python audit hooks catch ordinary
 fake-provider escapes; they are NOT an OS sandbox for hostile Python/native code.
-No live adapter imports or network clients. See out/MYHERO_MH003_RUNNER_DESIGN.md.
+No live adapter imports or network clients. See runcrew/docs/MYHERO_MH003_RUNNER_DESIGN.md.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-import multiprocessing
+import importlib
+import threading
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -24,8 +25,14 @@ import uuid
 ENABLED = False
 DEFAULT_LIMITS = {
     "time_seconds": 60, "provider_seconds": 30, "test_seconds": 15,
+    "cpu_seconds": 30, "address_space_bytes": 1024 * 1024 * 1024,
+    "file_size_bytes": 8 * 1024 * 1024, "processes": 64,
     "bytes": 8 * 1024 * 1024, "files": 1000, "diff_bytes": 1024 * 1024,
 }
+
+
+_USED_IDS = set()
+_ALLOCATION_LOCK = threading.Lock()
 
 
 class RunnerError(Exception):
@@ -177,49 +184,153 @@ def _guard(workspace):
     return refused
 
 
-def _provider_child(provider_fn, workspace, text, deadline, connection):
-    # Spawn imports the trusted callable before entering this guard.
+def _provider_entry(payload):
     sys.dont_write_bytecode = True
-    workspace = Path(workspace).resolve()
+    sys.path[:] = payload["import_paths"]
+    provider = importlib.import_module(payload["module"])
+    for part in payload["qualname"].split("."):
+        provider = getattr(provider, part)
+    workspace = Path(payload["workspace"]).resolve()
     os.chdir(workspace)
-    # Provider text is not an exported artifact, including on crashes.
-    sink = open(os.devnull, "w")
-    sys.stdout = sys.stderr = sink
     refused = _guard(workspace)
     code = None
     try:
-        provider_fn(workspace, text, deadline)
+        provider(workspace, payload["text"], payload["deadline"])
     except BaseException:
         code = "provider_error"
-    try:
-        connection.send(refused[0] if refused else code)
-    finally:
-        connection.close()
+    codes = [None, "provider_error", "outside_write", "unsafe_path",
+             "unsafe_link", "forbidden_operation"]
+    return codes.index(refused[0] if refused else code)
 
 
-def _provider(provider_fn, workspace, text, deadline):
-    context = multiprocessing.get_context("spawn")
-    receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(target=_provider_child,
-                              args=(provider_fn, str(workspace), text, deadline, sender))
-    started = False
+def _provider(provider_fn, workspace, text, deadline, env, bound):
+    # exec with env= is essential: clearing os.environ after spawn still leaks
+    # the original environment through /proc/self/environ on Linux.
+    payload = dict(module=provider_fn.__module__, qualname=provider_fn.__qualname__,
+                   import_paths=[os.path.abspath(p) for p in sys.path],
+                   workspace=str(workspace), text=text, deadline=deadline)
+    request = workspace.parent / "control" / "provider-request.json"
+    request.write_text(json.dumps(payload), encoding="utf-8")
+    bootstrap = ("import json,sys; sys.path.insert(0,sys.argv[1]); "
+                 "from workspace_runner import _provider_entry; "
+                 "sys.exit(_provider_entry(json.load(open(sys.argv[2],encoding='utf-8'))))")
     try:
-        process.start(); started = True
-        sender.close()
-        process.join(max(0, deadline - time.monotonic()))
-        if process.is_alive():
-            raise RunnerError("provider_timeout")
-        _need(process.exitcode == 0 and receiver.poll(), "provider_error")
-        code = receiver.recv()
-        _need(code is None, code)
-    finally:
-        if started:
-            if process.is_alive():
-                process.kill()
-            process.join(5)
-            _need(not process.is_alive(), "provider_stop_uncertain")
-            process.close()
-        receiver.close(); sender.close()
+        code, _ = _command([sys.executable, "-I", "-B", "-c", bootstrap,
+                            str(Path(__file__).resolve().parent), str(request)],
+                           workspace, env, deadline, bound["bytes"], bound)
+    except RunnerError as failure:
+        if str(failure) == "command_timeout":
+            raise RunnerError("provider_timeout") from None
+        raise
+    codes = {1: "provider_error", 2: "outside_write", 3: "unsafe_path",
+             4: "unsafe_link", 5: "forbidden_operation"}
+    _need(code == 0, codes.get(code, "provider_error"))
+
+
+def _child_environment(workspace, task_env):
+    _need(type(task_env) is dict, "invalid_task_env")
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(workspace),
+           "TMP": str(workspace), "TEMP": str(workspace), "TMPDIR": str(workspace),
+           "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+    if os.name == "nt":
+        for key in ("SYSTEMROOT", "COMSPEC"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+    for key, value in task_env.items():
+        _need(type(key) is str and key and "=" not in key and "\0" not in key
+              and type(value) is str and "\0" not in value, "invalid_task_env")
+        upper = key.upper()
+        _need(not any(word in upper for word in
+                      ("TOKEN", "SECRET", "KEY", "PASSWORD", "CREDENTIAL"))
+              and not upper.startswith(("HUB_", "GOOGLE_", "CLOUDSDK_", "GCE_",
+                                        "AWS_", "AZURE_", "BROKER", "RUNCREW_")),
+              "forbidden_task_env")
+        # Task variables cannot replace the supervisor's fixed environment or
+        # inject interpreter/loader configuration.
+        _need(upper not in env and upper not in ("SYSTEMROOT", "COMSPEC", "WINDIR", "USERPROFILE")
+              and not upper.startswith(("PYTHON", "LD_", "DYLD_", "GIT_")),
+              "forbidden_task_env")
+        env[key] = value
+    return env
+
+
+def _credential_policy(root, directories):
+    _need(isinstance(directories, (list, tuple)), "invalid_credential_dirs")
+    for directory in directories:
+        credential = Path(directory).resolve()
+        _need(credential != root and root not in credential.parents
+              and credential not in root.parents, "credential_overlap")
+    # Fail closed on all links/reparse points: this also refuses indirect links
+    # to ancestors of a credential directory, cycles, and broken links.
+    def unreadable(error):
+        raise RunnerError("credential_policy_unreadable") from None
+    for folder, dirs, files in os.walk(root, followlinks=False, onerror=unreadable):
+        for name in dirs + files:
+            _need(not _link((Path(folder) / name).lstat()), "unsafe_link")
+
+
+def _apply_rlimits(bound):
+    if os.name != "posix":
+        return
+    try:
+        import resource
+    except ImportError:
+        return
+    for name, key in (("RLIMIT_CPU", "cpu_seconds"), ("RLIMIT_AS", "address_space_bytes"),
+                      ("RLIMIT_FSIZE", "file_size_bytes"), ("RLIMIT_NPROC", "processes")):
+        if hasattr(resource, name):
+            limit = getattr(resource, name)
+            _, hard = resource.getrlimit(limit)
+            value = math.ceil(bound[key])
+            if hard != resource.RLIM_INFINITY:
+                value = min(value, hard)
+            resource.setrlimit(limit, (value, value))
+
+
+def _windows_job(process):
+    """Assign the suspended child before it can spawn, then resume it.
+
+    TerminateJobObject is the taskkill /T equivalent, including descendants
+    whose immediate parent already exited. No breakaway flag is enabled.
+    """
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    job = kernel.CreateJobObjectW(None, None)
+    try:
+        _need(job and kernel.AssignProcessToJobObject(job, int(process._handle)),
+              "command_stop_uncertain")
+        native = ctypes.WinDLL("ntdll")
+        native.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        native.NtResumeProcess.restype = ctypes.c_long
+        _need(native.NtResumeProcess(int(process._handle)) == 0, "command_stop_uncertain")
+    except BaseException:
+        process.kill()
+        process.wait(timeout=5)
+        if job:
+            kernel.CloseHandle(job)
+        raise
+    return kernel, job
+
+
+def _kill_tree(process, job=None):
+    if os.name == "posix":
+        import signal
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif job is not None:
+        kernel, handle = job
+        try:
+            _need(kernel.TerminateJobObject(handle, 1), "command_stop_uncertain")
+        finally:
+            kernel.CloseHandle(handle)
 
 
 def _environment(control):
@@ -235,30 +346,35 @@ def _environment(control):
     return env
 
 
-def _command(argv, cwd, env, deadline, output_limit):
+def _command(argv, cwd, env, deadline, output_limit, bound=None):
     """Drain stdout concurrently, cap memory, discard stderr, never invoke a shell."""
-    import threading
     remaining = deadline - time.monotonic()
     _need(remaining > 0, "command_timeout")
     process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               start_new_session=(os.name != "nt"))
+                               start_new_session=(os.name != "nt"),
+                               creationflags=0x00000004 if os.name == "nt" else 0,
+                               preexec_fn=(lambda: _apply_rlimits(bound or DEFAULT_LIMITS))
+                               if os.name == "posix" else None)
+    job = _windows_job(process) if os.name == "nt" else None
     data = bytearray()
     overflow = threading.Event()
     def drain():
         while True:
-            chunk = process.stdout.read(65536)
+            chunk = process.stdout.read1(min(65536, output_limit + 1))
             if not chunk:
                 break
             if len(data) + len(chunk) > output_limit:
                 overflow.set()
-                process.kill()
                 break
             data.extend(chunk)
     thread = threading.Thread(target=drain, daemon=True)
     thread.start()
     try:
-        process.wait(timeout=remaining)
+        while process.poll() is None:
+            if overflow.wait(min(0.02, max(0, deadline - time.monotonic()))):
+                raise RunnerError("output_limit")
+            _need(time.monotonic() < deadline, "command_timeout")
         thread.join(max(0, deadline - time.monotonic()))
         _need(not thread.is_alive(), "command_timeout")
         _need(not overflow.is_set(), "output_limit")
@@ -266,19 +382,11 @@ def _command(argv, cwd, env, deadline, output_limit):
     except subprocess.TimeoutExpired:
         raise RunnerError("command_timeout") from None
     finally:
-        if os.name != "nt":
-            import signal
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.poll() is None:
-            process.kill()
+        _kill_tree(process, job)
         process.wait(timeout=5)
         thread.join(1)
         if not thread.is_alive():
             process.stdout.close()
-        # Windows descendants are outside this prototype's trust contract.
         _need(not thread.is_alive(), "command_stop_uncertain")
 
 
@@ -331,11 +439,13 @@ def _discard(path, root):
     return proof
 
 
-def run_coding_task(spec, provider_fn, *, root, limits):
+def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, task_env=None):
     """Run one offline experiment, even though live enablement stays False.
 
     spec: {base_snapshot: directory/tar path, task_text: str,
            test_command: nonempty argv list, limits: optional tightening dict}.
+    credential_dirs must be disjoint from root; links below root are refused.
+    task_env explicitly passes non-secret variables to provider and tests only.
     limits use DEFAULT_LIMITS keys; neither caller nor spec can raise hard caps.
     provider_fn must be a trusted importable top-level callable (no lambdas or
     closures). Its return value is ignored. test counts represent ONE command
@@ -356,9 +466,17 @@ def run_coding_task(spec, provider_fn, *, root, limits):
     _need(callable(provider_fn) and "base_snapshot" in spec, "invalid_spec")
     root = _plain_path(root)
     _need(root.is_dir(), "invalid_root")
+    _credential_policy(root, [] if credential_dirs is None else credential_dirs)
+    _child_environment(root, {} if task_env is None else task_env)
     deadline = time.monotonic() + bound["time_seconds"]
     run = root / ("workspace-" + uuid.uuid4().hex)
-    run.mkdir()
+    with _ALLOCATION_LOCK:
+        _need(run.name not in _USED_IDS and not os.path.lexists(run), "workspace_reuse")
+        try:
+            run.mkdir()
+        except FileExistsError:
+            raise RunnerError("workspace_reuse") from None
+        _USED_IDS.add(run.name)
     workspace, control = run / "work", run / "control"
     result = {"status": "failed", "error_code": None, "model_call_attempted": False,
               "runner_receipt": None, "diff": None, "discard_proof": None}
@@ -367,6 +485,7 @@ def run_coding_task(spec, provider_fn, *, root, limits):
         workspace.mkdir(); control.mkdir()
         _materialize(spec["base_snapshot"], workspace, bound)
         env = _environment(control)
+        child_env = _child_environment(workspace, {} if task_env is None else task_env)
         git = shutil.which("git")
         _need(git is not None, "git_unavailable")
         def git_run(*args, cap=None):
@@ -386,11 +505,11 @@ def run_coding_task(spec, provider_fn, *, root, limits):
         base_commit = git_run("rev-parse", "HEAD").decode().strip()
         result["model_call_attempted"] = True
         _provider(provider_fn, workspace, text,
-                  min(deadline, time.monotonic() + bound["provider_seconds"]))
+                  min(deadline, time.monotonic() + bound["provider_seconds"]), child_env, bound)
         _snapshot(workspace, bound)
         try:
-            code, _ = _command(argv, workspace, env,
-                               min(deadline, time.monotonic() + bound["test_seconds"]), bound["bytes"])
+            code, _ = _command(argv, workspace, child_env,
+                               min(deadline, time.monotonic() + bound["test_seconds"]), bound["bytes"], bound)
         except RunnerError as failure:
             if str(failure) == "command_timeout":
                 raise RunnerError("test_timeout") from None

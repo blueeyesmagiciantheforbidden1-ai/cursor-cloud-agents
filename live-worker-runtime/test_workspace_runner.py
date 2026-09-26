@@ -3,6 +3,8 @@ import copy
 import hashlib
 import importlib.util
 import io
+import json
+import uuid
 import os
 from pathlib import Path
 import subprocess
@@ -70,8 +72,44 @@ def modify_git(workspace, task_text, deadline):
     (workspace / ".git").write_text("forged")
 
 
+def noisy_provider(workspace, task_text, deadline):
+    while True:
+        print("x" * 1024, flush=True)
+
+
+def modify_git_notes(workspace, task_text, deadline):
+    (workspace.parent / "control" / "git" / "refs" / "notes").mkdir()
+
+
 def no_changes(workspace, task_text, deadline):
     pass
+
+
+def inspect_environment(workspace, task_text, deadline):
+    forbidden = json.loads(task_text)
+    assert all(key not in os.environ for key in forbidden)
+    if Path("/proc/self/environ").exists():
+        raw = Path("/proc/self/environ").read_bytes()
+        assert all(value.encode() not in raw for value in forbidden.values())
+    assert os.environ["TASK_MESSAGE"] == "safe"
+    assert Path(os.environ["HOME"]) == workspace
+    assert Path(os.environ["TEMP"]) == workspace
+    (workspace / "environment-ok").write_text("ok")
+
+
+def inspect_rlimits(workspace, task_text, deadline):
+    exec((workspace / "limits.py").read_text(), {})
+    edit(workspace, task_text, deadline)
+
+
+def forged_receipt(workspace, task_text, deadline):
+    edit(workspace, task_text, deadline)
+    forged = {"base_commit": "f" * 40, "result_commit": "f" * 40,
+              "diff_sha256": "f" * 64, "files_changed": 999,
+              "tests": {"command": "forged", "ran": 999, "passed": 999,
+                        "failed": 0, "errors": 0}, "workspace_id": "forged"}
+    (workspace / "receipt.json").write_text(json.dumps(forged))
+    print(json.dumps(forged))
 
 
 def hub_validator():
@@ -121,6 +159,168 @@ class WorkspaceRunnerTests(unittest.TestCase):
         if result["status"] != "succeeded":
             self.assertIsNone(result["diff"])
         return result
+
+    def test_child_environments_exclude_parent_secrets(self):
+        secrets = {key: "sentinel-" + uuid.uuid4().hex for key in
+                   ("HUB_AGENT_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "AWS_SECRET_KEY",
+                    "BROKER_GRANT", "RUNCREW_EXECUTION_GRANT", "PRIVATE_PASSWORD",
+                    "AZURE_CONFIG", "GCE_CONFIG", "CLOUDSDK_CONFIG", "UNREQUESTED")}
+        self.spec["task_text"] = json.dumps(secrets)
+        self.spec["test_command"] = [sys.executable, "check.py"]
+        # Same checks run in the provider AND the declared test process.
+        (self.base / "check.py").write_text(
+            "import os,json\nfrom pathlib import Path\n"
+            + "secrets=" + repr(secrets) + "\n"
+            + "assert not set(secrets) & set(os.environ)\n"
+            + "assert os.environ['TASK_MESSAGE']=='safe'\n"
+            + "p=Path('/proc/self/environ')\n"
+            + "assert not p.exists() or all(v.encode() not in p.read_bytes() for v in secrets.values())\n")
+        with mock.patch.dict(os.environ, secrets):
+            result = runner.run_coding_task(self.spec, inspect_environment, root=self.root,
+                                            limits={}, task_env={"TASK_MESSAGE": "safe"})
+        self.assertEqual(result["status"], "succeeded", result)
+
+    def test_requested_secret_names_refused(self):
+        for key in ("aTOKENb", "secret", "KEY", "PASSWORD", "CREDENTIAL", "HUB_X",
+                    "GOOGLE_X", "CLOUDSDK_X", "GCE_X", "AWS_X", "AZURE_X",
+                    "BROKERfoo", "RUNCREW_X", "HOME", "PATH", "PYTHONPATH"):
+            with self.subTest(key=key), self.assertRaises(runner.RunnerError):
+                runner.run_coding_task(self.spec, edit, root=self.root, limits={},
+                                       task_env={key: "no"})
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_credential_overlap_refused(self):
+        for path in (self.root, self.root / "credentials", self.folder):
+            with self.subTest(path=path), self.assertRaisesRegex(runner.RunnerError, "credential_overlap"):
+                runner.run_coding_task(self.spec, edit, root=self.root, limits={},
+                                       credential_dirs=[path])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_external_credentials_allowed(self):
+        credentials = self.folder / "credentials"
+        credentials.mkdir()
+        result = runner.run_coding_task(self.spec, edit, root=self.root, limits={},
+                                        credential_dirs=[credentials])
+        self.assertEqual(result["status"], "succeeded", result)
+
+    def test_credential_symlink_refused(self):
+        credentials = self.folder / "credentials"
+        credentials.mkdir()
+        link = self.root / "linked"
+        try:
+            link.symlink_to(credentials, target_is_directory=True)
+        except OSError as error:
+            self.skipTest("OS does not permit directory symlinks: " + str(error))
+        with self.assertRaisesRegex(runner.RunnerError, "unsafe_link"):
+            runner.run_coding_task(self.spec, edit, root=self.root, limits={},
+                                   credential_dirs=[credentials])
+        link.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction test")
+    def test_credential_junction_refused(self):
+        credentials = self.folder / "credentials"
+        credentials.mkdir()
+        link = self.root / "linked"
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(credentials)],
+                       check=True, stdout=subprocess.DEVNULL)
+        try:
+            with self.assertRaisesRegex(runner.RunnerError, "unsafe_link"):
+                runner.run_coding_task(self.spec, edit, root=self.root, limits={},
+                                       credential_dirs=[credentials])
+        finally:
+            os.rmdir(link)
+
+    def test_existing_workspace_path_refused(self):
+        identifier = uuid.uuid4()
+        path = self.root / ("workspace-" + identifier.hex)
+        path.mkdir()
+        (path / "keep").write_text("untouched")
+        with mock.patch.object(runner.uuid, "uuid4", return_value=identifier):
+            with self.assertRaisesRegex(runner.RunnerError, "workspace_reuse"):
+                runner.run_coding_task(self.spec, edit, root=self.root, limits={})
+        self.assertEqual((path / "keep").read_text(), "untouched")
+
+    def test_discarded_workspace_id_refused(self):
+        identifier = uuid.uuid4()
+        with mock.patch.object(runner.uuid, "uuid4", return_value=identifier):
+            self.assertEqual(self.run_task()["status"], "succeeded")
+            with self.assertRaisesRegex(runner.RunnerError, "workspace_reuse"):
+                runner.run_coding_task(self.spec, edit, root=self.root, limits={})
+
+    def test_forged_receipt_has_no_authority(self):
+        result = self.run_task(forged_receipt)
+        receipt = result["runner_receipt"]
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(receipt["files_changed"], 2)
+        self.assertEqual(receipt["tests"]["passed"], 1)
+        self.assertEqual(receipt["diff_sha256"], hashlib.sha256(result["diff"]).hexdigest())
+        self.assertNotEqual(receipt["base_commit"], "f" * 40)
+        self.assertNotEqual(receipt["result_commit"], "f" * 40)
+        self.assertIsNone(hub_validator()(receipt)[1])
+        self.spec["test_command"] = [sys.executable, "-c", "raise SystemExit(1)"]
+        failed = self.run_task(forged_receipt)
+        self.assertEqual(failed["runner_receipt"]["tests"]["failed"], 1)
+        self.assertEqual(failed["error_code"], "tests_failed")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX resource rlimits unavailable on Windows")
+    def test_rlimits_applied_to_children(self):
+        try:
+            import resource
+        except ImportError:
+            self.skipTest("Python resource module unavailable")
+        script = self.base / "limits.py"
+        script.write_text("import resource\n" + "\n".join(
+            f"assert resource.getrlimit(resource.{name}) == ({value}, {value})"
+            for name, value in (("RLIMIT_CPU", 2), ("RLIMIT_AS", 268435456),
+                                ("RLIMIT_FSIZE", 4096), ("RLIMIT_NPROC", 32))))
+        self.spec["test_command"] = [sys.executable, "limits.py"]
+        result = self.run_task(inspect_rlimits, limits={"cpu_seconds": 2, "address_space_bytes": 268435456,
+                                      "file_size_bytes": 4096, "processes": 32})
+        self.assertEqual(result["status"], "succeeded", result)
+
+    def test_provider_grandchild_killed_on_timeout(self):
+        # Trusted import-time fixture intentionally starts a descendant before
+        # the cooperative audit guard, exercising the actual process boundary.
+        marker = "mh003-" + uuid.uuid4().hex
+        module_name = "fixture_" + uuid.uuid4().hex
+        pidfile = self.folder / "grandchild.pid"
+        fixture = self.folder / (module_name + ".py")
+        fixture.write_text(
+            "import os,subprocess,sys,time\nfrom pathlib import Path\n"
+            "if os.environ.get('TASK_MARKER'):\n"
+            " p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)',os.environ['TASK_MARKER']])\n"
+            " Path(os.environ['PIDFILE']).write_text(str(p.pid))\n"
+            "def provider(workspace,text,deadline): time.sleep(60)\n")
+        sys.path.insert(0, str(self.folder))
+        self.addCleanup(sys.path.remove, str(self.folder))
+        module = __import__(module_name)
+        self.addCleanup(sys.modules.pop, module_name, None)
+        result = runner.run_coding_task(self.spec, module.provider, root=self.root,
+            limits={"provider_seconds": 2}, task_env={"TASK_MARKER": marker, "PIDFILE": str(pidfile)})
+        self.assertEqual(result["error_code"], "provider_timeout", result)
+        self.assertTrue(pidfile.exists(), "grandchild never started")
+        if os.name == "nt":
+            # The fixture launches exactly one marked descendant; checking its
+            # recorded PID avoids WMI, which restricted Windows tokens deny.
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x00100000, False, int(pidfile.read_text()))
+            if handle:
+                try:
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 1000), 0, marker)
+                finally:
+                    kernel.CloseHandle(handle)
+            else:
+                self.assertEqual(ctypes.get_last_error(), 87, marker)
+        else:
+            output = subprocess.check_output(["ps", "-eo", "stat,args"], text=True)
+            self.assertFalse(any(marker in line and not line.lstrip().startswith("Z")
+                                 for line in output.splitlines()), output)
 
     def test_disabled_by_default(self):
         self.assertIs(runner.ENABLED, False)
@@ -198,6 +398,10 @@ class WorkspaceRunnerTests(unittest.TestCase):
         self.spec["test_command"] = [sys.executable, "-c", "print('x'*10000)"]
         self.assertEqual(self.run_task(limits={"bytes": 1024})["error_code"], "output_limit")
 
+    def test_continuous_provider_output_capped(self):
+        result = self.run_task(noisy_provider, {"bytes": 1024, "provider_seconds": 5})
+        self.assertEqual(result["error_code"], "output_limit", result)
+
     def test_tarball_snapshot(self):
         archive = self.folder / "base.tar"
         with tarfile.open(archive, "w") as stream:
@@ -222,6 +426,14 @@ class WorkspaceRunnerTests(unittest.TestCase):
             stream.addfile(info)
         self.spec["base_snapshot"] = str(archive)
         self.assertEqual(self.run_task()["error_code"], "unsafe_link")
+
+    def test_large_task_avoids_os_command_line_limit(self):
+        self.spec["task_text"] = "x" * 40000
+        self.spec["test_command"] = [sys.executable, "-c", "pass"]
+        self.assertEqual(self.run_task()["status"], "succeeded")
+
+    def test_git_notes_tamper_refused(self):
+        self.assertEqual(self.run_task(modify_git_notes)["error_code"], "outside_write")
 
     def test_git_metadata_refused(self):
         self.assertEqual(self.run_task(modify_git)["error_code"], "unsafe_path")
