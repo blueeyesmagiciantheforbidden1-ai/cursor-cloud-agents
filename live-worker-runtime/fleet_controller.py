@@ -43,6 +43,58 @@ QUOTA_PARK_CAP_SECONDS = 14400
 
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
 
+# Hub advisory readiness phases (POST /v1/fleet/readiness). Mapped from the
+# controller slot phases below; see map_readiness_phase.
+READINESS_PHASES = ('idle', 'launching', 'pending_start', 'starting', 'ready', 'blocked', 'unknown')
+
+
+def execution_started(execution):
+    """True when the controller has observed the execution as started (not merely created)."""
+    if not isinstance(execution, dict):
+        return False
+    running = execution.get('runningCount', 0)
+    if type(running) is int and running > 0:
+        return True
+    start = execution.get('startTime')
+    return isinstance(start, str) and bool(start)
+
+
+def map_readiness_phase(slot_phase, execution=None):
+    """Map a controller slot phase (+ created vs started execution) to hub readiness.
+
+    Controller slot phases (this file):
+      idle             — L358 init / L376 tick branch
+      binding_intent   — L389
+      binding_ready    — L395
+      launch_intent    — L401
+      launch_submitted — L410
+      grant_intent     — L426
+      active           — L430
+      blocked          — L418 / L468
+
+    Execution status the controller already observes: created (execution dict
+    present) vs started (runningCount > 0 or startTime). launch_submitted with
+    no execution yet is pending_start; created-but-not-started is starting;
+    started under active is ready.
+    """
+    if slot_phase == 'idle':
+        return 'idle'
+    if slot_phase == 'blocked':
+        return 'blocked'
+    if slot_phase in ('binding_intent', 'binding_ready', 'launch_intent'):
+        return 'launching'
+    if slot_phase == 'launch_submitted':
+        if execution is None:
+            return 'pending_start'
+        return 'starting'
+    if slot_phase == 'grant_intent':
+        return 'starting'
+    if slot_phase == 'active':
+        if execution is not None and not execution_started(execution):
+            return 'starting'
+        return 'ready'
+    return 'unknown'
+
 
 def require(value, code):
     if not value: raise ControllerError(code)
@@ -90,10 +142,12 @@ class Controller:
     perform the corresponding external mutation. An intent is never replayed.
     """
     def __init__(self, policy, slot, store, cloud, broker, *, binding_store=None,
-                 grant_factory=ExecutionGrantStore, clock=time.time):
+                 grant_factory=ExecutionGrantStore, clock=time.time, readiness_publisher=None):
         self.policy, self.slot, self.store, self.cloud, self.broker = policy, slot, store, cloud, broker
         self.bindings = binding_store or BindingStore(policy)
         self.grant_factory, self.clock = grant_factory, clock
+        # Optional advisory hub publisher (off unless injected / env-enabled).
+        self.readiness_publisher = readiness_publisher
         require(set(slot) == {'job_uid', 'template_sha256', 'enabled'} and type(slot['enabled']) is bool
                 and re.fullmatch(r'[a-f0-9-]{36}', slot['job_uid'])
                 and re.fullmatch(r'[a-f0-9]{64}', slot['template_sha256']), 'slot_config_invalid')
@@ -279,6 +333,24 @@ class Controller:
         return result, self.store.cas(result, version)
 
     def tick(self):
+        # Publish hook: after each tick, best-effort advisory readiness. A
+        # failure never changes the tick result, CAS state, or launch path.
+        result = self._tick()
+        self._publish_readiness_after_tick()
+        return result
+
+    def _publish_readiness_after_tick(self):
+        publisher = self.readiness_publisher
+        if publisher is None:
+            return
+        try:
+            from fleet_readiness_publisher import publish_after_tick
+            publish_after_tick([self], publisher)
+        except Exception:
+            # Publisher is best-effort; never break the tick path.
+            pass
+
+    def _tick(self):
         if not self.slot['enabled']:
             return {'status': 'disabled'}
         state, version = self.store.read()
