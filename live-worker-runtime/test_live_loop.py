@@ -2349,16 +2349,19 @@ class HeartbeatPhaseTests(unittest.TestCase):
         import threading
         from http.server import ThreadingHTTPServer
         from urllib.request import Request, urlopen
-        import agent_hub
         import agent_hub.core as agent_hub_core
         from agent_hub.core import AGENTS, Hub
-        # Skip only when server.py is absent (worker image). If the file exists
-        # but the import is broken, this test must ERROR — not skip silently.
-        server_path = Path(agent_hub.__file__).resolve().parent / 'server.py'
-        if not server_path.is_file():
-            self.skipTest('agent_hub/server.py is not shipped in the worker image')
+        # Worker images (their Dockerfile sets RUNCREW_LIVE_PROVIDER) copy the
+        # pack's agent_hub/ over the base image's older store.py and server.py,
+        # so the modules on the image path are not one hub. Replay only in the
+        # dev layout (vendored ../agent-hub); anywhere else a missing or stale
+        # module must ERROR, never skip.
+        if os.environ.get('RUNCREW_LIVE_PROVIDER'):
+            self.skipTest('old-hub replay needs the dev layout, not a worker image')
         from agent_hub.server import load_tokens, make_handler
         from agent_hub.store import SQLiteStore
+        self.assertTrue(hasattr(SQLiteStore, 'mutate_room_with_state'),
+                        'agent_hub.core claims through mutate_room_with_state; this store.py predates it')
         # Pin: this vendored hub is pre-F4. If it gains heartbeat_phase, this
         # test would silently stop proving old-hub compatibility.
         self.assertFalse(hasattr(agent_hub_core, 'heartbeat_phase'))
