@@ -1923,7 +1923,13 @@ class HeartbeatPhaseTests(unittest.TestCase):
         from urllib.request import Request, urlopen
         import agent_hub.core as agent_hub_core
         from agent_hub.core import AGENTS, Hub
-        from agent_hub.server import load_tokens, make_handler
+        try:
+            from agent_hub.server import load_tokens, make_handler
+        except ImportError:
+            # Worker images ship agent_hub/ without server.py, and their
+            # Dockerfile runs this module: skip there, never fail the build.
+            # The dev layout (vendored ../agent-hub) always has it.
+            self.skipTest('agent_hub.server is not shipped in the worker image')
         from agent_hub.store import SQLiteStore
         # Pin: this vendored hub is pre-F4. If it gains heartbeat_phase, this
         # test would silently stop proving old-hub compatibility.
