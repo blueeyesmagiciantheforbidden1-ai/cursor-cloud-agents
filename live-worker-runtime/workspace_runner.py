@@ -424,6 +424,26 @@ def _tree_hash(path):
     return digest.hexdigest()
 
 
+def _git_refs_snapshot(git_dir):
+    """Snapshot loose refs and packed-refs for the control/git tripwire."""
+    refs = {}
+    refs_root = git_dir / "refs"
+    if refs_root.is_dir():
+        for folder, _dirs, files in os.walk(refs_root, followlinks=False):
+            for name in files:
+                path = Path(folder) / name
+                if _link(path.lstat()):
+                    continue
+                rel = str(path.relative_to(git_dir)).replace("\\", "/")
+                with open(path, "rb") as stream:
+                    refs[rel] = stream.read()
+    packed = git_dir / "packed-refs"
+    if packed.is_file() and not _link(packed.lstat()):
+        with open(packed, "rb") as stream:
+            refs["packed-refs"] = stream.read()
+    return refs
+
+
 def _discard(path, root):
     proof = {"path": str(path), "tree_sha256": None, "directory_absent": False}
     try:
@@ -497,7 +517,8 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
         git = shutil.which("git")
         _need(git is not None, "git_unavailable")
         def git_run(*args, cap=None):
-            code, output = _command([git, "--git-dir=" + str(control / "git"),
+            code, output = _command([git, "--no-replace-objects",
+                "--git-dir=" + str(control / "git"),
                 "--work-tree=" + str(workspace), "-c", "core.autocrlf=false",
                 "-c", "core.hooksPath=" + str(control / "no-hooks"),
                 "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
@@ -520,24 +541,8 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
         git_run("add", "--all", "--force")
         git_run("commit", "--allow-empty", "-m", "result")
         result_commit = git_run("rev-parse", "HEAD").decode().strip()
-        test_work = run / "test-work"
-        test_work.mkdir()
-        for name, (data, executable) in pre_test.items():
-            target = test_work.joinpath(*_relative(name))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("xb") as stream:
-                stream.write(data)
-            target.chmod(0o755 if executable else 0o644)
-        try:
-            code, _ = _command(argv, test_work, test_env,
-                               min(deadline, time.monotonic() + bound["test_seconds"]), bound["bytes"], bound)
-        except RunnerError as failure:
-            if str(failure) == "command_timeout":
-                raise RunnerError("test_timeout") from None
-            raise
-        # Tripwire: tests must not touch the receipt workspace at all.
-        post_test = _snapshot(workspace, bound)
-        _need(post_test == pre_test, "test_mutated_workspace")
+        # Freeze the receipt patch before tests: control/git is outside the
+        # worktree tripwire, and git diff honours replace refs by default.
         try:
             patch = git_run("diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames",
                             "--unified=3", base_commit, result_commit, "--", cap=bound["diff_bytes"])
@@ -546,13 +551,35 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
                 raise RunnerError("diff_limit") from None
             raise
         changed = git_run("diff", "--name-only", "-z", "--no-renames", base_commit, result_commit, "--")
+        files_changed = len(changed.rstrip(b"\0").split(b"\0")) if changed else 0
+        diff_sha256 = hashlib.sha256(patch).hexdigest()
+        test_work = run / "test-work"
+        test_work.mkdir()
+        for name, (data, executable) in pre_test.items():
+            target = test_work.joinpath(*_relative(name))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as stream:
+                stream.write(data)
+            target.chmod(0o755 if executable else 0o644)
+        git_dir = control / "git"
+        pre_refs = _git_refs_snapshot(git_dir)
+        try:
+            code, _ = _command(argv, test_work, test_env,
+                               min(deadline, time.monotonic() + bound["test_seconds"]), bound["bytes"], bound)
+        except RunnerError as failure:
+            if str(failure) == "command_timeout":
+                raise RunnerError("test_timeout") from None
+            raise
         result["runner_receipt"] = {
             "base_commit": base_commit, "result_commit": result_commit,
-            "diff_sha256": hashlib.sha256(patch).hexdigest(),
-            "files_changed": len(changed.rstrip(b"\0").split(b"\0")) if changed else 0,
+            "diff_sha256": diff_sha256, "files_changed": files_changed,
             "tests": {"command": command, "ran": 1, "passed": int(code == 0),
                       "failed": int(code != 0), "errors": 0}, "workspace_id": run.name,
         }
+        # Tripwire: tests must not touch the receipt workspace or control/git refs.
+        post_test = _snapshot(workspace, bound)
+        _need(post_test == pre_test, "test_mutated_workspace")
+        _need(_git_refs_snapshot(git_dir) == pre_refs, "test_mutated_control")
         _need(code == 0, "tests_failed")
         result["status"] = "succeeded"
     except BaseException as failure:

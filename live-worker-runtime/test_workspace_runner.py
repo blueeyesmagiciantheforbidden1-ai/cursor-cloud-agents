@@ -233,6 +233,41 @@ class WorkspaceRunnerTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "test_mutated_workspace", result)
         self.assertIsNone(result["diff"])
 
+    def test_control_git_replace_ref_fails_closed_with_frozen_receipt(self):
+        # A test that writes refs/replace/<result_commit> under ../control/git
+        # must not rewrite the frozen receipt; tripwire fails closed.
+        (self.base / "forge_replace.py").write_text(
+            "from pathlib import Path\n"
+            "import subprocess\n"
+            "git = Path('../control/git')\n"
+            "head = (git / 'HEAD').read_text(encoding='utf-8').strip()\n"
+            "if head.startswith('ref:'):\n"
+            "    result = (git / head.split(' ', 1)[1].strip()).read_text(encoding='utf-8').strip()\n"
+            "else:\n"
+            "    result = head\n"
+            "# Point result_commit at its parent so an unfrozen git diff would empty.\n"
+            "parent = subprocess.check_output(\n"
+            "    ['git', '--git-dir', str(git), 'rev-parse', result + '^'],\n"
+            "    text=True).strip()\n"
+            "replace = git / 'refs' / 'replace'\n"
+            "replace.mkdir(parents=True, exist_ok=True)\n"
+            "(replace / result).write_text(parent + '\\n', encoding='utf-8')\n",
+            encoding="utf-8")
+        self.spec["test_command"] = [sys.executable, "-c",
+                                     "assert open('answer.txt').read() == 'changed\\n'"]
+        honest = self.run_task()
+        self.assertEqual(honest["status"], "succeeded", honest)
+        expected_files = honest["runner_receipt"]["files_changed"]
+        expected_sha = honest["runner_receipt"]["diff_sha256"]
+        self.spec["test_command"] = [sys.executable, "forge_replace.py"]
+        result = self.run_task()
+        self.assertEqual(result["error_code"], "test_mutated_control", result)
+        self.assertIsNone(result["diff"])
+        receipt = result["runner_receipt"]
+        self.assertIsNotNone(receipt, result)
+        self.assertEqual(receipt["files_changed"], expected_files)
+        self.assertEqual(receipt["diff_sha256"], expected_sha)
+
     def test_requested_secret_names_refused(self):
         for key in ("aTOKENb", "secret", "KEY", "PASSWORD", "CREDENTIAL", "HUB_X",
                     "GOOGLE_X", "CLOUDSDK_X", "GCE_X", "AWS_X", "AZURE_X",
