@@ -44,6 +44,21 @@ def capability_env(**values):
                 os.environ[key] = value
 
 
+def require_dev_hub(test):
+    """Tests that run a real Hub need the dev layout (vendored ../agent-hub).
+
+    Worker images (their Dockerfile sets RUNCREW_LIVE_PROVIDER) copy the pack's
+    agent_hub/ over the base image's older store.py and server.py, so the
+    modules on the image path are not one hub: skip there. Anywhere else a
+    stale store must fail loudly, never skip.
+    """
+    if os.environ.get('RUNCREW_LIVE_PROVIDER'):
+        test.skipTest('needs a real hub (dev layout), not a worker image')
+    from agent_hub.store import SQLiteStore
+    test.assertTrue(hasattr(SQLiteStore, 'mutate_room_with_state'),
+                    'agent_hub.core claims through mutate_room_with_state; this store.py predates it')
+
+
 def arm_manifest(adapter):
     adapter.CLI_NAME = 'runcrew-live-grok'
     adapter.CLI_VERSION = '1'
@@ -2062,6 +2077,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
 
     def test_metadata_identity_409_does_not_revoke_task_lease(self):
         """Identity-path HTTP 409 is not LeaseLost; failure still completes."""
+        require_dev_hub(self)
         import io
         import uuid
         from unittest.mock import patch
@@ -2351,17 +2367,9 @@ class HeartbeatPhaseTests(unittest.TestCase):
         from urllib.request import Request, urlopen
         import agent_hub.core as agent_hub_core
         from agent_hub.core import AGENTS, Hub
-        # Worker images (their Dockerfile sets RUNCREW_LIVE_PROVIDER) copy the
-        # pack's agent_hub/ over the base image's older store.py and server.py,
-        # so the modules on the image path are not one hub. Replay only in the
-        # dev layout (vendored ../agent-hub); anywhere else a missing or stale
-        # module must ERROR, never skip.
-        if os.environ.get('RUNCREW_LIVE_PROVIDER'):
-            self.skipTest('old-hub replay needs the dev layout, not a worker image')
+        require_dev_hub(self)
         from agent_hub.server import load_tokens, make_handler
         from agent_hub.store import SQLiteStore
-        self.assertTrue(hasattr(SQLiteStore, 'mutate_room_with_state'),
-                        'agent_hub.core claims through mutate_room_with_state; this store.py predates it')
         # Pin: this vendored hub is pre-F4. If it gains heartbeat_phase, this
         # test would silently stop proving old-hub compatibility.
         self.assertFalse(hasattr(agent_hub_core, 'heartbeat_phase'))
