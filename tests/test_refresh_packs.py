@@ -226,6 +226,14 @@ class RefreshPacksTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_every_pack_ships_the_cli_version_probe(self):
+        for provider in refresh_packs.PROVIDERS:
+            files = refresh_packs.live_files(provider)
+            self.assertIn('providers/cli_version.py', files)
+            self.assertEqual(
+                files['providers/cli_version.py'],
+                refresh_packs.RUNTIME / 'providers' / 'cli_version.py')
+
     def test_built_packs_keep_every_import_pin_and_tag(self):
         closures = {}
         for provider in refresh_packs.PROVIDERS:

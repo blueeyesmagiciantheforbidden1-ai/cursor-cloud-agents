@@ -2873,6 +2873,121 @@ class LoopTests(unittest.TestCase):
             finally:
                 sp.run = real_run
 
+    def test_missing_cli_version_module_is_logged_with_a_fixed_reason(self):
+        import providers
+        import providers.cli_version as cli_version_mod
+
+        saved_mod = sys.modules['providers.cli_version']
+        saved_attr = getattr(providers, 'cli_version', None)
+        sys.modules['providers.cli_version'] = None
+        if hasattr(providers, 'cli_version'):
+            delattr(providers, 'cli_version')
+        try:
+            clock = Clock()
+            client = Client(clock)
+            logs = []
+            adapter = Adapter()
+            adapter.CLI_NAME = 'runcrew-live-grok'
+            adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+            adapter.WORKSPACE_MODE = 'read_only'
+            adapter.MODEL = 'grok-4.7'
+            adapter.EFFORT = 'xhigh'
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep, log=logs.append)
+            start_omit = [item for item in logs
+                          if isinstance(item, dict) and item.get('kind') == 'runcrew_capability_omit']
+            self.assertEqual(start_omit, [{
+                'kind': 'runcrew_capability_omit',
+                'reason': 'cli_version_module_missing',
+                'cli_name': adapter.CLI_NAME,
+            }])
+            self.assertEqual(adapter.CLI_VERSION_REASON, 'cli_version_module_missing')
+            self.assertIsNone(getattr(adapter, 'CLI_VERSION', None))
+            with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+                self.assertIsNone(worker._capability())
+            self.assertIn(
+                {'kind': 'runcrew_capability_omit', 'reason': 'cli_version_module_missing',
+                 'agent': 'grok'},
+                logs)
+        finally:
+            sys.modules['providers.cli_version'] = saved_mod
+            if saved_attr is not None:
+                providers.cli_version = saved_attr
+            elif hasattr(providers, 'cli_version'):
+                delattr(providers, 'cli_version')
+            # Keep the real module reachable for later tests in this process.
+            if cli_version_mod is not None:
+                sys.modules['providers.cli_version'] = cli_version_mod
+                providers.cli_version = cli_version_mod
+
+    def test_cli_version_bind_error_is_logged_with_a_fixed_reason(self):
+        import providers.cli_version as cli_version_mod
+
+        original = cli_version_mod.bind_cli_version
+
+        def boom(*args, **kwargs):
+            raise RuntimeError('probe detail must not leak')
+
+        clock = Clock()
+        client = Client(clock)
+        logs = []
+        adapter = Adapter()
+        adapter.CLI_NAME = 'runcrew-live-grok'
+        adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+        adapter.WORKSPACE_MODE = 'read_only'
+        adapter.MODEL = 'grok-4.7'
+        adapter.EFFORT = 'xhigh'
+        cli_version_mod.bind_cli_version = boom
+        try:
+            Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                   object(), clock=clock, sleep=clock.sleep, log=logs.append)
+            start_omit = [item for item in logs
+                          if isinstance(item, dict) and item.get('kind') == 'runcrew_capability_omit']
+            self.assertEqual(start_omit, [{
+                'kind': 'runcrew_capability_omit',
+                'reason': 'cli_version_probe_failed',
+                'cli_name': adapter.CLI_NAME,
+            }])
+            self.assertEqual(adapter.CLI_VERSION_REASON, 'cli_version_probe_failed')
+            self.assert_hidden(logs, 'probe detail must not leak')
+        finally:
+            cli_version_mod.bind_cli_version = original
+
+    def test_missing_cli_version_module_keeps_a_preset_version(self):
+        import providers
+        import providers.cli_version as cli_version_mod
+
+        saved_mod = sys.modules['providers.cli_version']
+        saved_attr = getattr(providers, 'cli_version', None)
+        sys.modules['providers.cli_version'] = None
+        if hasattr(providers, 'cli_version'):
+            delattr(providers, 'cli_version')
+        try:
+            clock = Clock()
+            client = Client(clock)
+            logs = []
+            adapter = Adapter()
+            arm_manifest(adapter)
+            Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                   object(), clock=clock, sleep=clock.sleep, log=logs.append)
+            self.assertEqual(adapter.CLI_VERSION, '1')
+            self.assertEqual(
+                [item for item in logs
+                 if isinstance(item, dict) and item.get('kind') == 'runcrew_capability_omit'],
+                [])
+            self.assertIsNone(live_loop.capability_omit_reason(
+                adapter, 'grok', '2020-01-01T00:00:00Z',
+                environ={'RUNCREW_IMAGE_DIGEST': DIGEST}))
+        finally:
+            sys.modules['providers.cli_version'] = saved_mod
+            if saved_attr is not None:
+                providers.cli_version = saved_attr
+            elif hasattr(providers, 'cli_version'):
+                delattr(providers, 'cli_version')
+            if cli_version_mod is not None:
+                sys.modules['providers.cli_version'] = cli_version_mod
+                providers.cli_version = cli_version_mod
+
     def test_process_started_at_on_every_report(self):
         with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
             worker, client, adapter, _ = self.setup_worker()

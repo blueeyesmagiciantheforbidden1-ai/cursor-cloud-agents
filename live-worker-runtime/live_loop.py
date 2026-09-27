@@ -672,7 +672,36 @@ class Worker:
         # Probe CLI --version once at start so report() / task setup never spawn it.
         try:
             from providers import cli_version as cli_version_mod
-            cli_version_mod.bind_cli_version(self.adapter, log=self.log)
+        except ImportError:
+            self._cli_version_start_omit('cli_version_module_missing')
+        except Exception:
+            self._cli_version_start_omit('cli_version_probe_failed')
+        else:
+            try:
+                cli_version_mod.bind_cli_version(self.adapter, log=self.log)
+            except Exception:
+                self._cli_version_start_omit('cli_version_probe_failed')
+
+    def _cli_version_start_omit(self, code):
+        """Record a fixed omit reason when the start-time probe cannot run.
+
+        Preset CLI_VERSION (tests arm manifests before start) is left alone.
+        Never invents CLI_VERSION or puts exception text in the log/reason.
+        """
+        try:
+            current = getattr(self.adapter, 'CLI_VERSION', None)
+        except Exception:
+            current = None
+        if isinstance(current, str) and current:
+            return
+        try:
+            self.adapter.CLI_VERSION_REASON = code
+        except Exception:
+            pass
+        try:
+            cli_name = getattr(self.adapter, 'CLI_NAME', None)
+            self.log({'kind': 'runcrew_capability_omit', 'reason': code,
+                      'cli_name': cli_name if isinstance(cli_name, str) else None})
         except Exception:
             pass
 

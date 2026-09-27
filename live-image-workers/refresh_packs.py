@@ -42,6 +42,7 @@ def copy(src, dst):
 def live_files(provider):
     files = {name: RUNTIME / name for name in COMMON}
     files['providers/__init__.py'] = RUNTIME / 'providers' / '__init__.py'
+    files['providers/cli_version.py'] = RUNTIME / 'providers' / 'cli_version.py'
     files['providers/' + provider + '.py'] = RUNTIME / 'providers' / (provider + '.py')
     files['tests/__init__.py'] = RUNTIME / 'tests' / '__init__.py'
     if provider == 'grok':
