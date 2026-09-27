@@ -562,6 +562,79 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(worker.last_exit, 1)
         self.assertNotIn('network', str(result))
 
+    def test_hub_claim_candidates_failed_503_is_uncertain_today(self):
+        """Record today's handling of a real HubClient 503 claim response.
+
+        FLIPS marks the unread-body, outcome error_code, claim-span error_code,
+        finish_exit return, and stderr assertions that change once HubClient
+        reads the reason and live_loop maps it. The outcome and exit policy
+        depend on the Q4 choice. The control cases must not change.
+        """
+        from agent_hub.worker import Config, HubClient
+        from urllib.error import HTTPError
+        from live_loop import finish_exit
+
+        def run_case(status, body_bytes):
+            logs = []
+            worker, client, adapter, _ = self.setup_worker(log=logs.append)
+            hub = HubClient(Config('http://127.0.0.1:8080', 'grok', 'test-token',
+                                   'TEST_TOKEN', {'project': Path.cwd()}))
+            stream = io.BytesIO(body_bytes)
+            response = HTTPError('http://127.0.0.1:8080/v1/tasks/claim', status,
+                                 'Service Unavailable', {}, stream)
+            response.read = Mock(wraps=response.read)
+            self.addCleanup(stream.close)
+            hub.opener = Mock()
+            hub.opener.open.side_effect = response
+            original = client.post
+
+            def post(path, value):
+                if path.endswith('/claim'):
+                    client.calls.append((path, copy.deepcopy(value)))
+                    client.claims += 1
+                    return hub.post(path, value)
+                return original(path, value)
+
+            client.post = post
+            result = worker.run()
+            return worker, client, adapter, hub, response, logs, result
+
+        body = json.dumps({'error': 'Claim failed on every candidate room',
+                           'reason': 'claim_candidates_failed'}).encode()
+        worker, client, adapter, hub, response, logs, result = run_case(503, body)
+        hub.opener.open.assert_called_once()
+        self.assertEqual(client.claims, 1)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertIn('close', adapter.calls)
+        self.assertFalse(any(path.endswith(('/heartbeat', '/complete'))
+                             for path, _ in client.calls))
+        self.assertIs(result['claim_attempted'], True)
+        self.assertIs(result['model_call_attempted'], False)
+
+        response.read.assert_not_called()  # FLIPS: the client will read the reason.
+        self.assertEqual(result['error_code'], 'claim_response_uncertain')  # FLIPS
+        claim_span = [span for span in self.span_lines(logs) if span['span'] == 'claim'][-1]
+        self.assertEqual(claim_span['error_code'], 'claim_response_uncertain')  # FLIPS
+        # FLIPS: the outcome and exit code depend on the Q4 choice.
+        stderr = io.StringIO()
+        self.assertEqual(finish_exit('grok', result, worker.last_exit, stderr), 1)
+        self.assertEqual(stderr.getvalue(), 'grok worker exit 1: claim_response_uncertain\n')
+
+        controls = (
+            ('internal_error', 500, b'{"error": "Internal error"}'),
+            ('no_reason', 503, b'{"error": "Claim failed on every candidate room"}'),
+            ('html', 503, b'<html>Service Unavailable</html>'),
+            ('oversize', 503, b'{"reason": "claim_candidates_failed"}'.ljust(4097, b' ')),
+            ('unknown_reason', 503, b'{"reason": "future_reason"}'),
+            ('wrong_status', 500, b'{"reason": "claim_candidates_failed"}'),
+        )
+        for name, status, body_bytes in controls:
+            with self.subTest(case=name, status=status):
+                worker, client, adapter, hub, response, logs, result = run_case(status, body_bytes)
+                self.assertEqual(result['error_code'], 'claim_response_uncertain')
+                self.assertEqual(worker.last_exit, 1)
+                self.assertNotIn('execute', adapter.calls)
+
     def test_completion_redelivers_identical_result_without_inference(self):
         worker, client, adapter, _ = self.setup_worker(); client.fail_completions = 2
         result = worker.run()
