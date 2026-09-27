@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ PROVIDERS = Path(__file__).resolve().parent / 'providers'
 SPAN_FIELDS = ('trace_id', 'room_id', 'step', 'attempt_key', 'span', 'duration_ms', 'outcome', 'error_code')
 DIGEST = 'sha256:' + ('ab' * 32)
 TRACE = '01234567-89ab-cdef-0123-456789abcdef'
+# Claude's TOOLS_POLICY still has uppercase A; hub _POLICY refuses it (REVIEW.md).
+HUB_REFUSED_CONSTANTS = {('claude', 'TOOLS_POLICY')}
 
 
 @contextmanager
@@ -160,7 +163,10 @@ class ProviderErrorTests(unittest.TestCase):
                     'started_at': '2020-01-01T00:00:00Z',
                 }
                 filler[name.lower()] = value
-                self.assertTrue(live_loop.capability_valid(filler, now=now), path.name + ':' + name)
+                self.assertTrue(
+                    live_loop.capability_valid(filler, now=now)
+                    is ((path.stem, name) not in HUB_REFUSED_CONSTANTS),
+                    path.name + ':' + name)
         # A built image carries one provider; only the checkout carries all
         # five, and only there must every constant appear at least once.
         present = {path.stem for path in PROVIDERS.glob('*.py')}
@@ -1630,6 +1636,414 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('capability', client.calls[-1][1])
         self.assertNotIn('native-secret', json.dumps(client.calls))
         self.assertEqual(client.calls[-1][1]['worker_id'], 'grok-live')
+
+    def test_capability_valid_refuses_what_the_hub_refuses(self):
+        # No runcrew: also runs in worker images. Values from finding 2 that the
+        # hub refuses (HubError or soft CapabilityRejected) must fail here too.
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        valid = {
+            'runner': 'local', 'region': 'us-central1', 'cli_name': 'grok', 'cli_version': '1',
+            'workspace_mode': 'read_only', 'tools_policy': 'deny_all', 'model': 'grok-4.7',
+            'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
+            'started_at': '2020-01-01T00:00:00Z',
+        }
+        self.assertTrue(live_loop.capability_valid(valid, now=now))
+        refused = (
+            ('tools_policy', 'Deny_all'),
+            ('tools_policy', 'read_only_tools_dontAsk_restricted'),
+            ('tools_policy', 'a' + '_b' * 24),
+            ('tools_policy', 'denyallandabortonobserved'),
+            ('auth_alias', 'Grok'),
+            ('auth_alias', '-grok'),
+            ('auth_alias', 'grok-' + 'a' * 20),
+            ('auth_alias', 'abcdefghijklmnop'),
+            ('model', 'grok+4'),
+            ('model', '-grok'),
+            ('model', 'me@example.com'),
+            ('model', 'a@b.c'),
+            ('model', 'https://x'),
+            ('model', 'abcdefabcdefabcdef'),
+            ('model', 'Abcdefghijklmnopqrstu'),
+            ('cli_version', '.1'),
+            ('cli_version', '+1'),
+            ('cli_version', '-1'),
+            ('effort', '-max'),
+            ('effort', '.max'),
+            ('started_at', '1969-12-31T23:59:59Z'),
+        )
+        for field, bad in refused:
+            broken = dict(valid)
+            broken[field] = bad
+            with self.subTest(field=field, bad=bad):
+                self.assertFalse(live_loop.capability_valid(broken, now=now), field + '=' + str(bad))
+        accepted = (
+            ('model', 'claude-4@20250929'),
+            ('model', 'composer-2.5'),
+            ('model', 'claude-opus-5-5[1m]'),
+            ('model', 'models/gemini-3[1m]'),
+            ('tools_policy', 'deny_all_and_abort_on_observed_tool'),
+            ('tools_policy', 'ask_mode_deny_all_abort_on_observed_tool'),
+            ('tools_policy', 'read_only_tools_dontask_restricted'),
+            ('auth_alias', 'claude'),
+            ('auth_alias', 'codex'),
+            ('auth_alias', 'copilot'),
+            ('auth_alias', 'cursor'),
+            ('auth_alias', 'grok'),
+            ('auth_alias', 'ab-ab-ab-ab-ab-ab-ab-ab-'),
+            ('cli_version', '1.2.3+build'),
+        )
+        for field, good in accepted:
+            ok = dict(valid)
+            ok[field] = good
+            with self.subTest(field=field, good=good):
+                self.assertTrue(live_loop.capability_valid(ok, now=now), field + '=' + good)
+
+    def test_capability_valid_matches_runcrew_validate_capability(self):
+        import importlib.util
+        import types
+        roots = [
+            os.environ.get('RUNCREW_AGENT_HUB'),
+            Path(__file__).resolve().parents[2] / 'runcrew',
+            Path(__file__).resolve().parents[2] / 'runcrew' / 'source' / 'agent-hub',
+        ]
+        runcrew_ah = None
+        for root in roots:
+            if not root:
+                continue
+            telemetry = Path(root) / 'agent_hub' / 'telemetry.py'
+            if telemetry.is_file() and 'def validate_capability' in telemetry.read_text(encoding='utf-8'):
+                runcrew_ah = Path(root) / 'agent_hub'
+                break
+        if runcrew_ah is None:
+            self.skipTest('runcrew agent_hub not found: set RUNCREW_AGENT_HUB to runcrew source/agent-hub')
+
+        pkg_name = '_capability_parity_runcrew_agent_hub'
+        if pkg_name not in sys.modules:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = [str(runcrew_ah)]
+            sys.modules[pkg_name] = pkg
+        core_name = pkg_name + '.core'
+        if core_name not in sys.modules:
+            core = types.ModuleType(core_name)
+
+            class HubError(Exception):
+                def __init__(self, message, status=400):
+                    Exception.__init__(self, message)
+                    self.status = status
+
+            core.HubError = HubError
+            core.AGENTS = ('codex', 'claude', 'cursor', 'copilot', 'grok')
+            sys.modules[core_name] = core
+        tel_name = pkg_name + '.telemetry'
+        if tel_name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(tel_name, runcrew_ah / 'telemetry.py')
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[tel_name] = mod
+            spec.loader.exec_module(mod)
+        else:
+            mod = sys.modules[tel_name]
+        HubError = sys.modules[core_name].HubError
+        CapabilityRejected = mod.CapabilityRejected
+        validate_capability = mod.validate_capability
+
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        started_at = '2020-01-01T00:00:00Z'
+        base = {
+            'runner': 'local', 'region': 'us-central1', 'cli_name': 'grok', 'cli_version': '1',
+            'workspace_mode': 'read_only', 'tools_policy': 'deny_all', 'model': 'grok-4.7',
+            'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
+            'started_at': started_at,
+        }
+
+        def hub_accepts(obj):
+            try:
+                validate_capability(obj, now.timestamp())
+                return True
+            except CapabilityRejected:
+                return False
+            except HubError:
+                return False
+
+        rows = []
+        for field, bad in (
+            ('tools_policy', 'Deny_all'),
+            ('tools_policy', 'read_only_tools_dontAsk_restricted'),
+            ('tools_policy', 'a' + '_b' * 24),
+            ('tools_policy', 'denyallandabortonobserved'),
+            ('auth_alias', 'Grok'),
+            ('auth_alias', '-grok'),
+            ('auth_alias', 'grok-' + 'a' * 20),
+            ('auth_alias', 'abcdefghijklmnop'),
+            ('model', 'grok+4'),
+            ('model', '-grok'),
+            ('model', 'me@example.com'),
+            ('model', 'a@b.c'),
+            ('model', 'https://x'),
+            ('model', 'abcdefabcdefabcdef'),
+            ('model', 'Abcdefghijklmnopqrstu'),
+            ('cli_version', '.1'),
+            ('cli_version', '+1'),
+            ('cli_version', '-1'),
+            ('effort', '-max'),
+            ('effort', '.max'),
+            ('started_at', '1969-12-31T23:59:59Z'),
+            ('model', 'claude-4@20250929'),
+            ('model', 'composer-2.5'),
+            ('model', 'claude-opus-5-5[1m]'),
+            ('model', 'models/gemini-3[1m]'),
+            ('tools_policy', 'deny_all_and_abort_on_observed_tool'),
+            ('tools_policy', 'ask_mode_deny_all_abort_on_observed_tool'),
+            ('tools_policy', 'read_only_tools_dontask_restricted'),
+            ('auth_alias', 'claude'),
+            ('auth_alias', 'codex'),
+            ('auth_alias', 'copilot'),
+            ('auth_alias', 'cursor'),
+            ('auth_alias', 'grok'),
+            ('auth_alias', 'ab-ab-ab-ab-ab-ab-ab-ab-'),
+            ('cli_version', '1.2.3+build'),
+        ):
+            obj = dict(base)
+            obj[field] = bad
+            rows.append((field + '=' + str(bad), obj))
+
+        const_names = ('CLI_NAME', 'CLI_VERSION', 'TOOLS_POLICY', 'MODEL', 'EFFORT')
+        provider_stems = ('claude', 'codex', 'copilot', 'cursor', 'grok')
+        for path in sorted(PROVIDERS.glob('*.py')):
+            if path.stem not in provider_stems:
+                continue
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+            assigned = {}
+            for node in tree.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                        and node.targets[0].id in const_names
+                        and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                    assigned[node.targets[0].id] = node.value.value
+                elif (isinstance(node.targets[0], ast.Tuple)
+                      and isinstance(node.value, ast.Tuple)
+                      and len(node.targets[0].elts) == len(node.value.elts)):
+                    for target, value in zip(node.targets[0].elts, node.value.elts):
+                        if (isinstance(target, ast.Name) and target.id in const_names
+                                and isinstance(value, ast.Constant) and isinstance(value.value, str)):
+                            assigned[target.id] = value.value
+            if path.stem == 'cursor' and 'MODEL' not in assigned:
+                review_path = path.parent.parent / 'cursor_native' / 'cursor_review_runtime.py'
+                if review_path.is_file():
+                    review_tree = ast.parse(review_path.read_text(encoding='utf-8'))
+                    for node in review_tree.body:
+                        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                                and isinstance(node.targets[0], ast.Name)
+                                and node.targets[0].id == 'MODEL'
+                                and isinstance(node.value, ast.Constant)
+                                and isinstance(node.value.value, str)):
+                            assigned['MODEL'] = node.value.value
+            for name, value in assigned.items():
+                obj = dict(base)
+                obj[name.lower()] = value
+                rows.append((path.stem + '.' + name + '=' + value, obj))
+            alias_obj = dict(base)
+            alias_obj['auth_alias'] = path.stem
+            rows.append((path.stem + '.auth_alias', alias_obj))
+
+        for label, obj in rows:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    live_loop.capability_valid(obj, now=now), hub_accepts(obj), label)
+
+    def test_hub_refused_policy_omits_the_manifest(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        result = live_loop.capability_manifest(
+            SimpleNamespace(
+                CLI_NAME='grok', CLI_VERSION='1',
+                TOOLS_POLICY='read_only_tools_dontAsk_restricted',
+                MODEL='claude-fable-5-1', EFFORT='max'),
+            'claude', '2020-01-01T00:00:00Z',
+            environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now)
+        self.assertIsNone(result)
+
+    def test_report_400_with_manifest_retries_once_without_it(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.ready = True
+
+            def make_hub400():
+                try:
+                    raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                        'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
+                except WorkerError as exc:
+                    return exc
+
+            first = [True]
+            original = client.post
+
+            def post(path, value):
+                if path.endswith('/report') and first[0]:
+                    first[0] = False
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise make_hub400()
+                return original(path, value)
+
+            client.post = post
+            worker.report(force=True)
+            reports = [value for path, value in client.calls if path.endswith('/report')]
+            self.assertEqual(len(reports), 2)
+            self.assertIn('capability', reports[0])
+            self.assertNotIn('capability', reports[1])
+            self.assertEqual(reports[1]['usage'], [])
+            self.assertTrue(worker.capability_dropped)
+            self.assertEqual(worker.usage_rejected, 0)
+            self.assertEqual(worker.next_report, 125)
+            before = len(client.calls)
+            worker.report(force=True)
+            later = [value for path, value in client.calls[before:] if path.endswith('/report')]
+            self.assertEqual(len(later), 1)
+            self.assertNotIn('capability', later[0])
+
+    def test_report_400_with_manifest_and_usage_drops_both(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.ready = True
+            worker._last_turn_usage = {
+                'inputTokens': 123, 'outputTokens': 12,
+                'reasoningTokens': 3, 'cachedReadTokens': 20,
+            }
+            worker._last_turn_observed_at = '2026-01-01T00:00:00Z'
+
+            def make_hub400():
+                try:
+                    raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                        'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
+                except WorkerError as exc:
+                    return exc
+
+            first = [True]
+            original = client.post
+
+            def post(path, value):
+                if path.endswith('/report') and first[0]:
+                    first[0] = False
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise make_hub400()
+                return original(path, value)
+
+            client.post = post
+            worker.report(force=True)
+            reports = [value for path, value in client.calls if path.endswith('/report')]
+            self.assertEqual(len(reports), 2)
+            self.assertEqual(reports[1]['usage'], [])
+            self.assertNotIn('capability', reports[1])
+            self.assertEqual(worker.usage_rejected, 0)
+            self.assertTrue(worker.capability_dropped)
+
+    def test_report_400_retry_failure_keeps_the_manifest(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.ready = True
+
+            def make_hub400():
+                try:
+                    raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                        'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
+                except WorkerError as exc:
+                    return exc
+
+            pending = [make_hub400(), make_hub400()]
+            original = client.post
+
+            def post(path, value):
+                if path.endswith('/report') and pending:
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise pending.pop(0)
+                return original(path, value)
+
+            client.post = post
+            with self.assertRaises(WorkerError):
+                worker.report(force=True)
+            self.assertFalse(worker.capability_dropped)
+            self.assertEqual(len([1 for path, _ in client.calls if path.endswith('/report')]), 2)
+            # Hub accepted path: next report still carries capability.
+            client.post = original
+            before = len(client.calls)
+            worker.report(force=True)
+            later = [value for path, value in client.calls[before:] if path.endswith('/report')]
+            self.assertEqual(len(later), 1)
+            self.assertIn('capability', later[0])
+
+    def test_report_non_400_with_manifest_does_not_retry(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.ready = True
+
+            def make_hub500():
+                try:
+                    raise WorkerError('Hub request failed (HTTP 500)') from HTTPError(
+                        'http://hub/v1/workers/report', 500, 'Server Error', None, None)
+                except WorkerError as exc:
+                    return exc
+
+            def make_identity_400():
+                try:
+                    raise WorkerError(
+                        'Could not obtain the configured GCE service identity') from HTTPError(
+                        'http://metadata.google.internal/computeMetadata/v1/instance/'
+                        'service-accounts/default/identity', 400, 'Bad Request', None, None)
+                except WorkerError as exc:
+                    return exc
+
+            for label, error in (('hub500', make_hub500()), ('identity400', make_identity_400())):
+                with self.subTest(label=label):
+                    worker.capability_dropped = False
+                    client.calls.clear()
+
+                    def post(path, value, _error=error):
+                        client.calls.append((path, copy.deepcopy(value)))
+                        raise _error
+
+                    client.post = post
+                    with self.assertRaises(WorkerError) as caught:
+                        worker.report(force=True)
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(len(client.calls), 1)
+                    self.assertFalse(worker.capability_dropped)
+
+    def test_outcome_records_capability_dropped(self):
+        from urllib.error import HTTPError
+        from agent_hub.worker import WorkerError
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            first_report = [True]
+            original = client.post
+
+            def post(path, value):
+                if path.endswith('/report') and first_report[0]:
+                    first_report[0] = False
+                    client.calls.append((path, copy.deepcopy(value)))
+                    raise WorkerError('Hub request failed (HTTP 400)') from HTTPError(
+                        'http://hub/v1/workers/report', 400, 'Bad Request', None, None)
+                return original(path, value)
+
+            client.post = post
+            result = worker.run()
+            self.assertEqual(result['outcome'], 'completed')
+            self.assertTrue(result['capability_dropped'])
+            reports = [value for path, value in client.calls if path.endswith('/report')]
+            self.assertTrue(reports)
+            self.assertIn('capability', reports[0])
+            self.assertTrue(all('capability' not in value for value in reports[1:]))
 
     def test_entrypoint_wires_trace_id_and_span_lines(self):
         source = (Path(__file__).resolve().parent / 'entrypoint.py').read_text(encoding='utf-8')

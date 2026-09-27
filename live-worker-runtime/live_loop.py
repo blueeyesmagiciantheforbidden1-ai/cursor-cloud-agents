@@ -295,21 +295,23 @@ def task_prompt(task, room, agent):
     return result
 
 
-# Hub POST /v1/workers/report capability object. A present value that is null,
-# partial, or carrying an unknown key is rejected in full, so this side sends
-# the object only when every field matches and otherwise omits the key.
+# Hub capability labels: match runcrew agent_hub/telemetry.py validate_capability
+# and _label. A label the hub refuses with HubError fails the whole report, so
+# the worker must never send one.
 _CAPABILITY_FIELDS = (
     'runner', 'region', 'cli_name', 'cli_version', 'workspace_mode', 'tools_policy',
     'model', 'effort', 'auth_alias', 'image_digest', 'started_at',
 )
 _REGION = re.compile(r'[a-z][a-z0-9-]{0,31}')
 _CLI_NAME = re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,31}')
-_CLI_VERSION = re.compile(r'[A-Za-z0-9._+-]{1,32}')
-_TOOLS_POLICY = re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,63}')
-_MODEL = re.compile(r'[A-Za-z0-9._:@/+\[\]-]{1,64}')
-_EFFORT = re.compile(r'[A-Za-z0-9._-]{1,32}')
-_AUTH_ALIAS = re.compile(r'[A-Za-z0-9_-]{1,32}')
+_CLI_VERSION = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,31}')
+_TOOLS_POLICY = re.compile(r'[a-z][a-z0-9._-]{0,47}')
+_MODEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/\[\]@-]{0,63}')
+_EFFORT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}')
+_AUTH_ALIAS = re.compile(r'[a-z0-9][a-z0-9_-]{0,23}')
 _IMAGE_DIGEST = re.compile(r'sha256:[a-f0-9]{64}')
+_HEX_SECRET = re.compile(r'[0-9a-fA-F]{16,}')
+_BASE64_SECRET = re.compile(r'[A-Za-z0-9+/]{16,}={0,2}')
 _SPAN_NAMES = frozenset({'startup', 'claim', 'task_setup', 'model_call', 'close', 'complete'})
 _SPAN_FIELDS = ('trace_id', 'room_id', 'step', 'attempt_key', 'span', 'duration_ms', 'outcome', 'error_code')
 
@@ -318,8 +320,25 @@ def _fullmatch(pattern, value):
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
 
+def _hub_label_valid(pattern, value):
+    """False for mailboxes, URLs, opaque secrets, or a pattern mismatch."""
+    if not isinstance(value, str):
+        return False
+    if value.count('@') == 1:
+        local, domain = value.split('@', 1)
+        if local and '.' in domain:
+            return False
+    if '://' in value:
+        return False
+    if _HEX_SECRET.fullmatch(value) or _BASE64_SECRET.fullmatch(value):
+        return False
+    if len(value) >= 20 and re.search(r'[-_.]', value) is None:
+        return False
+    return pattern.fullmatch(value) is not None
+
+
 def _started_at_valid(value, now):
-    """Timezone-aware ISO-8601, at most 40 characters, not in the future."""
+    """Timezone-aware ISO-8601, at most 40 characters, not negative, not in the future."""
     if not isinstance(value, str) or not value or len(value) > 40:
         return False
     try:
@@ -332,7 +351,10 @@ def _started_at_valid(value, now):
         current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
         if current.tzinfo is None:
             return False
-        return parsed.timestamp() <= current.timestamp()
+        started = parsed.timestamp()
+        if started < 0:
+            return False
+        return started <= current.timestamp()
     except (ValueError, OverflowError, OSError):
         return False
 
@@ -352,13 +374,13 @@ def capability_valid(value, now=None):
             return False
         if not _fullmatch(_CLI_VERSION, value['cli_version']):
             return False
-        if not _fullmatch(_TOOLS_POLICY, value['tools_policy']):
+        if not _hub_label_valid(_TOOLS_POLICY, value['tools_policy']):
             return False
-        if not _fullmatch(_MODEL, value['model']):
+        if not _hub_label_valid(_MODEL, value['model']):
             return False
         if not _fullmatch(_EFFORT, value['effort']):
             return False
-        if not _fullmatch(_AUTH_ALIAS, value['auth_alias']):
+        if not _hub_label_valid(_AUTH_ALIAS, value['auth_alias']):
             return False
         if not _fullmatch(_IMAGE_DIGEST, value['image_digest']):
             return False
@@ -494,6 +516,8 @@ class Worker:
         self._last_turn_usage = None
         self._last_turn_observed_at = None
         self.usage_rejected = 0
+        # Set when a hub HTTP 400 forced a retry that dropped the capability manifest.
+        self.capability_dropped = False
 
     def _capability(self):
         """Build the manifest once per run. Failure omits it; it never raises."""
@@ -615,19 +639,28 @@ class Worker:
             require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
         except Exception as error:
             usage_rows = payload.get('usage')
-            # Retry once with usage:[] ONLY on hub HTTP 400 with a non-empty usage
-            # list (validation rejection of quota rows). Never on transport/5xx,
-            # other HTTP codes, LeaseLost, identity-path 400, or a not-accepted receipt.
-            if (not isinstance(usage_rows, list) or not usage_rows
-                    or not _hub_rejected_request(error)):
+            had_capability = 'capability' in payload
+            # Retry once with usage:[] and no capability on hub HTTP 400 when the
+            # payload had a non-empty usage list or a capability key. Never on
+            # transport/5xx, other HTTP codes, LeaseLost, identity-path 400, or a
+            # not-accepted receipt. A bare 400 with neither is not retried.
+            has_usage = isinstance(usage_rows, list) and bool(usage_rows)
+            if not _hub_rejected_request(error) or (not has_usage and not had_capability):
                 raise
             retry_payload = dict(payload)
             retry_payload['usage'] = []
+            retry_payload.pop('capability', None)
             receipt = self.client.post('/v1/workers/report', retry_payload)
             require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
-            # Count only after the usage:[] retry is accepted; never usage contents;
-            # never a span. A failed retry leaves the counter unchanged.
-            self.usage_rejected += len(usage_rows)
+            # After an accepted retry: a dropped capability is not usage rejection
+            # (hubs keep the report when a usage row is bad). Count usage_rejected
+            # only when no capability was sent. A failed retry leaves both unchanged.
+            if had_capability:
+                self._capability_ready = True
+                self._capability_value = None
+                self.capability_dropped = True
+            else:
+                self.usage_rejected += len(usage_rows)
         self.next_report = self.clock() + 25
 
     def heartbeat(self):
@@ -1054,4 +1087,6 @@ class Worker:
                 outcome['offline_report'] = 'unconfirmed'
             if self.usage_rejected > 0:
                 outcome['usage_rejected'] = self.usage_rejected
+            if self.capability_dropped:
+                outcome['capability_dropped'] = True
             self.log(outcome)
