@@ -410,6 +410,41 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertFalse(raw.get('rejected_outputs'))
         self.assertFalse(raw.get('completion_rejections'))
 
+    def test_7_lost_complete_reply_next_agent_claimed_counts_as_delivered(self):
+        room = self.create_room(agents=[self.agent, 'cursor'], recovery='auto')
+        client = LoopbackClient(self.base, self.tokens[self.agent], self.agent)
+        original = client.post
+        completions = []
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                completions.append(path)
+                if len(completions) == 1:
+                    original(path, value)
+                    task = self.hub.claim('cursor', room['id'])
+                    self.assertIsNotNone(task['task'])
+                    raise OSError('simulated lost reply after the hub stored the completion')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(
+            Settings(self.agent, 'grok-e2e', warm_seconds=60),
+            client, DieAdapter(), object(), sleep=lambda seconds: None,
+        )
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertEqual(len(completions), 2)
+        self.assertNotIn('completion_delivery', result)
+        raw = self.raw(room['id'])
+        self.assertEqual(raw['status'], 'running')
+        self.assertEqual(len(raw['messages']), 1)
+        self.assertEqual(raw['messages'][0]['agent'], 'grok')
+        self.assertEqual(raw['messages'][0]['text'], 'A useful e2e answer.')
+        self.assertEqual(len(raw['completed_leases']), 1)
+        self.assertEqual(raw['completed_leases'][0]['agent'], 'grok')
+        self.assertEqual(raw['lease']['agent'], 'cursor')
+
     def test_5_happy_path_finishing(self):
         """EXPECTED (normal completion):
         Room advances (completed for a one-agent one-round room); the attempt

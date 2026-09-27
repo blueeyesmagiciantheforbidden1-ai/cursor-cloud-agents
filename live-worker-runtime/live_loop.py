@@ -26,6 +26,16 @@ import usage_report
 # reserved execute window.
 HUB_POST_TIMEOUT_SECONDS = 10
 
+# /complete returns 200 when it stores this completion or completed_leases
+# already holds the same lease and payload. In runcrew agent_hub/core.py,
+# Hub.complete()'s completed_leases loop in change() echoes the current room
+# status: running (the next agent claimed), cancelled, expired, and stalled
+# still confirm delivery.
+HUB_ROOM_STATUSES = frozenset({
+    'queued', 'running', 'completed', 'failed', 'cancelled', 'expired',
+    'stalled', 'needs_reconciliation', 'retry_scheduled', 'blocked_on_provider',
+})
+
 # Process start for this interpreter. The capability manifest stamps it once.
 _PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
@@ -699,11 +709,10 @@ class Worker:
         for attempt in range(3):
             try:
                 result = self.client.post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
-                require(result.get('room_id') == self.task['room_id'] and
-                        result.get('status') in ('completed', 'queued', 'failed',
-                                                 'needs_reconciliation',
-                                                 'retry_scheduled',
-                                                 'blocked_on_provider'),
+                status = result.get('status') if isinstance(result, dict) else None
+                require(isinstance(result, dict) and
+                        result.get('room_id') == self.task['room_id'] and
+                        isinstance(status, str) and status in HUB_ROOM_STATUSES,
                         'completion_unconfirmed')
                 return
             except LeaseLost:

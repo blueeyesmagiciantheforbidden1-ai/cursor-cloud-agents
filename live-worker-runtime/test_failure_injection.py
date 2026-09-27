@@ -22,6 +22,7 @@ from provider_errors import ProviderCodeError
 
 
 ROOM = 'b' * 32
+_KEEP_STATUS = object()
 # Distinctive secrets: must never appear in logs, stdout, or stderr.
 LEASE = 'inj-lease-tok-aabbccddee1122'
 PROMPT = 'UNIQUE_PROMPT_TEXT_FOR_INJECTION_TEST'
@@ -56,6 +57,8 @@ class FakeHub:
         self.fail_claim = False
         self.claim_raises_after_lease = False
         self.fail_completions = 0
+        self.drop_reply_after_commit = 0
+        self.status_after_commit = _KEEP_STATUS
         self.active = True
         self.empty = False
         self.duplicate_claim_returns_same_task = False
@@ -104,6 +107,11 @@ class FakeHub:
                 self._accepted_lease_hashes.add(lease_hash)
                 self.accepted_completions.append(copy.deepcopy(value))
                 self.room['status'] = 'completed' if value.get('exit_code') == 0 else 'failed'
+            if self.drop_reply_after_commit:
+                self.drop_reply_after_commit -= 1
+                if self.status_after_commit is not _KEEP_STATUS:
+                    self.room['status'] = self.status_after_commit
+                raise OSError('reply lost after the hub stored the completion')
             return {'room_id': ROOM, 'status': self.room['status']}
         return {'accepted': True}
 
@@ -490,6 +498,61 @@ class FailureInjectionTests(unittest.TestCase):
         self.assertNotIn(PROMPT, completion['output'])
         self.assertNotIn(LEASE, completion['output'])
         self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+    # --- (i) completion stored, reply lost, room moved on ---------------------
+
+    def assert_replay_delivered(self, status):
+        worker, hub, adapter, _ = self.setup_worker()
+        hub.drop_reply_after_commit = 1
+        hub.status_after_commit = status
+        result, out, err = self.run_captured(worker)
+        self.assert_common(
+            worker, hub, adapter, result,
+            execute=1, completions=2, accepted=1, closes=1, last_exit=0,
+            outcome='completed', model_call_attempted=True,
+        )
+        self.assertNotIn('completion_delivery', result)
+        self.assertTrue(all(p == hub.completions[0] and p['exit_code'] == 0
+                            for p in hub.completions))
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    def test_i1_replay_running_is_delivered(self):
+        self.assert_replay_delivered('running')
+
+    def test_i2_replay_cancelled_is_delivered(self):
+        self.assert_replay_delivered('cancelled')
+
+    def test_i3_replay_expired_is_delivered(self):
+        self.assert_replay_delivered('expired')
+
+    def test_i4_replay_stalled_is_delivered(self):
+        self.assert_replay_delivered('stalled')
+
+    def test_i5_failure_completion_replay_running_is_delivered(self):
+        worker, hub, adapter, _ = self.setup_worker()
+        adapter.fail_execute = True
+        hub.drop_reply_after_commit = 1
+        hub.status_after_commit = 'running'
+        result, out, err = self.run_captured(worker)
+        self.assert_common(worker, hub, adapter, result,
+                           completions=2, accepted=1, last_exit=1, outcome='failed')
+        self.assertEqual(hub.accepted_completions[0]['exit_code'], 1)
+        self.assertNotIn('completion_delivery', result)
+        self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
+
+    def test_i6_replay_unknown_status_stays_uncertain(self):
+        for status in ('finished', None, ['running'], 7):
+            with self.subTest(status=status):
+                worker, hub, adapter, _ = self.setup_worker()
+                hub.drop_reply_after_commit = 1
+                hub.status_after_commit = status
+                result, out, err = self.run_captured(worker)
+                self.assert_common(
+                    worker, hub, adapter, result,
+                    completions=3, accepted=1, last_exit=1,
+                    error_code='completion_delivery_uncertain',
+                )
+                self.assertEqual(result['completion_delivery'], 'unconfirmed')
+                self.assert_no_secret_leak(result, out, err, self.log_records, self._logging_records)
 
 
 class RealSigtermInjection(unittest.TestCase):
