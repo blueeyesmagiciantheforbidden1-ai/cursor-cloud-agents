@@ -98,7 +98,9 @@ STARTUP_AUTH_CODES = frozenset({
     'grok_owner_mismatch',                     # grok prepare (_owner)
     'copilot_owner_mismatch',                  # copilot prepare (_owner; also signed-out)
 })
-assert all(provider_errors.SAFE_CODE.fullmatch(code) for code in STARTUP_AUTH_CODES)
+# Not an assert: the check must hold under python -O too.
+if not all(provider_errors.SAFE_CODE.fullmatch(code) for code in STARTUP_AUTH_CODES):
+    raise RuntimeError('STARTUP_AUTH_CODES must all match SAFE_CODE')
 
 
 # Consecutive idle maintain() retries before the execution fails with the code.
