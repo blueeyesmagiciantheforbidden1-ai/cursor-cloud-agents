@@ -1057,10 +1057,15 @@ class LoopTests(unittest.TestCase):
         fleet_path = Path(__file__).resolve().parent / 'fleet_controller.py'
         if not fleet_path.is_file():
             self.skipTest('fleet_controller.py is not present in this image')
-        self.assertEqual(
-            module_constant(ast.parse(fleet_path.read_text(encoding='utf-8')),
-                            'ROOM_REFUSED_EXIT_CODE'),
-            provider_errors.ROOM_REFUSED_EXIT_CODE)
+        # Parsed, not imported: the controller image ships neither module to the
+        # other, and its build-time tests must not import provider_errors.
+        tree = ast.parse(fleet_path.read_text(encoding='utf-8'))
+        self.assertEqual(module_constant(tree, 'ROOM_REFUSED_EXIT_CODE'),
+                         provider_errors.ROOM_REFUSED_EXIT_CODE)
+        self.assertEqual(module_constant(tree, 'QUOTA_EXIT_CODE'),
+                         provider_errors.QUOTA_EXIT_CODE)
+        self.assertNotEqual(provider_errors.QUOTA_EXIT_CODE,
+                            provider_errors.ROOM_REFUSED_EXIT_CODE)
 
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):
