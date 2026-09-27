@@ -798,7 +798,9 @@ class CodexLive(unittest.TestCase):
         reports = [v for p, v in client.posts if p.endswith('/report')]
         self.assertTrue(reports)
         self.assertEqual(reports[-1]['auth_status'], 'failed')
-        self.assertEqual(self.session.state, 'active')
+        # session.state is not asserted: the stand-in close and fake finish do not
+        # model the broker's state (production would read 'quarantined'). The real
+        # broker first-reason test (agent-hub test_cloud_credential_broker) pins it.
         self.assertIsNone(worker.handle)
 
     def test_worker_malformed_account_status_at_prepare_is_not_failed_auth(self):
