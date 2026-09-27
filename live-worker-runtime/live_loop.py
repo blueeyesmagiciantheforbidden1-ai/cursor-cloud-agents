@@ -728,7 +728,7 @@ class Worker:
                     # Stop the call in every case. A retained expired lease can
                     # still accept the existing failure completion; preserve
                     # the actual phase and model_call_attempted for that path.
-                    self.lease_revoked = error.reason != 'lease_expired_completable'
+                    self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
                     return False
                 if not isinstance(receipt, dict) or receipt.get('active') is not True:
                     self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
@@ -992,7 +992,7 @@ class Worker:
                         if isinstance(error, LeaseLost):
                             # A retained lease gets one failure completion with
                             # model_call_attempted=False: execute never started.
-                            self.lease_revoked = error.reason != 'lease_expired_completable'
+                            self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
                             raise LiveError('task_lease_lost') from error
                         if beat_attempt == 0 and is_task_heartbeat_transport_error(error):
                             delay = 1

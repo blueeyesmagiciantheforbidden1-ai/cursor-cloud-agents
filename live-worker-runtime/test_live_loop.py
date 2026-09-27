@@ -2936,6 +2936,51 @@ class HeartbeatPhaseTests(unittest.TestCase):
                     self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
                     self.assertEqual(client.completions, [])
 
+    def test_old_client_lease_lost_without_reason_keeps_the_skip(self):
+        # Packs pin agent_hub/worker.py and live_loop.py through separate refs:
+        # an older agent_hub can ship under this live_loop (the 26a base-layer
+        # incident). Its LeaseLost has no .reason; both beats must keep today's
+        # skip instead of raising AttributeError (Light, T110).
+        from unittest.mock import patch
+        from agent_hub.worker import WorkerError
+
+        class OldLeaseLost(WorkerError):
+            pass
+
+        self.assertFalse(hasattr(OldLeaseLost('x'), 'reason'))
+
+        def old_error(kind, *, reason=None):
+            return OldLeaseLost('The hub revoked or expired this task lease')
+
+        # Mid-call heartbeat.
+        with patch.object(live_loop, 'LeaseLost', OldLeaseLost),                 patch.object(self, '_hub_shaped_error', old_error):
+            result, worker, client, adapter = self._run_mid_call_hub_error(409)
+        self.assertIs(worker.lease_revoked, True)
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertFalse(any(path.endswith('/complete') for path, _ in client.calls))
+        self.assertEqual(client.completions, [])
+
+        # Pre-execute model_call beat.
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and value.get('phase') == 'model_call':
+                client.calls.append((path, copy.deepcopy(value)))
+                raise OldLeaseLost('The hub revoked or expired this task lease')
+            return original(path, value)
+
+        client.post = post
+        with patch.object(live_loop, 'LeaseLost', OldLeaseLost):
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=lambda seconds: None)
+            result = worker.run()
+        self.assertEqual(result['error_code'], 'task_lease_lost')
+        self.assertIs(worker.lease_revoked, True)
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertEqual(client.completions, [])
+        self.assertNotIn('execute', adapter.calls)
+
     def test_model_call_heartbeat_transport_error_then_success_runs_execute(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post

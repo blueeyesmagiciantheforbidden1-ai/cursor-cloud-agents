@@ -432,7 +432,7 @@ class F4HubE2ETests(unittest.TestCase):
                 try:
                     return super().post(path, value)
                 except LeaseLost as error:
-                    self.lease_reasons.append(error.reason)
+                    self.lease_reasons.append(getattr(error, 'reason', None))
                     raise
 
         client = RecordingClient()
