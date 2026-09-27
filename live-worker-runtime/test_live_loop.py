@@ -376,6 +376,8 @@ class LoopTests(unittest.TestCase):
             'claude_subscription_account_unverified',
             'grok_owner_mismatch',
             'copilot_owner_mismatch',
+            # providers/codex.py _collect, called from prepare()
+            'native_subscription_identity_required',
         })
         self.assertEqual(live_loop.STARTUP_AUTH_CODES, expected)
         for code in live_loop.STARTUP_AUTH_CODES:
@@ -383,6 +385,22 @@ class LoopTests(unittest.TestCase):
             self.assertTrue(provider_errors.SAFE_CODE.fullmatch(code))
         self.assertNotIn('fresh_native_account_identity_unavailable',
                          live_loop.STARTUP_AUTH_CODES)
+
+    def test_startup_auth_codes_cover_every_hub_auth_code_prepare_can_raise(self):
+        import inspect
+        from test_copilot_provider import runcrew_provider_auth_codes
+        from providers import copilot as copilot_provider
+
+        hub_codes = runcrew_provider_auth_codes()
+        if hub_codes is None:
+            self.skipTest('RUNCREW_AGENT_HUB not set (or hub PROVIDER_AUTH_CODES unreadable)')
+        # providers/copilot.py: _owner raises this only when claim_recheck=True;
+        # prepare() calls _fresh_metadata(handle) without it.
+        EXECUTE_ONLY = frozenset({'copilot_account_not_authenticated'})
+        self.assertEqual(hub_codes - live_loop.STARTUP_AUTH_CODES, EXECUTE_ONLY)
+        self.assertTrue(EXECUTE_ONLY <= hub_codes)
+        self.assertTrue(EXECUTE_ONLY.isdisjoint(live_loop.STARTUP_AUTH_CODES))
+        self.assertNotIn('claim_recheck', inspect.getsource(copilot_provider.prepare))
 
     def test_prepare_auth_failure_reports_failed_auth_and_never_claims(self):
         for code in live_loop.STARTUP_AUTH_CODES:

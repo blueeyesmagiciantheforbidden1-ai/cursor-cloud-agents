@@ -150,11 +150,15 @@ STARTUP_AUTH_CODES = frozenset({
     'claude_subscription_account_unverified',  # claude prepare
     'grok_owner_mismatch',                     # grok prepare (_owner)
     'copilot_owner_mismatch',                  # copilot prepare (_owner; also signed-out)
+    'native_subscription_identity_required',   # hub PROVIDER_AUTH_CODES; codex prepare (_collect, T138)
 })
 # Execute-time sign-out seen before the prompt (hub PROVIDER_AUTH_CODES). When
 # cleanup then fails closed, the loop still sends one failure completion with
 # the auth code (model_call_attempted false) and records credential_cleanup
 # failed. Cursor has no execute-time re-check; its account code stays startup-only.
+# native_subscription_identity_required is deliberately in both sets: Codex
+# _collect runs in prepare() (no task → worker report only) and in execute()
+# (claimed task → one completion, T138).
 PRE_PROMPT_SIGN_OUT_CODES = frozenset({
     'copilot_account_not_authenticated',
     'native_subscription_identity_required',

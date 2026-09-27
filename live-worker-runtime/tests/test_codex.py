@@ -631,6 +631,100 @@ class CodexLive(unittest.TestCase):
         self.session.broker.quarantine.assert_called()
         self.session.finish.assert_not_called()
 
+    def test_worker_signed_out_at_prepare_reports_failed_auth_and_never_claims(self):
+        cases = (
+            {'requiresOpenaiAuth': False},
+            {'requiresOpenaiAuth': True, 'account': {'type': 'api', 'email': EMAIL}},
+            {'requiresOpenaiAuth': True, 'account': {'type': 'chatgpt'}},
+            {'requiresOpenaiAuth': True, 'account': None},
+        )
+        for account in cases:
+            with self.subTest(account=account):
+                self._fresh_session()
+                self.mutate = lambda native, account=account: setattr(
+                    native, 'account', copy.deepcopy(account))
+                adapter = SimpleNamespace(
+                    prepare=c.prepare, execute=c.execute, close=c.close, maintain=c.maintain,
+                    CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+                    CLI_NAME=getattr(c, 'CLI_NAME', None),
+                )
+
+                class HubClient:
+                    def __init__(self):
+                        self.posts = []
+
+                    def post(self, path, value):
+                        self.posts.append((path, copy.deepcopy(value)))
+                        if path.endswith('/claim') or path.endswith('/complete'):
+                            raise AssertionError('unexpected hub path: ' + path)
+                        return {'accepted': True}
+
+                    def get_room(self, room):
+                        raise AssertionError('unexpected get_room')
+
+                client = HubClient()
+                worker = live_loop.Worker(
+                    live_loop.Settings('codex', 'codex-live', warm_seconds=60),
+                    client, adapter, self.session,
+                    clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+                result = worker.run()
+                self.assertEqual(result['error_code'], 'native_subscription_identity_required')
+                self.assertIs(result['auth_failed'], True)
+                self.assertIs(result['model_call_attempted'], False)
+                self.assertEqual(worker.last_exit, 1)
+                self.assertFalse(any(p.endswith('/claim') or p.endswith('/complete')
+                                     for p, _ in client.posts))
+                reports = [v for p, v in client.posts if p.endswith('/report')]
+                self.assertGreaterEqual(len(reports), 2)
+                last = reports[-1]
+                self.assertEqual(last['status'], 'error')
+                self.assertEqual(last['auth_status'], 'failed')
+                self.assertIsNone(last['current_room_id'])
+                self.assertEqual(last['last_exit_code'], 1)
+                for earlier in reports[:-1]:
+                    self.assertEqual(earlier['status'], 'offline')
+                    self.assertEqual(earlier['auth_status'], 'unknown')
+                self.assertFalse(any(r['status'] == 'idle' for r in reports))
+                self.assertEqual(self.prompt_count(), 0)
+                self.assertFalse(any(r['method'] == 'thread/start' for r in self.native.requests))
+                self.session.broker.quarantine.assert_called()
+
+    def test_worker_malformed_account_status_at_prepare_is_not_failed_auth(self):
+        self._fresh_session()
+        self.mutate = lambda native: setattr(native, 'account', 'not-a-dict')
+        adapter = SimpleNamespace(
+            prepare=c.prepare, execute=c.execute, close=c.close, maintain=c.maintain,
+            CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+            CLI_NAME=getattr(c, 'CLI_NAME', None),
+        )
+
+        class HubClient:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, path, value):
+                self.posts.append((path, copy.deepcopy(value)))
+                if path.endswith('/claim') or path.endswith('/complete'):
+                    raise AssertionError('unexpected hub path: ' + path)
+                return {'accepted': True}
+
+            def get_room(self, room):
+                raise AssertionError('unexpected get_room')
+
+        client = HubClient()
+        worker = live_loop.Worker(
+            live_loop.Settings('codex', 'codex-live', warm_seconds=60),
+            client, adapter, self.session,
+            clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+        result = worker.run()
+        self.assertNotEqual(result['error_code'], 'native_subscription_identity_required')
+        self.assertNotIn('auth_failed', result)
+        reports = [v for p, v in client.posts if p.endswith('/report')]
+        self.assertTrue(reports)
+        self.assertEqual(reports[-1]['status'], 'offline')
+        self.assertEqual(reports[-1]['auth_status'], 'unknown')
+        self.assertFalse(any(p.endswith('/claim') for p, _ in client.posts))
+
     def test_worker_refuses_task_deadline_below_execute_warm_floor(self):
         """Real codex: loop deadline under EXECUTE_WARM_FLOOR never enters execute."""
         execute_calls = []
