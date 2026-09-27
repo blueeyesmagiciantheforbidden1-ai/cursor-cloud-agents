@@ -1150,6 +1150,122 @@ class LoopTests(unittest.TestCase):
         del client.task['repair']
         self.assertNotIn('previous_attempt_rejected_by_hub', task_prompt(client.task, client.room, 'grok'))
 
+    def _claim_envelope(self, **fields):
+        envelope = dict(room_id=ROOM, agent='grok', step=0, attempt=1, worker_id='grok-live',
+                        predecessor_count=0, input_sha256='0' * 64, provenance={})
+        envelope.update(fields)
+        return envelope
+
+    def test_hub_facts_come_from_the_claim_envelope(self):
+        client = Client(Clock())
+        client.task['envelope'] = self._claim_envelope(step=0, attempt=1, predecessor_count=0)
+        text = task_prompt(client.task, client.room, 'grok')
+        preamble, body = text.split('\n\n', 1)
+        context = json.loads(body)
+        self.assertEqual(context['hub_facts'],
+                         {'room_id': ROOM, 'step': 0, 'attempt': 1, 'agent': 'grok', 'prior_count': 0})
+        self.assertIn(live_loop.HUB_FACTS_NOTE, preamble)
+        for key in ('worker_id', 'input_sha256', 'provenance'):
+            self.assertNotIn(key, context['hub_facts'])
+
+    def test_hub_prior_count_is_the_envelope_count_not_the_visible_rows(self):
+        client = Client(Clock())
+        messages = [
+            {'agent': 'codex', 'text': 'ok', 'exit_code': 0},
+            {'agent': 'claude', 'text': 'fail', 'exit_code': 1},
+            {'agent': 'cursor', 'text': 'ok', 'exit_code': 0},
+        ]
+        client.task['messages'] = client.room['messages'] = messages
+        client.task['step'] = client.room['step'] = 3
+        client.task['envelope'] = self._claim_envelope(step=3, attempt=1, predecessor_count=3)
+        original = copy.deepcopy(client.task['messages'])
+        text = task_prompt(client.task, client.room, 'grok')
+        context = json.loads(text.split('\n\n', 1)[1])
+        self.assertEqual(len(context['previous_agent_contributions']), 2)
+        self.assertEqual(context['hub_facts']['prior_count'], 3)
+        self.assertEqual(client.task['messages'], original)
+
+    def test_repair_claim_hub_facts_carry_the_new_attempt(self):
+        client = Client(Clock())
+        client.task['repair'] = {'attempt': 1, 'errors': ['prior_count: expected 0 (hub), got 1']}
+        client.task['envelope'] = self._claim_envelope(step=0, attempt=2, predecessor_count=0)
+        text = task_prompt(client.task, client.room, 'grok')
+        preamble, body = text.split('\n\n', 1)
+        context = json.loads(body)
+        self.assertEqual(context['hub_facts']['attempt'], 2)
+        self.assertIn(live_loop.HUB_FACTS_NOTE, preamble)
+        self.assertIn('rejected by the hub', preamble)
+        self.assertLess(preamble.index(live_loop.HUB_FACTS_NOTE),
+                        preamble.index('rejected by the hub'))
+
+    def test_claimed_envelope_reaches_the_model_prompt(self):
+        worker, client, adapter, _ = self.setup_worker()
+        client.task['envelope'] = self._claim_envelope(step=0, attempt=1, predecessor_count=0)
+        seen = {}
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            seen['prompt'] = prompt
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        context = json.loads(seen['prompt'].split('\n\n', 1)[1])
+        self.assertEqual(context['hub_facts'],
+                         {'room_id': ROOM, 'step': 0, 'attempt': 1, 'agent': 'grok', 'prior_count': 0})
+
+    def test_absent_or_malformed_envelope_leaves_the_prompt_unchanged(self):
+        # Pins the no-envelope prompt at d32d690 (477 bytes). Regenerate with:
+        # python -c "import hashlib,test_live_loop as t,live_loop as l; c=t.Client(t.Clock());
+        # s=l.task_prompt(c.task,c.room,'grok'); print(len(s.encode()), hashlib.sha256(s.encode()).hexdigest())"
+        base_digest = '12817db60683caba01091833ccfc31b87c8e0129a957341c1468a9ba383c1ffb'
+        client = Client(Clock())
+        baseline = task_prompt(client.task, client.room, 'grok')
+        self.assertEqual(hashlib.sha256(baseline.encode()).hexdigest(), base_digest)
+
+        def assert_unchanged(envelope):
+            client.task['envelope'] = envelope
+            text = task_prompt(client.task, client.room, 'grok')
+            self.assertEqual(text, baseline)
+
+        for bad in (None, 'x', [], {}):
+            with self.subTest(envelope=bad):
+                assert_unchanged(bad)
+        for key in ('room_id', 'step', 'attempt', 'predecessor_count', 'agent'):
+            with self.subTest(missing=key):
+                envelope = self._claim_envelope()
+                del envelope[key]
+                assert_unchanged(envelope)
+        for step in (True, '0', -1, 1):
+            with self.subTest(step=step):
+                assert_unchanged(self._claim_envelope(step=step))
+        assert_unchanged(self._claim_envelope(room_id='b' * 32))
+        for attempt in (0, True):
+            with self.subTest(attempt=attempt):
+                assert_unchanged(self._claim_envelope(attempt=attempt))
+        for count in (-1, 1.0):
+            with self.subTest(predecessor_count=count):
+                assert_unchanged(self._claim_envelope(predecessor_count=count))
+        assert_unchanged(self._claim_envelope(agent='codex'))
+
+        client.task.pop('envelope', None)
+        client.task['repair'] = {'attempt': 1, 'errors': ['schema failed']}
+        repair_only = task_prompt(client.task, client.room, 'grok')
+        client.task['envelope'] = self._claim_envelope(step=-1)
+        self.assertEqual(task_prompt(client.task, client.room, 'grok'), repair_only)
+
+    def test_hub_facts_prompt_keeps_the_byte_cap(self):
+        client = Client(Clock())
+        client.task['envelope'] = self._claim_envelope()
+        blob = 'x' * 10000
+        client.task['messages'] = client.room['messages'] = [
+            {'agent': 'codex', 'text': blob, 'exit_code': 0} for _ in range(21)
+        ]
+        with self.assertRaises(LiveError) as caught:
+            task_prompt(client.task, client.room, 'grok')
+        self.assertEqual(error_code(caught.exception), 'full_context_exceeds_worker_limit')
+
     def test_idle_drain_records_its_drain_code(self):
         # Light 25d gap: pins outcome['drain_code'] on the second idle_drained path.
         worker, client, adapter, _ = self.setup_worker(); client.empty = True

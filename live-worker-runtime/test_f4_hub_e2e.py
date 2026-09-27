@@ -768,6 +768,78 @@ class F4HubE2ETests(unittest.TestCase):
         audit = seen['recovery_audit'][-1]
         self.assertEqual(audit['last_phase'], 'finishing')
 
+    def test_8_hub_facts_satisfy_bind_at_step_0(self):
+        """Adapter echoes hub_facts; bind contract accepts them at step 0."""
+        import broker_renew
+
+        class HubFactsAdapter(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                broker_renew.finishing_beat(self._heartbeat)
+                context = json.loads(prompt.split('\n\n', 1)[1])
+                return {
+                    'text': json.dumps(context.get('hub_facts', {})),
+                    'model': 'example', 'effort': 'max', 'usage': None,
+                }
+
+        bind = {f: f for f in ('room_id', 'step', 'attempt', 'agent', 'prior_count')}
+        room = self.create_room(
+            recovery='auto',
+            acceptance={'format': 'json', 'max_repairs': 0, 'bind': bind},
+        )
+        result, _ = self.run_worker(adapter=HubFactsAdapter())
+        self.assertEqual(result.get('outcome'), 'completed')
+        seen = self.seen(room['id'])
+        self.assertEqual(seen['status'], 'completed')
+        text = seen['messages'][-1]['text']
+        self.assertEqual(
+            json.loads(text),
+            {'room_id': room['id'], 'step': 0, 'attempt': 1, 'agent': 'grok', 'prior_count': 0},
+        )
+
+    def test_8b_repair_claim_binds_attempt_2(self):
+        """First attempt fails schema; repair claim carries attempt 2 in hub_facts."""
+        import broker_renew
+
+        class HubFactsRepairAdapter(DieAdapter):
+            def __init__(self):
+                super().__init__()
+                self.n = 0
+
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                self.n += 1
+                broker_renew.finishing_beat(self._heartbeat)
+                context = json.loads(prompt.split('\n\n', 1)[1])
+                payload = dict(context.get('hub_facts', {}))
+                if self.n >= 2:
+                    payload['ok'] = True
+                return {
+                    'text': json.dumps(payload),
+                    'model': 'example', 'effort': 'max', 'usage': None,
+                }
+
+        bind = {f: f for f in ('room_id', 'step', 'attempt', 'agent', 'prior_count')}
+        room = self.create_room(
+            recovery='auto',
+            acceptance={
+                'format': 'json',
+                'max_repairs': 1,
+                'schema': {'type': 'object', 'required': ['ok']},
+                'bind': bind,
+            },
+        )
+        adapter = HubFactsRepairAdapter()
+        self.run_worker(adapter=adapter)
+        mid = self.raw(room['id'])
+        self.assertIsNotNone(mid.get('repair'))
+        self.assertEqual(mid['repair'].get('step'), 0)
+        result, _ = self.run_worker(adapter=adapter)
+        self.assertEqual(result.get('outcome'), 'completed')
+        seen = self.seen(room['id'])
+        self.assertEqual(seen['status'], 'completed')
+        self.assertEqual(seen['messages'][-1]['envelope']['attempt'], 2)
+
 
 if __name__ == '__main__':
     unittest.main()
