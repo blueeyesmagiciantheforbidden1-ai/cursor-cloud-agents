@@ -410,6 +410,102 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertFalse(raw.get('rejected_outputs'))
         self.assertFalse(raw.get('completion_rejections'))
 
+    def test_7_expired_lease_mid_call_skips_a_completable_failure(self):
+        """Worker-side asserts flip once the heartbeat 409 carries a machine code."""
+        import provider_errors
+
+        case = self
+        room = self.create_room(recovery='manual')
+        beats = []
+
+        class RecordingClient(HubClient):
+            def __init__(self):
+                super().__init__(Config(case.base, case.agent, case.tokens[case.agent],
+                                        'F4_E2E_TOKEN', {}))
+                self.opener = build_opener(ProxyHandler({}))
+                self.paths = []
+                self.reader = LoopbackClient(case.base, case.tokens[case.agent], case.agent)
+
+            def get_room(self, room_id):
+                return self.reader.get_room(room_id)
+
+            def post(self, path, value):
+                self.paths.append((path, dict(value)))
+                return super().post(path, value)
+
+        class TickError(provider_errors.ProviderCodeError, RuntimeError):
+            pass
+
+        class ExpiryAdapter(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                case.now += 20
+                active = self._heartbeat()
+                beats.append(active)
+                if active is not True:
+                    raise AssertionError('first heartbeat did not renew the lease')
+                # Renewal expires at t0+65; this tick is t0+66, before t0+120.
+                case.now += LEASE_SECONDS + 1
+                active = self._heartbeat()
+                beats.append(active)
+                if active is not True:
+                    raise TickError('grok_hub_heartbeat_lost')
+                raise AssertionError('lease expiry did not stop the call')
+
+        client = RecordingClient()
+        result, adapter = self.run_worker(client=client, adapter=ExpiryAdapter())
+        self.assertEqual(beats, [True, False])
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertIs(result['model_call_attempted'], True)
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertFalse(any(path.endswith('/complete') for path, _ in client.paths))
+        self.assertEqual(adapter.calls.count('close'), 1)
+
+        raw = self.raw(room['id'])
+        self.assertEqual(raw['status'], 'needs_reconciliation')
+        self.assertEqual(raw['failure_reason'], 'lease')
+        self.assertIsNotNone(raw['lease'])
+        heartbeat_bodies = [value for path, value in client.paths
+                            if path.endswith('/heartbeat')]
+        self.assertTrue(heartbeat_bodies)
+        token = heartbeat_bodies[0]['lease_token']
+        self.assertTrue(all(value['lease_token'] == token for value in heartbeat_bodies))
+        self.assertEqual(raw['lease']['token'], token)
+        record = raw['attempt_records'][-1]
+        self.assertEqual(record['outcome'], 'lease_expired')
+        self.assertEqual(record['failure_class'], 'lease_expired')
+        self.assertEqual(record['last_phase'], 'model_call')
+        for key in ('exit_code', 'error_code', 'model_call_attempted'):
+            self.assertNotIn(key, record)
+        self.assertFalse(raw.get('rejected_outputs'))
+
+        output = ('The cloud worker stopped before it could deliver a verified answer '
+                  '(grok_hub_heartbeat_lost). It did not automatically repeat the model request.')
+        receipt = client.post('/v1/tasks/' + room['id'] + '/complete', {
+            'lease_token': token,
+            'output': output,
+            'exit_code': 1,
+            'step': 0,
+            'error_code': 'grok_hub_heartbeat_lost',
+            'model_call_attempted': True,
+        })
+        self.assertEqual(receipt, {'room_id': room['id'], 'status': 'needs_reconciliation'})
+        raw = self.raw(room['id'])
+        self.assertIsNone(raw['lease'])
+        self.assertEqual(raw['failure_reason'], 'post_model')
+        record = raw['attempt_records'][-1]
+        self.assertEqual(record['outcome'], 'failed')
+        self.assertEqual(record['failure_class'], 'post_model')
+        self.assertEqual(record['exit_code'], 1)
+        self.assertEqual(record['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertIs(record['model_call_attempted'], True)
+        self.assertIn('expired_first', record)
+        self.assertEqual(len(raw['rejected_outputs']), 1)
+        self.assertEqual(raw['rejected_outputs'][0]['exit_code'], 1)
+        self.assertEqual(raw['rejected_outputs'][0]['step'], 0)
+        self.assertEqual(raw['rejected_outputs'][0]['full_text'], output)
+        self.assertEqual(raw['messages'], [])
+
     def test_7_lost_complete_reply_next_agent_claimed_counts_as_delivered(self):
         room = self.create_room(agents=[self.agent, 'cursor'], recovery='auto')
         client = LoopbackClient(self.base, self.tokens[self.agent], self.agent)
