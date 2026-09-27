@@ -707,6 +707,12 @@ class Worker:
                         'completion_unconfirmed')
                 return
             except LeaseLost:
+                # A 409 on /complete is final: the hub checks completed_leases (an
+                # identical replay returns 200) before the lease match, so a 409 is a
+                # lease mismatch or a deterministic refusal (room_deadline,
+                # room/step mismatch, input_changed). completion_payload_conflict is
+                # also a 409, but the completion_payload_changed guard above stops a
+                # changed payload before it is sent.
                 self.completion_refused = True
                 raise LiveError('completion_refused') from None
             except Exception:
