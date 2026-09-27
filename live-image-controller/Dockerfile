@@ -11,7 +11,7 @@ COPY --chown=0:0 agent-hub/agent_hub/__init__.py agent-hub/agent_hub/adapters.py
     agent-hub/agent_hub/credential_broker_service.py agent-hub/agent_hub/learning.py agent-hub/agent_hub/model_policy.py \
     agent-hub/agent_hub/model_runtime.py agent-hub/agent_hub/subscription_auth.py agent-hub/agent_hub/worker.py \
     /opt/runcrew/app/agent_hub/
-COPY --chown=0:0 live-worker-runtime/cloud_runtime.py live-worker-runtime/dynamic_broker.py live-worker-runtime/fleet_controller.py \
+COPY --chown=0:0 live-worker-runtime/cloud_runtime.py live-worker-runtime/dynamic_broker.py live-worker-runtime/fleet_controller.py live-worker-runtime/fleet_readiness_publisher.py \
     live-worker-runtime/serve.py live-worker-runtime/broker_auth_check.py live-worker-runtime/test_dynamic_broker.py /opt/runcrew/app/
 COPY --chown=0:0 live-worker-runtime/providers/__init__.py /opt/runcrew/app/providers/
 COPY --chown=0:0 live-worker-runtime/tests/__init__.py live-worker-runtime/tests/test_dynamic_broker_review.py \
