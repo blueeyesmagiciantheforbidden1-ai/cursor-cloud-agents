@@ -1194,6 +1194,40 @@ class GrokAdapter(unittest.TestCase):
             session.broker.quarantine.assert_not_called()
 
 
+    def test_keyboard_interrupt_inside_close_quarantines_and_reraises(self):
+        fixture = Fixture(close_error=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            with self.assertRaises(KeyboardInterrupt):
+                g.close(handle)
+            self.assertTrue(handle.close_failed)
+            self.assertFalse(handle.finished)
+            session.broker.quarantine.assert_called_once_with(
+                session.lease, 'provider_refresh_uncertain')
+            session.finish.assert_not_called()
+
+    def test_keyboard_interrupt_inside_prepare_failure_close_quarantines(self):
+        fixture = Fixture(close_error=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            with patch.object(g, 'NativeProcess', fixture.factory), \
+                    self.assertRaises(KeyboardInterrupt):
+                g.prepare(session, lambda: False, time.monotonic() + 30)
+            session.broker.quarantine.assert_called_once_with(
+                session.lease, 'provider_refresh_uncertain')
+            session.finish.assert_not_called()
+            self.assertEqual(fixture.events, ['stop'])
+
+    def test_plain_exception_inside_close_still_quarantines_and_reraises(self):
+        fixture = Fixture(close_error=RuntimeError('native stop failed'))
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            with self.assertRaises(RuntimeError):
+                g.close(handle)
+            self.assertTrue(handle.close_failed)
+            session.broker.quarantine.assert_called_once()
+
+
 class BillingPolicy(unittest.TestCase):
     def test_native_omissions_are_unavailable_and_cent_empty_is_zero(self):
         result = g._billing(billing(), {'rule': {}})

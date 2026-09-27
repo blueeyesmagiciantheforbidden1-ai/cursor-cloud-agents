@@ -342,7 +342,9 @@ def close(handle):
         handle.finished = True
         handle.secret = ''
         return handle.credential_version
-    except Exception:
+    except BaseException:
+        # Bookkeeping for Exception and for SIGTERM's KeyboardInterrupt /
+        # SystemExit; never swallow the original BaseException.
         handle.close_failed = True
         try:
             handle.session.broker.quarantine(handle.session.lease, 'provider_refresh_uncertain')
@@ -420,9 +422,18 @@ def prepare(session, heartbeat, deadline):
         # so idle pumping covers the live loop's wait. execute() replaces it.
         handle.native.deadline = max(started + WARM_SECONDS, time.monotonic() + WARM_SECONDS)
         return handle
-    except BaseException:
+    except Exception:
         if not handle.finished and not handle.close_failed:
             close(handle)
+        raise
+    except BaseException:
+        # Interrupt during prepare: close may raise Exception after bookkeeping;
+        # never let that replace KeyboardInterrupt / SystemExit.
+        if not handle.finished and not handle.close_failed:
+            try:
+                close(handle)
+            except Exception:
+                pass
         raise
 
 

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import live_loop
 from live_loop import Worker, Settings, LiveError, task_prompt, handle_released
@@ -1108,6 +1109,48 @@ class LoopTests(unittest.TestCase):
         result = worker.run()
         self.assertIn('prepare', adapter.calls)
         self.assertEqual(result['outcome'], 'idle_drained'); self.assertEqual(worker.last_exit, 0)
+
+    def test_sigterm_during_first_report_releases_lease_exactly_once(self):
+        """SIGTERM during the first report(force=True) before prepare releases the lease."""
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        finish = Mock()
+        quarantine = Mock()
+        session = SimpleNamespace(
+            state='active',
+            finish=finish,
+            broker=SimpleNamespace(quarantine=quarantine),
+            lease=object(),
+        )
+
+        def finish_side(*, native_stopped):
+            self.assertIs(native_stopped, True)
+            session.state = 'committed'
+            return 'version/1'
+
+        finish.side_effect = finish_side
+        worker = Worker(
+            Settings('grok', 'grok-live', warm_seconds=60),
+            client, adapter, session,
+            clock=clock, sleep=clock.sleep, log=lambda record: None)
+
+        def post(path, value):
+            if path.endswith('/report') and first[0]:
+                first[0] = False
+                raise KeyboardInterrupt
+            return {'accepted': True}
+
+        first = [True]
+        client.post = post
+        result = worker.run()
+        finish.assert_called_once_with(native_stopped=True)
+        quarantine.assert_not_called()
+        self.assertNotIn('prepare', adapter.calls)
+        self.assertEqual(result['outcome'], 'idle_drained')
+        self.assertEqual(worker.last_exit, 0)
+        self.assertTrue(worker.cleaned)
+        self.assertEqual(session.state, 'committed')
 
     def test_idle_hub_heartbeat_codes_from_maintain_are_retried(self):
         for error in (CodeError('hub_lease_lost'),

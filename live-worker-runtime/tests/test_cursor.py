@@ -793,5 +793,47 @@ class CursorPrepareInterrupt(unittest.TestCase):
             session.broker.quarantine.assert_not_called()
 
 
+    def test_keyboard_interrupt_inside_close_quarantines_and_reraises(self):
+        fixture = Fixture(close_error=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            with patch.object(c, '_metadata_process', fixture.metadata_process), \
+                    patch.object(c, '_acp_process', fixture.acp_process):
+                handle = c.prepare(session, lambda: True, time.monotonic() + 30)
+            with self.assertRaises(KeyboardInterrupt):
+                c.close(handle)
+            self.assertTrue(handle.close_failed)
+            self.assertFalse(handle.finished)
+            session.broker.quarantine.assert_called_once_with(
+                session.lease, 'provider_refresh_uncertain')
+            session.finish.assert_not_called()
+
+    def test_keyboard_interrupt_inside_prepare_failure_close_quarantines(self):
+        fixture = Fixture(close_error=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            # Fail after ACP is up: second heartbeat (post-verify) raises via False.
+            beats = iter([True, False])
+            with patch.object(c, '_metadata_process', fixture.metadata_process), \
+                    patch.object(c, '_acp_process', fixture.acp_process), \
+                    self.assertRaises(KeyboardInterrupt):
+                c.prepare(session, lambda: next(beats), time.monotonic() + 30)
+            session.broker.quarantine.assert_called_once_with(
+                session.lease, 'provider_refresh_uncertain')
+            session.finish.assert_not_called()
+
+    def test_plain_exception_inside_close_still_quarantines_and_reraises(self):
+        fixture = Fixture(close_error=RuntimeError('native stop failed'))
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            with patch.object(c, '_metadata_process', fixture.metadata_process), \
+                    patch.object(c, '_acp_process', fixture.acp_process):
+                handle = c.prepare(session, lambda: True, time.monotonic() + 30)
+            with self.assertRaises(RuntimeError):
+                c.close(handle)
+            self.assertTrue(handle.close_failed)
+            session.broker.quarantine.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1229,6 +1229,51 @@ class CodexLive(unittest.TestCase):
         self.session.broker.quarantine.assert_called_once()
         self.session.finish.assert_not_called()
 
+    def test_keyboard_interrupt_inside_close_quarantines_and_reraises(self):
+        handle = self.prepare()
+
+        def boom():
+            raise KeyboardInterrupt
+
+        handle.native.stop_group = boom
+        with self.assertRaises(KeyboardInterrupt):
+            c.close(handle)
+        self.assertEqual(handle.state, 'quarantined')
+        self.assertEqual(handle.credential_writeback, 'uncertain')
+        self.session.broker.quarantine.assert_called_once_with(
+            self.session.lease, 'provider_refresh_uncertain')
+        self.session.finish.assert_not_called()
+
+    def test_keyboard_interrupt_inside_prepare_failure_close_quarantines(self):
+        def boom_stop():
+            raise KeyboardInterrupt
+
+        def factory(*args, **kwargs):
+            self.native = FixtureRPC(*args, **kwargs)
+            self.mutate(self.native)
+            original = self.native.stop_group
+
+            def stop():
+                self.native.order.append('stop')
+                raise KeyboardInterrupt
+
+            self.native.stop_group = stop
+            return self.native
+
+        with patch.object(c, 'WarmRPC', side_effect=factory), \
+                self.assertRaises(KeyboardInterrupt):
+            c.prepare(self.session, lambda: False, time.monotonic() + 120)
+        self.assertEqual(self.session.broker.quarantine.call_count, 1)
+        self.session.finish.assert_not_called()
+
+    def test_plain_exception_inside_close_still_substitutes_reconciliation_error(self):
+        handle = self.prepare()
+        handle.native.stop_error = True
+        with self.assertRaisesRegex(c.LiveCodexError, 'credential_reconciliation_required'):
+            c.close(handle)
+        self.assertEqual(handle.state, 'quarantined')
+        self.session.broker.quarantine.assert_called_once()
+
 
 @unittest.skipIf(c is None, SKIP_REASON)
 class TransportWiring(unittest.TestCase):

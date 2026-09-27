@@ -437,6 +437,16 @@ def _close(handle):
         except Exception:
             pass
         raise LiveCodexError('credential_reconciliation_required') from None
+    except BaseException:
+        # SIGTERM's KeyboardInterrupt / SystemExit: mark quarantined and
+        # best-effort broker.quarantine, then re-raise the interrupt unchanged.
+        handle.state = 'quarantined'
+        handle.credential_writeback = 'uncertain'
+        try:
+            handle.session.broker.quarantine(handle.session.lease, 'provider_refresh_uncertain')
+        except Exception:
+            pass
+        raise
 
 
 def _fail(handle, error):

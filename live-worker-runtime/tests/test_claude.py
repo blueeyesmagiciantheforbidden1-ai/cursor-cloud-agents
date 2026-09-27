@@ -904,6 +904,43 @@ class ClaudeAdapter(unittest.TestCase):
             session.broker.quarantine.assert_not_called()
 
 
+    def test_keyboard_interrupt_inside_close_quarantines_and_reraises(self):
+        """SIGTERM (KeyboardInterrupt) inside close after prepare still bookkeeps."""
+        fixture = Fixture(close_error=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            with self.assertRaises(KeyboardInterrupt):
+                c.close(handle)
+            self.assertTrue(handle.close_failed)
+            self.assertFalse(handle.finished)
+            session.broker.quarantine.assert_called_once_with(
+                session.lease, 'provider_refresh_uncertain')
+            session.finish.assert_not_called()
+
+    def test_keyboard_interrupt_inside_prepare_failure_close_quarantines(self):
+        """Prepare-failure close hit by SIGTERM: quarantine once, interrupt propagates."""
+        fixture = Fixture(close_error=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            with patch.object(c, 'NativeProcess', fixture.factory), \
+                    patch.object(c, 'launch_context_error', lambda *a: None), \
+                    self.assertRaises(KeyboardInterrupt):
+                c.prepare(session, lambda: False, time.monotonic() + 30)
+            session.broker.quarantine.assert_called_once_with(
+                session.lease, 'provider_refresh_uncertain')
+            session.finish.assert_not_called()
+            self.assertEqual(fixture.events, ['stop'])
+
+    def test_plain_exception_inside_close_still_quarantines_and_reraises(self):
+        fixture = Fixture(close_error=RuntimeError('native stop failed'))
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            with self.assertRaises(RuntimeError):
+                c.close(handle)
+            self.assertTrue(handle.close_failed)
+            session.broker.quarantine.assert_called_once()
+
+
 class ClaudePrepareInterruptLoop(unittest.TestCase):
     def test_worker_prepare_interrupt_releases_without_claim(self):
         fixture = Fixture()

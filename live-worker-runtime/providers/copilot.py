@@ -640,6 +640,15 @@ def close(handle):
         except Exception:
             pass
         raise CopilotError('copilot_close_requires_reconciliation') from None
+    except BaseException:
+        # SIGTERM's KeyboardInterrupt / SystemExit: record close failure and
+        # best-effort quarantine, then re-raise the interrupt unchanged.
+        handle.close_failed = True
+        try:
+            handle.session.broker.quarantine(handle.session.lease, 'provider_refresh_uncertain')
+        except Exception:
+            pass
+        raise
 
 
 def _home(session):

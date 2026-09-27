@@ -438,7 +438,9 @@ def close(handle):
         handle.finished = True
         handle.environment = {}
         return handle.credential_version
-    except Exception:
+    except BaseException:
+        # Bookkeeping for Exception and for SIGTERM's KeyboardInterrupt /
+        # SystemExit; never swallow the original BaseException.
         handle.close_failed = True
         try:
             handle.session.broker.quarantine(handle.session.lease, 'provider_refresh_uncertain')
@@ -490,9 +492,18 @@ def prepare(session, heartbeat, deadline):
             'same_process_account_model_quota': False}
         need(heartbeat() is True, 'claude_hub_heartbeat_lost')
         return handle
-    except BaseException:
+    except Exception:
         if not handle.finished and not handle.close_failed:
             close(handle)
+        raise
+    except BaseException:
+        # Interrupt during prepare: close may raise Exception after bookkeeping;
+        # never let that replace KeyboardInterrupt / SystemExit.
+        if not handle.finished and not handle.close_failed:
+            try:
+                close(handle)
+            except Exception:
+                pass
         raise
 
 

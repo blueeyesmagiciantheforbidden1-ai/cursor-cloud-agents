@@ -1184,6 +1184,40 @@ class Lifecycle(unittest.TestCase):
         self.broker.quarantine.assert_called_once()
         self.session.finish.assert_not_called()
 
+    def test_keyboard_interrupt_inside_close_quarantines_and_reraises(self):
+        handle = self.prepare()
+
+        def boom():
+            raise KeyboardInterrupt
+
+        handle.native.close = boom
+        with self.assertRaises(KeyboardInterrupt):
+            c.close(handle)
+        self.assertTrue(handle.close_failed)
+        self.assertFalse(handle.finished)
+        self.broker.quarantine.assert_called_once_with(
+            handle.session.lease, 'provider_refresh_uncertain')
+        self.session.finish.assert_not_called()
+
+    def test_keyboard_interrupt_inside_prepare_failure_close_quarantines(self):
+        self.heartbeat.return_value = False
+
+        def boom(self):
+            raise KeyboardInterrupt
+
+        with patch.object(FakeNative, 'close', boom), self.assertRaises(KeyboardInterrupt):
+            self.prepare()
+        self.broker.quarantine.assert_called_once()
+        self.session.finish.assert_not_called()
+
+    def test_plain_exception_inside_close_still_substitutes_reconciliation_error(self):
+        handle = self.prepare()
+        handle.native.fail_stop = True
+        with self.assertRaisesRegex(c.CopilotError, 'copilot_close_requires_reconciliation'):
+            c.close(handle)
+        self.assertTrue(handle.close_failed)
+        self.broker.quarantine.assert_called_once()
+
 
 class Admission(unittest.TestCase):
     def test_permission_flags_are_required_and_false_is_not_zero(self):

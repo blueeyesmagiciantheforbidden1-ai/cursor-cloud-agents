@@ -764,6 +764,28 @@ class Worker:
         self.cleaned = True
         self._emit_span('close', started, 'ok', task=self.task, attempt_key=self._attempt_key)
 
+    def _release_unprepared_session(self):
+        """Exactly-once finish/quarantine when run() exits before prepare returns a handle.
+
+        Entrypoint hands the active lease to Worker at construction; entrypoint's
+        finally only finishes when worker is None. An interrupt during the first
+        report(force=True) (before prepare) must still release the lease here.
+        prepare()'s own cleanup leaves session non-active, so this is a no-op then.
+        """
+        if self.handle is not None or self.cleaned:
+            return
+        if getattr(self.session, 'state', None) != 'active':
+            return
+        try:
+            with self._critical():
+                self.session.finish(native_stopped=True)
+        except Exception:
+            try:
+                self.session.broker.quarantine(self.session.lease, 'provider_refresh_uncertain')
+            except Exception:
+                pass
+        self.cleaned = True
+
     def _finishing_beat(self, deadline):
         """One finishing-phase task beat before /complete when the last ack is stale.
 
@@ -1360,6 +1382,8 @@ class Worker:
                                    claim_attempted=self.claim_attempted)
                     outcome.pop('drain_code', None)
                     return outcome
+            else:
+                self._release_unprepared_session()
             # A stop before any claim is the same clean end as a drain.
             idle_session_lost = idle_session_lost or (
                 code == 'worker_stopping' and self.task is None and not self.model_call_attempted)
@@ -1418,6 +1442,8 @@ class Worker:
                                        error_code='credential_cleanup_failed')
                         outcome.pop('drain_code', None)
                         self.last_exit = 1
+            else:
+                self._release_unprepared_session()
             measured = _usage_measured_at(self.handle)
             if measured is not None:
                 outcome['usage_measured_at'] = measured
