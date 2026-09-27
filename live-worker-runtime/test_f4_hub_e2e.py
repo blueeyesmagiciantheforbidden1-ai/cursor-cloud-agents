@@ -1,8 +1,10 @@
 """End-to-end: live_loop.Worker against the integrated F4 hub over loopback HTTP.
 
-Skipped unless F4_HUB_PATH points at a directory that contains the F4 agent_hub
-package (with HEARTBEAT_PHASES). That path is put first on sys.path before any
-agent_hub import so the vendored pre-F4 hub on PYTHONPATH cannot win.
+Skipped only when F4_HUB_PATH is unset or empty. When it is set, a missing or
+pre-F4 hub, or agent_hub already loaded from elsewhere, is an import error.
+The configured F4 hub is put first on sys.path before importing live_loop and
+stays first for the rest of the process. Leave F4_HUB_PATH unset for a full
+discover run; run these contract tests in their own process with it set.
 """
 from __future__ import annotations
 
@@ -18,9 +20,6 @@ from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
-import live_loop
-from live_loop import Settings, Worker
-
 F4_HUB_PATH = os.environ.get('F4_HUB_PATH')
 _SKIP_REASON = None
 Hub = HEARTBEAT_PHASES = LEASE_SECONDS = None
@@ -28,22 +27,43 @@ SQLiteStore = ThreadingHTTPServer = make_handler = None
 
 if not F4_HUB_PATH:
     _SKIP_REASON = 'F4_HUB_PATH is unset; set it to the F4 agent-hub source tree'
-elif not (Path(F4_HUB_PATH) / 'agent_hub').is_dir():
-    _SKIP_REASON = 'F4_HUB_PATH does not contain agent_hub/: %r' % (F4_HUB_PATH,)
 else:
-    # F4 hub must win over any vendored agent_hub already on PYTHONPATH.
-    sys.path.insert(0, str(Path(F4_HUB_PATH).resolve()))
+    hub_root = Path(F4_HUB_PATH).resolve()
+    if not (hub_root / 'agent_hub').is_dir():
+        raise ImportError('F4_HUB_PATH does not contain agent_hub/: %r' % (F4_HUB_PATH,))
+    sys.path.insert(0, str(hub_root))
+
+import live_loop
+from live_loop import Settings, Worker
+
+if F4_HUB_PATH:
     import agent_hub.core as _core
+
+    # A prior test module may have cached a different hub before this import.
+    _package_root = Path(os.path.normcase(str((hub_root / 'agent_hub').resolve())))
+    for _module_name in ('agent_hub', 'agent_hub.core', 'agent_hub.worker'):
+        _loaded_file = getattr(sys.modules.get(_module_name), '__file__', None)
+        _loaded_path = (
+            Path(os.path.normcase(str(Path(_loaded_file).resolve())))
+            if _loaded_file else None
+        )
+        if _loaded_path is None or not _loaded_path.is_relative_to(_package_root):
+            raise ImportError(
+                'agent_hub was not loaded from F4_HUB_PATH %s: %s.__file__=%r\n'
+                'Run python -m unittest test_f4_hub_e2e in its own process, '
+                'or unset F4_HUB_PATH so the module skips.'
+                % (hub_root, _module_name, _loaded_file)
+            )
+
     if not hasattr(_core, 'HEARTBEAT_PHASES'):
-        _SKIP_REASON = (
+        raise ImportError(
             'agent_hub at F4_HUB_PATH is not F4 (missing HEARTBEAT_PHASES); '
             'refusing to run against the vendored pre-F4 hub'
         )
-    else:
-        from agent_hub.core import HEARTBEAT_PHASES, Hub, LEASE_SECONDS
-        from agent_hub.server import ThreadingHTTPServer, make_handler
-        from agent_hub.store import SQLiteStore
-        from agent_hub.worker import Config, HubClient
+    from agent_hub.core import HEARTBEAT_PHASES, Hub, LEASE_SECONDS
+    from agent_hub.server import ThreadingHTTPServer, make_handler
+    from agent_hub.store import SQLiteStore
+    from agent_hub.worker import Config, HubClient
 
 
 class LoopbackClient:
