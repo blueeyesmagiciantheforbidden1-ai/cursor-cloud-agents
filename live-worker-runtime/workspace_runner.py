@@ -4,6 +4,12 @@ Only trusted, importable (subprocess-import compatible) fake providers and
 trusted local test commands are supported. Python audit hooks catch ordinary
 fake-provider escapes; they are NOT an OS sandbox for hostile Python/native code.
 No live adapter imports or network clients. See runcrew/docs/MYHERO_MH003_RUNNER_DESIGN.md.
+
+Run and provider-home directories are created with mode 0o700 (advisory on Windows).
+HOME/TMP scratch stays outside the receipt workspace. XDG_CACHE_HOME,
+XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR, APPDATA and
+LOCALAPPDATA are pinned beneath provider-home for providers and test-home for
+tests, overriding task_env values case-insensitively.
 """
 from __future__ import annotations
 
@@ -234,12 +240,19 @@ def _provider(provider_fn, workspace, text, deadline, env, bound, home):
 
 def _child_environment(home, task_env):
     _need(type(task_env) is dict, "invalid_task_env")
+    redirects = {key: str(Path(home) / folder) for key, folder in (
+        ("XDG_CACHE_HOME", ".cache"), ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"), ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_RUNTIME_DIR", ".runtime"), ("APPDATA", "AppData/Roaming"),
+        ("LOCALAPPDATA", "AppData/Local"),
+    )}
     home = str(home)
     env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": home,
            "TMP": home, "TEMP": home, "TMPDIR": home,
            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
            # Interpreter caches are build artifacts, never part of a receipt diff.
            "PYTHONDONTWRITEBYTECODE": "1"}
+    env.update(redirects)
     if os.name == "nt":
         for key in ("SYSTEMROOT", "COMSPEC"):
             if key in os.environ:
@@ -254,6 +267,9 @@ def _child_environment(home, task_env):
               and not upper.startswith(("HUB_", "GOOGLE_", "CLOUDSDK_", "GCE_",
                                         "AWS_", "AZURE_", "BROKER", "RUNCREW_")),
               "forbidden_task_env")
+        # Drop aliases as well: Windows environment names are case-insensitive.
+        if upper in redirects:
+            continue
         # Task variables cannot replace the supervisor's fixed environment or
         # inject interpreter/loader configuration.
         _need(upper not in env and upper not in ("SYSTEMROOT", "COMSPEC", "WINDIR", "USERPROFILE")
@@ -502,7 +518,7 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
     with _ALLOCATION_LOCK:
         _need(run.name not in _USED_IDS and not os.path.lexists(run), "workspace_reuse")
         try:
-            run.mkdir()
+            run.mkdir(mode=0o700)
         except FileExistsError:
             raise RunnerError("workspace_reuse") from None
         _USED_IDS.add(run.name)
@@ -513,7 +529,7 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
     try:
         workspace.mkdir(); control.mkdir()
         provider_home = run / "provider-home"
-        provider_home.mkdir()
+        provider_home.mkdir(mode=0o700)
         _materialize(spec["base_snapshot"], workspace, bound)
         env = _environment(control)
         child_env = _child_environment(provider_home, {} if task_env is None else task_env)

@@ -7,6 +7,7 @@ import json
 import uuid
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tarfile
@@ -16,6 +17,12 @@ import unittest
 from unittest import mock
 
 import workspace_runner as runner
+
+
+SCRATCH_REDIRECTS = (
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR", "APPDATA", "LOCALAPPDATA",
+)
 
 
 def edit(workspace, task_text, deadline):
@@ -110,6 +117,16 @@ def provider_scratch(workspace, task_text, deadline):
     edit(workspace, task_text, deadline)
 
 
+def provider_redirect_scratch(workspace, task_text, deadline):
+    home = workspace.parent / "provider-home"
+    for key in SCRATCH_REDIRECTS:
+        target = Path(os.environ[key]).resolve()
+        assert home in target.parents, (key, target)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / (key + ".scratch")).write_text("scratch")
+    edit(workspace, task_text, deadline)
+
+
 def provider_home_git(workspace, task_text, deadline):
     (Path(os.environ["HOME"]) / ".git").mkdir()
 
@@ -179,8 +196,9 @@ class WorkspaceRunnerTests(unittest.TestCase):
         self.spec = {"base_snapshot": str(self.base), "task_text": "changed\n",
                      "test_command": [sys.executable, "-c", "assert open('answer.txt').read() == 'changed\\n'"]}
 
-    def run_task(self, provider=edit, limits=None):
-        result = runner.run_coding_task(self.spec, provider, root=self.root, limits=limits or {})
+    def run_task(self, provider=edit, limits=None, task_env=None):
+        result = runner.run_coding_task(self.spec, provider, root=self.root, limits=limits or {},
+                                       task_env=task_env)
         proof = result["discard_proof"]
         self.assertTrue(proof["directory_absent"], result)
         self.assertFalse(os.path.lexists(proof["path"]))
@@ -259,6 +277,67 @@ class WorkspaceRunnerTests(unittest.TestCase):
         self.assertEqual(proof["tree_sha256"], recorded["tree_sha256"])
         self.assertTrue(proof["directory_absent"])
         self.assertFalse(os.path.lexists(Path(proof["path"]) / "provider-home"))
+
+    def test_scratch_redirects_are_pinned_case_insensitively(self):
+        for name in ("provider-home", "test-home"):
+            home = self.folder / name
+            for spelling in (str.upper, str.lower, str.title):
+                with self.subTest(home=name, spelling=spelling.__name__):
+                    overrides = {key: str(self.base / key) for key in SCRATCH_REDIRECTS}
+                    overrides.update({spelling(key): str(self.base / "alias")
+                                      for key in SCRATCH_REDIRECTS})
+                    overrides["TASK_MESSAGE"] = "safe"
+                    expected = runner._child_environment(home, {})
+                    env = runner._child_environment(home, overrides)
+                    self.assertEqual(env["TASK_MESSAGE"], "safe")
+                    for key in SCRATCH_REDIRECTS:
+                        self.assertEqual(env[key], expected[key])
+                        self.assertIn(home, Path(env[key]).parents)
+                        self.assertEqual([k for k in env if k.upper() == key], [key])
+
+    def test_provider_redirect_scratch_stays_out_of_the_receipt(self):
+        identifier = uuid.uuid4()
+        workspace = self.root / ("workspace-" + identifier.hex) / "work"
+        overrides = {key: str(workspace / key) for key in SCRATCH_REDIRECTS}
+        original = runner._discard
+        recorded = {}
+
+        def capturing(path, root):
+            recorded["scratch"] = [p.relative_to(path) for p in path.rglob("*.scratch")]
+            recorded["work"] = sorted(p.name for p in (path / "work").iterdir())
+            return original(path, root)
+
+        with mock.patch.object(runner.uuid, "uuid4", return_value=identifier), \
+                mock.patch.object(runner, "_discard", side_effect=capturing):
+            result = self.run_task(provider_redirect_scratch, task_env=overrides)
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(result["runner_receipt"]["files_changed"], 1)
+        self.assertEqual([line for line in result["diff"].splitlines()
+                          if line.startswith(b"diff --git")],
+                         [b"diff --git a/answer.txt b/answer.txt"])
+        self.assertEqual(recorded["work"], ["answer.txt"])
+        self.assertCountEqual([p.name for p in recorded["scratch"]],
+                              [key + ".scratch" for key in SCRATCH_REDIRECTS])
+        self.assertTrue(all(p.parts[0] == "provider-home" for p in recorded["scratch"]))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission modes are advisory on Windows")
+    def test_run_and_provider_home_are_private(self):
+        original = runner._discard
+        recorded = {}
+
+        def capturing(path, root):
+            recorded["run"] = stat.S_IMODE(path.stat().st_mode)
+            recorded["provider-home"] = stat.S_IMODE((path / "provider-home").stat().st_mode)
+            return original(path, root)
+
+        previous_umask = os.umask(0)
+        try:
+            with mock.patch.object(runner, "_discard", side_effect=capturing):
+                result = self.run_task()
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(recorded, {"run": 0o700, "provider-home": 0o700})
 
     def test_test_cwd_artifacts_and_edits_stay_out_of_the_receipt(self):
         # Demand probe: pytest cache, coverage, and a test-mutated model file
