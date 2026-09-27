@@ -144,6 +144,7 @@ class DieAdapter:
         if self.die_at == 'execute':
             raise RuntimeError('simulated worker death inside execute')
         import broker_renew
+        broker_renew.start_finishing_renew(self._heartbeat)
         broker_renew.finishing_beat(self._heartbeat)
         return {'text': self.answer, 'model': 'example', 'effort': 'max', 'usage': None}
 
@@ -751,6 +752,7 @@ class F4HubE2ETests(unittest.TestCase):
 
     @gap
     def test_10_answer_near_deadline_with_slow_close_is_kept(self):
+        """T169 trigger (i): absolute deadline — left gated for T176."""
         import broker_renew
         case = self
         room = self.create_room(recovery='auto')
@@ -779,6 +781,63 @@ class F4HubE2ETests(unittest.TestCase):
             % (seen['status'], len(seen['messages']), seen.get('recovery_audit'), result),
         )
         self.assertEqual(seen['messages'][-1]['text'], adapter.answer)
+
+    def test_11_early_answer_long_close_keeps_lease(self):
+        """T169 trigger (ii): early answer + close > LEASE_SECONDS; renewer keeps lease."""
+        import broker_renew
+        import time as time_mod
+        from unittest.mock import patch
+
+        case = self
+        room = self.create_room(recovery='auto')
+        model_calls = {'n': 0}
+
+        class EarlyLongClose(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                model_calls['n'] += 1
+                broker_renew.start_finishing_renew(self._heartbeat)
+                broker_renew.finishing_beat(self._heartbeat)
+                end = case.now + LEASE_SECONDS + 20
+                while case.now < end:
+                    time_mod.sleep(0.08)
+                    case.now += 10
+                return {'text': self.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        adapter = EarlyLongClose()
+        with patch('live_loop.FINISHING_RENEW_INTERVAL_SECONDS', 0.05):
+            worker = Worker(
+                Settings(self.agent, 'grok-e2e', warm_seconds=60),
+                self.client, adapter, object(), clock=lambda: case.now,
+                sleep=lambda seconds: setattr(case, 'now', case.now + seconds),
+            )
+            result = worker.run()
+        seen = self.seen(room['id'])
+        self.assertEqual(
+            seen['status'], 'completed',
+            'status=%s; messages=%s; recovery_audit=%r; worker=%r'
+            % (seen['status'], len(seen['messages']), seen.get('recovery_audit'), result),
+        )
+        self.assertEqual(seen['messages'][-1]['text'], adapter.answer)
+        self.assertEqual(model_calls['n'], 1)
+        self.assertEqual(seen.get('recovery_audit'), [])
+
+    def test_12_heartbeat_clamps_expires_at_to_deadline(self):
+        """Hub.heartbeat clamps lease_expires_at to the absolute deadline."""
+        room = self.create_room(recovery='auto')
+        claimed = self.hub.claim(self.agent)
+        self.assertEqual(claimed['task']['room_id'], room['id'])
+        token = claimed['task']['lease_token']
+        deadline = claimed['task']['deadline']
+        # Renew along the way so settle does not drop the lease before the
+        # near-deadline beat that must clamp expires_at.
+        while self.now + LEASE_SECONDS < deadline - 5:
+            self.now += LEASE_SECONDS - 5
+            self.hub.heartbeat(self.agent, room['id'], token, phase='model_call')
+        self.now = deadline - 5
+        receipt = self.hub.heartbeat(self.agent, room['id'], token, phase='finishing')
+        self.assertEqual(receipt['lease_expires_at'], deadline)
+        self.assertLess(receipt['lease_expires_at'], self.now + LEASE_SECONDS)
 
     def test_7_loss_after_answer_records_finishing(self):
         """A loss after finishing_beat is visible as last_phase=finishing."""

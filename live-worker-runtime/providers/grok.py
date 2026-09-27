@@ -524,6 +524,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         # so the value returned below is checked again after close.
         handle.internal_acks = dict(getattr(handle.native, 'internal_ack_counts', {}))
         _need_ack_shape(handle.internal_acks)
+        broker_renew.start_finishing_renew(handle.heartbeat)
         broker_renew.finishing_beat(handle.heartbeat)
         version = close(handle)
         _need_ack_shape(handle.internal_acks)

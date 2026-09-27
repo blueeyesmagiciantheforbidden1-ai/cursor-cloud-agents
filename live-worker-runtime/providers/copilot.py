@@ -866,6 +866,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         handle.native.drain_after_shutdown()
         for event in handle.native.events:
             need(event.get('type') in PASSIVE_EVENTS, 'copilot_activity_after_completion')
+        broker_renew.start_finishing_renew(handle.heartbeat)
         broker_renew.finishing_beat(handle.heartbeat)
         version = close(handle)
         return {'provider': 'copilot', 'text': text, 'model': MODEL, 'effort': EFFORT, 'usage': usage,

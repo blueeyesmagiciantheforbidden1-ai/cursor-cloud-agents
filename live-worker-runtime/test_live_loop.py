@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import live_loop
 from live_loop import Worker, Settings, LiveError, task_prompt, handle_released
@@ -338,6 +338,14 @@ class Adapter:
 
 
 class PostAnswerLeaseBudgetTests(unittest.TestCase):
+    """T169 trigger (i): answer near the absolute hub deadline.
+
+    A finishing renewer cannot help (hub clamps expires_at to the deadline).
+    These gated cases stay for T176 (finalization budgets / admission).
+    Trigger (ii) — early answer, close longer than the 45 s renewable lease —
+    is covered by FinishingRenewerTests and F4 test_11 (ungated).
+    """
+
     def _run(self, close_seconds, first_complete_times_out=False):
         clock = Clock()
         client = Client(clock)
@@ -5361,6 +5369,261 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertIs(worker.lease_revoked, False)
         self.assertEqual(after['n'], 1)
         self.assertEqual(len(client.completions), 1)
+
+
+class FinishingRenewerTests(unittest.TestCase):
+    """T175: background finishing renewer through close and /complete."""
+
+    def _lease_client(self, clock):
+        from agent_hub.worker import LeaseLost
+
+        class LeaseClient(Client):
+            def __init__(self, clock):
+                super().__init__(clock)
+                self.expires = None
+                self.lock = __import__('threading').Lock()
+                self.renew_heartbeats = 0
+
+            def post(self, path, value):
+                with self.lock:
+                    self.calls.append((path, copy.deepcopy(value)))
+                    if path.endswith('/claim'):
+                        self.claims += 1
+                        return {'task': copy.deepcopy(self.task)}
+                    if path.endswith('/heartbeat'):
+                        if self.expires is not None and self.clock() > self.expires:
+                            raise LeaseLost('The hub revoked or expired this task lease',
+                                            reason='lease_expired_completable')
+                        self.expires = self.clock() + 45
+                        if value.get('phase') == 'finishing':
+                            self.renew_heartbeats += 1
+                        return {'active': True, 'deadline': self.task['deadline'],
+                                'server_time': self.clock() + 600}
+                    if path.endswith('/complete'):
+                        self.completions.append(copy.deepcopy(value))
+                        if self.expires is not None and self.clock() > self.expires:
+                            raise LeaseLost('The hub revoked or expired this task lease',
+                                            reason='lease_expired_completable')
+                        return {'room_id': ROOM, 'status': 'completed'}
+                    return {'accepted': True}
+
+        return LeaseClient(clock)
+
+    def test_early_answer_slow_close_keeps_lease(self):
+        import threading
+        import time as time_mod
+
+        clock = Clock()
+        client = self._lease_client(clock)
+        adapter = Adapter()
+        baseline = threading.active_count()
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            import broker_renew
+            broker_renew.start_finishing_renew(handle_heartbeat['fn'])
+            end = clock.now + 45 + 20
+            while clock.now < end:
+                time_mod.sleep(0.08)
+                clock.now += 10
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        handle_heartbeat = {'fn': None}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            handle_heartbeat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        adapter.execute = execute
+        adapter.prepare = prepare
+        with patch.object(live_loop, 'FINISHING_RENEW_INTERVAL_SECONDS', 0.05):
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(len(client.completions), 1)
+        self.assertGreaterEqual(client.renew_heartbeats, 2)
+        self.assertIsNone(worker._finishing_renew_thread)
+        self.assertLessEqual(threading.active_count(), baseline + 1)
+
+    def test_renewer_stops_before_any_heartbeat_after_complete(self):
+        import time as time_mod
+
+        clock = Clock()
+        client = self._lease_client(clock)
+        adapter = Adapter()
+        order = []
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and value.get('phase') == 'finishing':
+                order.append('heartbeat')
+            if path.endswith('/complete'):
+                order.append('complete')
+            return original(path, value)
+
+        client.post = post
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            import broker_renew
+            broker_renew.start_finishing_renew(hb['fn'])
+            time_mod.sleep(0.12)
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        hb = {'fn': None}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            hb['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        adapter.execute = execute
+        adapter.prepare = prepare
+        with patch.object(live_loop, 'FINISHING_RENEW_INTERVAL_SECONDS', 0.05):
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertIn('complete', order)
+        self.assertNotIn('heartbeat', order[order.index('complete') + 1:])
+
+    def test_renewal_409_still_completes_once_and_records_reason(self):
+        from agent_hub.worker import LeaseLost
+        import time as time_mod
+
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        original = client.post
+        renew_posts = {'n': 0}
+
+        def post(path, value):
+            if (path.endswith('/heartbeat') and value.get('phase') == 'finishing'
+                    and 'execute' in adapter.calls):
+                renew_posts['n'] += 1
+                client.calls.append((path, copy.deepcopy(value)))
+                if renew_posts['n'] >= 2:
+                    raise LeaseLost('gone', reason='lease_inactive')
+                return {'active': True, 'deadline': client.task['deadline'], 'server_time': 700}
+            return original(path, value)
+
+        client.post = post
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            import broker_renew
+            broker_renew.start_finishing_renew(hb['fn'])
+            time_mod.sleep(0.15)
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        hb = {'fn': None}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            hb['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        adapter.execute = execute
+        adapter.prepare = prepare
+        with patch.object(live_loop, 'FINISHING_RENEW_INTERVAL_SECONDS', 0.05):
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(worker.finishing_renew_lease_reason, 'lease_inactive')
+        self.assertFalse(worker.lease_revoked)
+        self.assertNotIn('completion_delivery', result)
+
+    def test_renewal_transport_error_keeps_renewing_and_outcome(self):
+        import time as time_mod
+
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        original = client.post
+        transport_hits = {'n': 0}
+
+        def post(path, value):
+            if (path.endswith('/heartbeat') and value.get('phase') == 'finishing'
+                    and 'execute' in adapter.calls):
+                transport_hits['n'] += 1
+                client.calls.append((path, copy.deepcopy(value)))
+                if transport_hits['n'] <= 2:
+                    raise OSError('hub blip')
+                return {'active': True, 'deadline': client.task['deadline'], 'server_time': 700}
+            return original(path, value)
+
+        client.post = post
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            import broker_renew
+            broker_renew.start_finishing_renew(hb['fn'])
+            time_mod.sleep(0.2)
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        hb = {'fn': None}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            hb['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        adapter.execute = execute
+        adapter.prepare = prepare
+        with patch.object(live_loop, 'FINISHING_RENEW_INTERVAL_SECONDS', 0.05):
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(result.get('model_call_attempted'), True)
+        self.assertNotIn('completion_delivery', result)
+        self.assertFalse(worker.lease_revoked)
+        self.assertGreaterEqual(result.get('finishing_renew_failures', 0), 1)
+        self.assertGreaterEqual(transport_hits['n'], 3)
+
+    def test_sigterm_during_close_joins_renewer(self):
+        import threading
+        import time as time_mod
+
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        baseline = threading.active_count()
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            import broker_renew
+            broker_renew.start_finishing_renew(hb['fn'])
+            time_mod.sleep(0.08)
+            raise KeyboardInterrupt
+
+        hb = {'fn': None}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            hb['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        adapter.execute = execute
+        adapter.prepare = prepare
+        with patch.object(live_loop, 'FINISHING_RENEW_INTERVAL_SECONDS', 0.05):
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            result = worker.run()
+        self.assertEqual(result['error_code'], 'worker_stopping')
+        self.assertIsNone(worker._finishing_renew_thread)
+        self.assertLessEqual(threading.active_count(), baseline + 1)
+
+    def test_finishing_renew_interval_under_lease_and_doc_notes_clamp(self):
+        self.assertEqual(live_loop.FINISHING_RENEW_INTERVAL_SECONDS, 15)
+        self.assertLess(live_loop.FINISHING_RENEW_INTERVAL_SECONDS, 45)
+        doc = Worker._finishing_renew_loop.__doc__ or ''
+        self.assertIn('clamps', doc.lower())
+        self.assertIn('deadline', doc.lower())
 
 
 class PrePromptSignOutLoopTests(unittest.TestCase):

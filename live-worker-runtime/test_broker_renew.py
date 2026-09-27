@@ -177,6 +177,19 @@ class BrokerRenewTests(unittest.TestCase):
         self.assertEqual(broker_renew.next_due(None, 8, clock), 108)
         self.assertEqual(broker_renew.next_due(False, 25, clock), 110)
 
+    def test_start_finishing_renew_noop_without_hook(self):
+        broker_renew.start_finishing_renew(lambda *, phase=None: True)
+
+    def test_start_finishing_renew_calls_hook(self):
+        seen = []
+
+        def heartbeat(*, phase=None):
+            return True
+
+        heartbeat.start_finishing_renew = lambda: seen.append('start')
+        broker_renew.start_finishing_renew(heartbeat)
+        self.assertEqual(seen, ['start'])
+
     def test_finishing_beat_calls_once_with_phase(self):
         calls = []
 

@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from urllib.error import HTTPError, URLError
 
@@ -25,6 +26,9 @@ import usage_report
 # budgeting a model_call heartbeat retry so the second POST cannot eat the
 # reserved execute window.
 HUB_POST_TIMEOUT_SECONDS = 10
+# Task-lease renewals while close and /complete run. Well under hub LEASE_SECONDS
+# (45): a beat every 15 s keeps the renewable lease alive through a long finish.
+FINISHING_RENEW_INTERVAL_SECONDS = 15
 
 # /complete returns 200 when it stores this completion or completed_leases
 # already holds the same lease and payload. In runcrew agent_hub/core.py,
@@ -335,6 +339,8 @@ MAX_REPAIR_ERRORS, MAX_REPAIR_ERROR_TEXT = 8, 160
 HEARTBEAT_PHASES = ('setup', 'model_call', 'finishing')
 # The hub lease is 45 s, and complete() can take three 10 s POSTs plus 3 s of sleeps.
 FINISHING_BEAT_AFTER_SECONDS = 10
+# Join bound for the finishing renewer after stop (one in-flight POST + slack).
+FINISHING_RENEW_JOIN_SECONDS = HUB_POST_TIMEOUT_SECONDS + 1
 TASK_HEARTBEAT_RETRY_DELAY_SECONDS = 1
 # Time passes between the loop's pre-execute deadline check and the adapter's
 # own EXECUTE_WARM_FLOOR check (the model_call beat, renew and collect run
@@ -677,6 +683,21 @@ def _usage_measured_at(handle):
     return None
 
 
+class _HeartbeatGate:
+    """Callable passed to adapters; exposes start_finishing_renew (T175)."""
+
+    __slots__ = ('_worker',)
+
+    def __init__(self, worker):
+        self._worker = worker
+
+    def __call__(self, phase=None):
+        return self._worker.heartbeat(phase)
+
+    def start_finishing_renew(self):
+        self._worker._start_finishing_renewer()
+
+
 class Worker:
     def __init__(self, settings, client, adapter, session, *, clock=time.monotonic,
                  sleep=time.sleep, log=lambda record: None, trace_id=None):
@@ -721,6 +742,16 @@ class Worker:
         # LeaseLost). The loop then skips its own finishing beat so a second
         # opener timeout cannot eat the completion reserve.
         self._finishing_beat_transport_failed = False
+        # Background finishing renewer (T175): one thread per task, stop Event.
+        self._finishing_renew_stop = None
+        self._finishing_renew_thread = None
+        self._finishing_renew_client_lock = threading.Lock()
+        self._finishing_renew_shares_client = False
+        self.finishing_renew_failures = 0
+        # getattr(LeaseLost, 'reason', None) from a renewer 409; never alters
+        # lease_revoked / completion_delivery (renewal must not steer outcome).
+        self.finishing_renew_lease_reason = None
+        self._heartbeat_gate = _HeartbeatGate(self)
         self.completion_payload = None
         self.cleaned = False
         # _release_unprepared_session's result; set once so it never runs twice.
@@ -931,6 +962,105 @@ class Worker:
                     self._task_ack_at = ack_at
         except Exception:
             pass
+
+    def _make_finishing_renew_client(self):
+        """Client used by the finishing renewer thread.
+
+        Prefer a separate HubClient constructed from the same config so a renewer
+        POST never holds the main client's opener/identity across /complete.
+        Test doubles without ``config`` share the injected client under a lock.
+        """
+        config = getattr(self.client, 'config', None)
+        if config is not None:
+            try:
+                clone = type(self.client)(config)
+            except Exception:
+                clone = None
+            if clone is not None and clone is not self.client:
+                self._finishing_renew_shares_client = False
+                return clone
+        self._finishing_renew_shares_client = True
+        return self.client
+
+    def _start_finishing_renewer(self):
+        """Start one background finishing renewer for the current task (idempotent)."""
+        if self._finishing_renew_thread is not None or self.task is None or self.stopping:
+            return
+        if (self.phase in HEARTBEAT_PHASES
+                and HEARTBEAT_PHASES.index('finishing') > HEARTBEAT_PHASES.index(self.phase)):
+            self.phase = 'finishing'
+        elif self.phase not in HEARTBEAT_PHASES:
+            self.phase = 'finishing'
+        stop = threading.Event()
+        self._finishing_renew_stop = stop
+        client = self._make_finishing_renew_client()
+        thread = threading.Thread(
+            target=self._finishing_renew_loop,
+            args=(client, stop),
+            name='finishing-renew',
+            daemon=True,
+        )
+        self._finishing_renew_thread = thread
+        thread.start()
+
+    def _stop_finishing_renewer(self):
+        """Signal the finishing renewer and join it with a bound timeout."""
+        stop = self._finishing_renew_stop
+        thread = self._finishing_renew_thread
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            thread.join(timeout=FINISHING_RENEW_JOIN_SECONDS)
+        self._finishing_renew_thread = None
+        self._finishing_renew_stop = None
+
+    def _finishing_renew_loop(self, client, stop):
+        """Renew the task lease while close and /complete run.
+
+        Hub.heartbeat clamps expires_at to min(now + LEASE_SECONDS, deadline)
+        (runcrew agent_hub/core.py Hub.heartbeat), so renewal cannot extend past
+        the absolute hub deadline. This closes T169 trigger (ii) — an early
+        answer followed by a long close — while absolute time remains, but not
+        trigger (i) (an answer 1 s before the deadline).
+
+        Uses a separate HubClient when available so the main thread's /complete
+        is never blocked waiting for this thread's opener. Transport errors
+        increment finishing_renew_failures and wait the full interval; a 409
+        records getattr(error, 'reason', None) and stops renewing without
+        altering lease_revoked or skipping /complete.
+        """
+        # Wait the interval first: the adapter/loop finishing beats cover the
+        # immediate post-answer renewal. Beating before the wait would race
+        # short unit clocks and duplicate the finishing phase on every success.
+        while not stop.wait(FINISHING_RENEW_INTERVAL_SECONDS):
+            if self.stopping:
+                return
+            task = self.task
+            if not isinstance(task, dict):
+                return
+            room_id = task.get('room_id')
+            if not (isinstance(room_id, str) and re.fullmatch(r'[a-f0-9]{32}', room_id)):
+                return
+            try:
+                ack_at = self.clock()
+                body = self._heartbeat_body(task)
+                if self._finishing_renew_shares_client:
+                    with self._finishing_renew_client_lock:
+                        receipt = client.post('/v1/tasks/' + room_id + '/heartbeat', body)
+                else:
+                    receipt = client.post('/v1/tasks/' + room_id + '/heartbeat', body)
+                if isinstance(receipt, dict) and receipt.get('active') is True:
+                    self._task_ack_at = ack_at
+                elif isinstance(receipt, dict) and receipt.get('active') is False:
+                    return
+            except LeaseLost as error:
+                # Record only; never set lease_revoked or skip /complete (T71/T110).
+                self.finishing_renew_lease_reason = getattr(error, 'reason', None)
+                return
+            except Exception:
+                if stop.is_set() or self.stopping:
+                    return
+                self.finishing_renew_failures += 1
 
     def _complete_for_span(self, output, exit_code, *, error_code=None):
         started = self.clock()
@@ -1154,41 +1284,46 @@ class Worker:
         require(self.completion_payload is None or self.completion_payload == payload,
                 'completion_payload_changed')
         self.completion_payload = dict(payload)
-        for attempt in range(3):
-            try:
-                result = self.client.post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
-                status = result.get('status') if isinstance(result, dict) else None
-                require(isinstance(result, dict) and
-                        result.get('room_id') == self.task['room_id'] and
-                        isinstance(status, str) and status in HUB_ROOM_STATUSES,
-                        'completion_unconfirmed')
-                self.completion_attempts.append('ok')
-                return
-            except LeaseLost:
-                # A 409 on /complete is final: the hub checks completed_leases (an
-                # identical replay returns 200) before the lease match, so a 409 is a
-                # lease mismatch or a deterministic refusal (room_deadline,
-                # room/step mismatch, input_changed). completion_payload_conflict is
-                # also a 409, but the completion_payload_changed guard above stops a
-                # changed payload before it is sent.
-                self.completion_attempts.append('http_409')
-                self.completion_refused = True
-                raise LiveError('completion_refused') from None
-            except Exception as error:
-                # Record before deciding: a final hub 4xx on the first POST is
-                # refused; the same 4xx after an earlier uncertain attempt stays
-                # unconfirmed. transport/5xx/408/429/unclassified still retry.
-                first_post = len(self.completion_attempts) == 0
-                code = _completion_attempt_code(error)
-                self.completion_attempts.append(code)
-                if _is_final_completion_4xx(code):
-                    if first_post:
-                        self.completion_refused = True
-                        raise LiveError('completion_rejected') from None
-                    raise LiveError('completion_delivery_uncertain') from None
-                if attempt == 2:
-                    raise LiveError('completion_delivery_uncertain') from None
-                self.sleep(attempt + 1)
+        try:
+            for attempt in range(3):
+                try:
+                    result = self.client.post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
+                    status = result.get('status') if isinstance(result, dict) else None
+                    require(isinstance(result, dict) and
+                            result.get('room_id') == self.task['room_id'] and
+                            isinstance(status, str) and status in HUB_ROOM_STATUSES,
+                            'completion_unconfirmed')
+                    self.completion_attempts.append('ok')
+                    return
+                except LeaseLost:
+                    # A 409 on /complete is final: the hub checks completed_leases (an
+                    # identical replay returns 200) before the lease match, so a 409 is a
+                    # lease mismatch or a deterministic refusal (room_deadline,
+                    # room/step mismatch, input_changed). completion_payload_conflict is
+                    # also a 409, but the completion_payload_changed guard above stops a
+                    # changed payload before it is sent.
+                    self.completion_attempts.append('http_409')
+                    self.completion_refused = True
+                    raise LiveError('completion_refused') from None
+                except Exception as error:
+                    # Record before deciding: a final hub 4xx on the first POST is
+                    # refused; the same 4xx after an earlier uncertain attempt stays
+                    # unconfirmed. transport/5xx/408/429/unclassified still retry.
+                    first_post = len(self.completion_attempts) == 0
+                    code = _completion_attempt_code(error)
+                    self.completion_attempts.append(code)
+                    if _is_final_completion_4xx(code):
+                        if first_post:
+                            self.completion_refused = True
+                            raise LiveError('completion_rejected') from None
+                        raise LiveError('completion_delivery_uncertain') from None
+                    if attempt == 2:
+                        raise LiveError('completion_delivery_uncertain') from None
+                    self.sleep(attempt + 1)
+        finally:
+            # Definitive /complete answer (2xx, final 4xx, 409) or exhausted
+            # retries: stop renewing so no heartbeat follows completion.
+            self._stop_finishing_renewer()
 
     def _adapter_execute_floor(self):
         """The adapter's EXECUTE_WARM_FLOOR when it is a non-negative int, else 0."""
@@ -1250,7 +1385,7 @@ class Worker:
                     raise
             startup_started = self.clock()
             try:
-                self.handle = self.adapter.prepare(self.session, self.heartbeat,
+                self.handle = self.adapter.prepare(self.session, self._heartbeat_gate,
                                                    self.clock() + self.settings.startup_seconds)
             except Exception as error:
                 code = _span_code(error)
@@ -1441,6 +1576,11 @@ class Worker:
                 # process. When the last acknowledged task beat is stale, the
                 # loop posts one more finishing beat before /complete so the
                 # hub lease covers delivery.
+                # T175: adapters start the finishing renewer at answer capture
+                # (before their in-execute close). Idempotent start here covers
+                # fakes that omit the hook, and keeps renewing through loop
+                # close + /complete.
+                self._start_finishing_renewer()
                 self._close_for_span()
                 self._finishing_beat(deadline)
                 self.ready = False
@@ -1577,6 +1717,10 @@ class Worker:
                         self.last_exit = 1
             elif self._release_unprepared_session() in ('quarantined', 'failed'):
                 outcome['credential_cleanup'] = 'failed'
+            # Every exit path (success, failure, SIGTERM/KeyboardInterrupt): the
+            # renewer must not outlive this task into the next warm/claim state.
+            # After close attempts so a failure-path close still sees renewals.
+            self._stop_finishing_renewer()
             measured = _usage_measured_at(self.handle)
             if measured is not None:
                 outcome['usage_measured_at'] = measured
@@ -1591,6 +1735,8 @@ class Worker:
                 outcome['report_failures'] = self.report_failures
             if self.task_heartbeat_retries > 0:
                 outcome['task_heartbeat_retries'] = self.task_heartbeat_retries
+            if self.finishing_renew_failures > 0:
+                outcome['finishing_renew_failures'] = self.finishing_renew_failures
             if any(code != 'ok' for code in self.completion_attempts):
                 outcome['completion_attempts'] = list(self.completion_attempts)
             if self.capability_dropped:

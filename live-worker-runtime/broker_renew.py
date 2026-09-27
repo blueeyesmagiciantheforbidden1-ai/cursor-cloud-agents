@@ -62,6 +62,18 @@ def next_due(renewed, cadence, clock=None):
 HUB_POST_TIMEOUT_SECONDS = 10
 
 
+def start_finishing_renew(heartbeat):
+    """Start the worker's background finishing renewer after the answer is captured.
+
+    Adapters call this once the verified answer is in hand and before close.
+    No-op for plain callables (unit fakes) that do not expose the hook; the
+    loop also starts the renewer after execute returns (idempotent).
+    """
+    start = getattr(heartbeat, 'start_finishing_renew', None)
+    if callable(start):
+        start()
+
+
 def finishing_beat(heartbeat, deadline=None, *, clock=None, post_timeout=None):
     """Tell the hub the model answered, before adapter close / broker finish.
 
