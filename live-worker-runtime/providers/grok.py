@@ -254,6 +254,12 @@ def _renew(handle):
     return renewed
 
 
+def _need_ack_shape(acks):
+    need(set(acks) <= {'skills-reload', 'workflows-reload'}
+         and all(type(value) is int and 1 <= value <= 8 for value in acks.values())
+         and sum(acks.values()) <= 8, 'grok_acknowledgement_count_shape')
+
+
 def close(handle):
     """Stop all native descendants before commit/release; idempotent after success."""
     if handle.finished:
@@ -503,13 +509,13 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
             'prompt': [{'type': 'text', 'text': prompt}], '_meta': {'verbatim': True, 'promptId': nonce}})
         text, usage = _answer(handle.native, result, handle.sid, nonce)
         # Capture and check acks before the finishing beat so a shape failure
-        # never tells the hub the model answered. close() re-reads the same map.
+        # never tells the hub the model answered. close() re-reads the same map,
+        # so the value returned below is checked again after close.
         handle.internal_acks = dict(getattr(handle.native, 'internal_ack_counts', {}))
-        need(set(handle.internal_acks) <= {'skills-reload', 'workflows-reload'}
-             and all(type(value) is int and 1 <= value <= 8 for value in handle.internal_acks.values())
-             and sum(handle.internal_acks.values()) <= 8, 'grok_acknowledgement_count_shape')
+        _need_ack_shape(handle.internal_acks)
         broker_renew.finishing_beat(handle.heartbeat)
         version = close(handle)
+        _need_ack_shape(handle.internal_acks)
         return {'text': text, 'provider': 'grok', 'model': MODEL, 'effort': EFFORT, 'usage': usage,
                 'preflight': handle.preflight, 'same_process_account_model_quota': handle.preflight['same_process_account_model_quota'],
                 'review_sha256': hashlib.sha256(text.encode()).hexdigest(),

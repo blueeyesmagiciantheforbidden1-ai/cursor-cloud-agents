@@ -260,6 +260,26 @@ class GrokAdapter(unittest.TestCase):
             self.assertEqual(fixture.events, ['stop', 'commit-release'])
             session.finish.assert_called_once()
 
+    def test_acks_that_turn_bad_before_close_are_still_refused(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session, handle = self.prepare(fixture, root)
+            phases = []
+
+            def heartbeat(*, phase=None):
+                phases.append(phase)
+                if phase == 'finishing':
+                    # close() re-reads the map after this beat.
+                    fixture.native.internal_ack_counts = {'skills-reload': 99}
+                return True
+
+            handle.heartbeat = heartbeat
+            with self.assertRaisesRegex(g.NativeError, '^grok_acknowledgement_count_shape$'):
+                g.execute(handle, 'Project.', time.monotonic() + 30)
+            self.assertIn('finishing', phases)
+            self.assertEqual(handle.internal_acks, {'skills-reload': 99})
+            session.finish.assert_called_once()
+
     def test_improvement_is_rejected_without_prompt_and_releases_cleanly(self):
         fixture = Fixture()
         with tempfile.TemporaryDirectory() as root:
