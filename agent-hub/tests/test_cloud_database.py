@@ -21,8 +21,10 @@ def fake_firestore():
     google.cloud = cloud
     cloud.firestore = firestore
     client = Mock(name='selected_database_client')
+    # Store also opens collection + '_state' for durable_state (see FirestoreStore.__init__).
     collections = {name: Mock(name=name) for name in
-                   ('isolated_rooms', 'isolated_rooms_workers', 'isolated_rooms_observations')}
+                   ('isolated_rooms', 'isolated_rooms_workers', 'isolated_rooms_observations',
+                    'isolated_rooms_state')}
     client.collection.side_effect = collections.__getitem__
     firestore.Client = Mock(return_value=client)
     firestore.transactional = lambda function: function
@@ -37,7 +39,9 @@ class CloudDatabaseTests(unittest.TestCase):
             store = FirestoreStore('synthetic-isolated-project', 'isolated_rooms', database='isolated-ledger')
             firestore.Client.assert_called_once_with(project='synthetic-isolated-project', database='isolated-ledger')
             self.assertEqual(client.collection.call_args_list,
-                             [call('isolated_rooms'), call('isolated_rooms_workers'), call('isolated_rooms_observations')])
+                             [call('isolated_rooms'), call('isolated_rooms_workers'),
+                              call('isolated_rooms_observations'), call('isolated_rooms_state')])
+            self.assertIs(store.durable_state, collections['isolated_rooms_state'])
             room = {'id': 'synthetic-room', 'status': 'queued'}
             worker = {'received_at': 1, 'status': 'idle'}
             observation = {'schema_version': 1}

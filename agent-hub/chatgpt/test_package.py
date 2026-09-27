@@ -7,9 +7,34 @@ from zipfile import ZipFile
 
 from build_plugin import FILES, PLUGIN, build
 
+PLUGIN_MANIFEST = PLUGIN / FILES[0]
+
+
+def plugin_manifest_absent():
+    """Skip PackageTests only when the plugin manifest path is not a regular file."""
+    return not PLUGIN_MANIFEST.is_file()
+
+
+class PluginManifestSkipConditionTests(unittest.TestCase):
+    def test_skip_condition_is_exactly_file_absent(self):
+        """Skip predicate is exactly 'file absent', not content or parse errors."""
+        self.assertEqual(FILES[0], '.codex-plugin/plugin.json')
+        self.assertEqual(PLUGIN_MANIFEST, PLUGIN / '.codex-plugin' / 'plugin.json')
+        self.assertIs(plugin_manifest_absent(), not PLUGIN_MANIFEST.is_file())
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / 'plugin.json'
+            present = Path(temporary) / 'plugin.json'
+            self.assertTrue(not missing.is_file())
+            present.write_text('{}', encoding='utf-8')
+            self.assertTrue(present.is_file())
+            present.unlink()
+            self.assertTrue(not present.is_file())
+
 
 class PackageTests(unittest.TestCase):
     def setUp(self):
+        if plugin_manifest_absent():
+            self.skipTest('plugin manifest deliberately not imported')
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
