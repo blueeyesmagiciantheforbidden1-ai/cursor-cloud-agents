@@ -460,6 +460,89 @@ class CodexLive(unittest.TestCase):
             c.execute(handle, 'Project task.', time.monotonic() + 180)
         self.assertEqual(self.prompt_count(), 0)
 
+    def test_signed_out_account_before_prompt_preserves_identity_auth_code(self):
+        cases = (
+            {'requiresOpenaiAuth': False},
+            {'requiresOpenaiAuth': True, 'account': {'type': 'api', 'email': EMAIL}},
+            {'requiresOpenaiAuth': True, 'account': {'type': 'chatgpt'}},
+            {'requiresOpenaiAuth': True, 'account': None},
+        )
+        for account in cases:
+            with self.subTest(account=account):
+                self._fresh_session()
+                handle = self.prepare()
+                self.native.account = account
+                with self.assertRaisesRegex(
+                        c.LiveCodexError, '^native_subscription_identity_required$') as caught:
+                    c.execute(handle, 'Project task.', time.monotonic() + 180)
+                self.assertEqual(self.prompt_count(), 0)
+                self.assertFalse(caught.exception.model_call_attempted)
+                self.assertEqual(handle.state, 'quarantined')
+                self.session.broker.quarantine.assert_called()
+                self.session.finish.assert_not_called()
+
+    def test_malformed_account_status_is_not_identity_auth(self):
+        handle = self.prepare()
+        self.native.account = 'not-a-dict'
+        with self.assertRaises(c.LiveCodexError) as caught:
+            c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertEqual(self.prompt_count(), 0)
+        self.assertNotEqual(str(caught.exception), 'native_subscription_identity_required')
+        self.assertFalse(caught.exception.model_call_attempted)
+
+    def test_worker_signed_out_before_prompt_one_auth_completion_and_quarantine(self):
+        """Real Worker + codex adapter: identity failure before prompt, close fails."""
+        real_prepare = c.prepare
+
+        def prepare(session, heartbeat, deadline):
+            handle = real_prepare(session, heartbeat, deadline)
+            self.native.account = {'requiresOpenaiAuth': True, 'account': None}
+            return handle
+
+        adapter = SimpleNamespace(
+            prepare=prepare, execute=c.execute, close=c.close, maintain=c.maintain,
+            CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+            CLI_NAME=getattr(c, 'CLI_NAME', None),
+        )
+
+        class HubClient:
+            def __init__(self):
+                self.completions = []
+
+            def post(self, path, value):
+                if path.endswith('/claim'):
+                    return {'task': {
+                        'room_id': 'b' * 32, 'lease_token': 'lease', 'workspace': 'default',
+                        'prompt': 'Project task.', 'messages': [], 'timeout_seconds': 300,
+                        'deadline': time.time() + 600, 'step': 0, 'learning_context': {},
+                    }}
+                if path.endswith('/heartbeat'):
+                    now = time.time()
+                    return {'active': True, 'deadline': now + 600, 'server_time': now}
+                if path.endswith('/complete'):
+                    self.completions.append(copy.deepcopy(value))
+                    return {'room_id': 'b' * 32, 'status': 'needs_reconciliation'}
+                return {'accepted': True}
+
+            def get_room(self, room):
+                return {'id': room, 'workspace': 'default', 'prompt': 'Project task.',
+                        'messages': [], 'status': 'running', 'step': 0, 'purpose': 'project'}
+
+        client = HubClient()
+        worker = live_loop.Worker(
+            live_loop.Settings('codex', 'codex-live', warm_seconds=60),
+            client, adapter, self.session,
+            clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+        result = worker.run()
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'],
+                         'native_subscription_identity_required')
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+        self.assertEqual(result['error_code'], 'native_subscription_identity_required')
+        self.assertEqual(result['credential_cleanup'], 'failed')
+        self.session.broker.quarantine.assert_called()
+        self.session.finish.assert_not_called()
+
     def test_unknown_turn_response_remains_uncertain_and_is_never_replayed(self):
         handle = self.prepare(); self.native.fail_prompt = True
         with self.assertRaises(c.LiveCodexError) as caught:

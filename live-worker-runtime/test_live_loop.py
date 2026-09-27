@@ -4735,4 +4735,109 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(len(client.completions), 1)
 
 
+class PrePromptSignOutLoopTests(unittest.TestCase):
+    """T138: vetted sign-out before the prompt + failed close → one auth completion."""
+
+    CODES = (
+        'copilot_account_not_authenticated',
+        'native_subscription_identity_required',
+    )
+
+    def _worker(self, *, code, prompt_sent, refuse_complete=False):
+        clock = Clock()
+        client = Client(clock)
+        quarantines = {'n': 0}
+
+        class SignOutAdapter:
+            def __init__(self):
+                self.calls = []
+
+            def prepare(self, session, heartbeat, deadline):
+                self.calls.append('prepare')
+                return SimpleNamespace(state='ready')
+
+            def maintain(self, handle):
+                self.calls.append('maintain')
+
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                quarantines['n'] += 1
+                err = CodeError(code)
+                err.model_call_attempted = prompt_sent
+                raise err
+
+            def close(self, handle):
+                self.calls.append('close')
+                quarantines['n'] += 1
+                raise CodeError('credential_reconciliation_required')
+
+        adapter = SignOutAdapter()
+        if refuse_complete:
+            from agent_hub.worker import LeaseLost
+            original = client.post
+
+            def post(path, value):
+                if path.endswith('/complete'):
+                    client.completions.append(copy.deepcopy(value))
+                    raise LeaseLost('complete refused', reason='lease_inactive')
+                return original(path, value)
+
+            client.post = post
+        worker = Worker(Settings('copilot', 'copilot-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep, log=lambda record: None)
+        return worker, client, adapter, quarantines
+
+    def test_signed_out_before_prompt_one_auth_completion_and_failed_cleanup(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                worker, client, adapter, quarantines = self._worker(
+                    code=code, prompt_sent=False)
+                result = worker.run()
+                self.assertEqual(len(client.completions), 1)
+                completion = client.completions[0]
+                self.assertEqual(completion['exit_code'], 1)
+                self.assertEqual(completion['error_code'], code)
+                self.assertIs(completion['model_call_attempted'], False)
+                self.assertEqual(result['error_code'], code)
+                self.assertEqual(result['credential_cleanup'], 'failed')
+                self.assertIs(result['model_call_attempted'], False)
+                self.assertEqual(worker.last_exit, 1)
+                self.assertGreaterEqual(quarantines['n'], 1)
+                self.assertIn('close', adapter.calls)
+
+    def test_failure_after_prompt_plus_close_failure_sends_no_completion(self):
+        for code in self.CODES:
+            with self.subTest(code=code):
+                worker, client, adapter, _ = self._worker(code=code, prompt_sent=True)
+                result = worker.run()
+                self.assertEqual(client.completions, [])
+                self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+                self.assertEqual(result['error_code'], 'credential_cleanup_failed')
+                self.assertNotIn('credential_cleanup', result)
+
+    def test_auth_completion_409_is_final_refused(self):
+        worker, client, adapter, _ = self._worker(
+            code='copilot_account_not_authenticated', prompt_sent=False,
+            refuse_complete=True)
+        result = worker.run()
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'],
+                         'copilot_account_not_authenticated')
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertEqual(result['error_code'], 'copilot_account_not_authenticated')
+        self.assertEqual(result['credential_cleanup'], 'failed')
+
+    def test_malformed_codex_status_is_not_auth_at_loop_completion(self):
+        # Protocol/shape miss must not open the provider_auth path.
+        worker, client, adapter, _ = self._worker(
+            code='native_metadata_unavailable', prompt_sent=False)
+        result = worker.run()
+        self.assertEqual(client.completions, [])
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(result['error_code'], 'credential_cleanup_failed')
+        self.assertNotEqual(result.get('error_code'),
+                            'native_subscription_identity_required')
+
+
 if __name__ == '__main__': unittest.main()

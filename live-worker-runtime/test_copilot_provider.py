@@ -284,10 +284,17 @@ class Lifecycle(unittest.TestCase):
         self.assertFalse(handle.attempted)
         self.session.finish.assert_not_called()
         self.assertTrue(native.native_stopped)
-        self.assertIsNotNone(provider_errors.error_code(caught.exception))
+        self.assertEqual(provider_errors.error_code(caught.exception),
+                         'copilot_account_not_authenticated')
+        self.assertIs(caught.exception.model_call_attempted, False)
+        self.broker.quarantine.assert_called_once()
 
-    @gap
     def test_signed_out_before_prompt_reports_a_hub_auth_code(self):
+        # Before the fix, close() masked the auth signal: _fresh_metadata cleared
+        # owner_verified, _owner raised, then close failed its owner check and
+        # replaced the code with copilot_close_requires_reconciliation (not
+        # copilot_owner_mismatch). That close code is absent from hub
+        # PROVIDER_AUTH_CODES. Now the adapter preserves the signed-out code.
         codes = runcrew_provider_auth_codes()
         if codes is None:
             self.skipTest('runcrew agent_hub/core.py is unavailable; set RUNCREW_AGENT_HUB')
@@ -297,9 +304,122 @@ class Lifecycle(unittest.TestCase):
         with self.assertRaises(c.CopilotError) as caught:
             c.execute(handle, 'project', time.monotonic()+100)
         code = provider_errors.error_code(caught.exception)
+        self.assertEqual(code, 'copilot_account_not_authenticated')
         self.assertIn(code, codes, msg=(
             f'{code}: absent from hub PROVIDER_AUTH_CODES; '
-            'classify_completion then gives post_model (model_call_attempted=True)'))
+            'without membership classify_completion would miss provider_auth'))
+
+    def test_other_status_shapes_before_prompt_stay_owner_or_close_codes(self):
+        # Explicit False is the only shape that becomes the hub auth code.
+        # Wrong login / missing field / non-dict stay today's mismatch/close path.
+        cases = (
+            {'isAuthenticated': True, 'authType': 'user', 'login': 'other-user',
+             'host': 'github.com'},
+            {'isAuthenticated': True, 'authType': 'oauth', 'login': c.EXPECTED_LOGIN,
+             'host': 'github.com'},
+            {'authType': 'user', 'login': c.EXPECTED_LOGIN, 'host': 'github.com'},
+            'not-a-dict',
+            None,
+        )
+        for owner in cases:
+            with self.subTest(owner=owner):
+                self._new_grant()
+                handle = self.prepare()
+                handle.native.owner = owner
+                with self.assertRaises(c.CopilotError) as caught:
+                    c.execute(handle, 'project', time.monotonic()+100)
+                code = provider_errors.error_code(caught.exception)
+                self.assertNotEqual(code, 'copilot_account_not_authenticated')
+                self.assertIn(code, (
+                    'copilot_owner_mismatch', 'copilot_close_requires_reconciliation'))
+
+    def test_prepare_signed_out_still_reports_owner_mismatch(self):
+        # T121: prepare must not emit copilot_account_not_authenticated.
+        class SignedOutNative(FakeNative):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.owner = {'isAuthenticated': False}
+
+        with patch.object(c, 'NativeProcess', SignedOutNative):
+            with self.assertRaises(c.CopilotError) as caught:
+                c.prepare(self.session, self.heartbeat, time.monotonic()+3500)
+        self.assertEqual(provider_errors.error_code(caught.exception), 'copilot_owner_mismatch')
+
+    def test_worker_signed_out_before_prompt_one_auth_completion_and_quarantine(self):
+        """Real Worker + copilot adapter: sign-out before prompt, close fails."""
+        class SignOutOnExecuteNative(FakeNative):
+            def request(self, method, params=None):
+                c.Native._tick(self)
+                self.index += 1
+                self.calls.append((method, copy.deepcopy(params)))
+                if method == 'connect':
+                    return {'protocolVersion': 3}
+                if method == 'auth.getStatus':
+                    # prepare already checked once; execute re-check is signed out.
+                    if sum(1 for m, _ in self.calls if m == 'auth.getStatus') >= 2:
+                        return {'isAuthenticated': False}
+                    return copy.deepcopy(self.owner)
+                if method == 'models.list':
+                    return copy.deepcopy(self.catalog)
+                if method == 'account.getQuota':
+                    return copy.deepcopy(self.quota)
+                if method == 'session.create':
+                    self.sid = params['sessionId']
+                    return {'sessionId': self.sid}
+                if method == 'session.model.setAllowedModels':
+                    return {'allowedModels': [c.MODEL], 'effectiveAllowedModels': [c.MODEL]}
+                if method == 'session.model.getCurrent':
+                    return {'modelId': c.MODEL, 'reasoningEffort': c.EFFORT}
+                if method == 'session.send':
+                    raise AssertionError('prompt must not be sent when signed out')
+                if method == 'runtime.shutdown':
+                    self.clean_shutdown = True
+                    return {}
+                raise AssertionError('unexpected method')
+
+            def close(self):
+                if self.fail_stop:
+                    raise OSError('private detail')
+                self.native_stopped = True
+
+        class HubClient:
+            def __init__(self):
+                self.completions = []
+                self.claims = 0
+
+            def post(self, path, value):
+                if path.endswith('/claim'):
+                    self.claims += 1
+                    return {'task': {
+                        'room_id': 'a' * 32, 'lease_token': 'lease', 'workspace': 'default',
+                        'prompt': 'Help with a design.', 'messages': [], 'timeout_seconds': 300,
+                        'deadline': 1_000_000, 'step': 0, 'learning_context': {},
+                    }}
+                if path.endswith('/heartbeat'):
+                    return {'active': True, 'deadline': 1_000_000, 'server_time': 700}
+                if path.endswith('/complete'):
+                    self.completions.append(copy.deepcopy(value))
+                    return {'room_id': 'a' * 32, 'status': 'needs_reconciliation'}
+                return {'accepted': True}
+
+            def get_room(self, room):
+                return {'id': room, 'workspace': 'default', 'prompt': 'Help with a design.',
+                        'messages': [], 'status': 'running', 'step': 0, 'purpose': 'project'}
+
+        with patch.object(c, 'NativeProcess', SignOutOnExecuteNative):
+            client = HubClient()
+            worker = live_loop.Worker(
+                live_loop.Settings('copilot', 'copilot-live', warm_seconds=60),
+                client, c, self.session,
+                clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+            result = worker.run()
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'], 'copilot_account_not_authenticated')
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+        self.assertEqual(result['error_code'], 'copilot_account_not_authenticated')
+        self.assertEqual(result['credential_cleanup'], 'failed')
+        self.broker.quarantine.assert_called()
+        self.session.finish.assert_not_called()
 
     def test_unknown_send_failure_remains_uncertain_commits_no_replay(self):
         handle = self.prepare(); native = handle.native; native.fail_send = True

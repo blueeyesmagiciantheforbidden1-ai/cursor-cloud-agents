@@ -355,13 +355,27 @@ def _collect(handle):
     session, native = handle.session, handle.native
     captured = {}
     handle.owner_verified = False
+    # Remember only a well-formed account/read dict whose account facts say
+    # signed-out / wrong-route. A malformed (non-dict) status must not become
+    # provider_auth after the gate flattens other metadata failures.
+    identity_auth = None
 
     def rpc(method, params):
+        nonlocal identity_auth
         result = native.request(method, params)
         if method in ('account/read', 'account/rateLimits/read'):
             captured[method] = result
         if method == 'account/read':
-            identity = metadata.account_metadata(result, session.lease.profile, session.lease.account_ref)
+            if not isinstance(result, dict):
+                # Protocol/shape miss: leave for the gate (native_metadata_unavailable).
+                return result
+            try:
+                identity = metadata.account_metadata(
+                    result, session.lease.profile, session.lease.account_ref)
+            except metadata.MetadataError as err:
+                if str(err) == 'native_subscription_identity_required':
+                    identity_auth = 'native_subscription_identity_required'
+                raise
             need(identity['plan_type'] != 'unknown', 'native_plan_unknown')
         if method == 'account/rateLimits/read':
             need(metadata.canonical_account_ref(result.get('accountId')) == session.lease.canonical_account_ref,
@@ -374,7 +388,12 @@ def _collect(handle):
                  'effort': EFFORT, 'billing': 'subscription_included'}
     gate = protocol_gate.PrePromptGate(rpc, selection, config_sha256=CONFIG_SHA,
         provider_account_ref=session.lease.canonical_account_ref, execution_mode='read_only_review')
-    preflight = gate.collect()
+    try:
+        preflight = gate.collect()
+    except Exception:
+        if identity_auth is not None:
+            raise LiveCodexError(identity_auth) from None
+        raise
     need(preflight['requirements_sha256'] == REQUIREMENTS_SHA, 'managed_requirements_changed')
     quota = _quota(captured['account/rateLimits/read'], session.lease.canonical_account_ref)
     handle.usage = quota

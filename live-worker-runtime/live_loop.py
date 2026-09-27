@@ -98,6 +98,14 @@ STARTUP_AUTH_CODES = frozenset({
     'grok_owner_mismatch',                     # grok prepare (_owner)
     'copilot_owner_mismatch',                  # copilot prepare (_owner; also signed-out)
 })
+# Execute-time sign-out seen before the prompt (hub PROVIDER_AUTH_CODES). When
+# cleanup then fails closed, the loop still sends one failure completion with
+# the auth code (model_call_attempted false) and records credential_cleanup
+# failed. Cursor has no execute-time re-check; its account code stays startup-only.
+PRE_PROMPT_SIGN_OUT_CODES = frozenset({
+    'copilot_account_not_authenticated',
+    'native_subscription_identity_required',
+})
 # Not an assert: the check must hold under python -O too.
 if not all(provider_errors.SAFE_CODE.fullmatch(code) for code in STARTUP_AUTH_CODES):
     raise RuntimeError('STARTUP_AUTH_CODES must all match SAFE_CODE')
@@ -121,6 +129,8 @@ ROOM_REFUSAL_CODES = frozenset({
 # Not an assert: the check must hold under python -O too.
 if not all(provider_errors.SAFE_CODE.fullmatch(code) for code in ROOM_REFUSAL_CODES):
     raise RuntimeError('ROOM_REFUSAL_CODES must all match SAFE_CODE')
+if not all(provider_errors.SAFE_CODE.fullmatch(code) for code in PRE_PROMPT_SIGN_OUT_CODES):
+    raise RuntimeError('PRE_PROMPT_SIGN_OUT_CODES must all match SAFE_CODE')
 
 
 # Consecutive idle maintain() retries before the execution fails with the code.
@@ -627,6 +637,10 @@ class Worker:
         self.lease_revoked = False
         # A completion HTTP 409 is a final refusal, not uncertain delivery.
         self.completion_refused = False
+        # Narrow exception to native_cleanup_required_before_completion: a
+        # vetted pre-prompt sign-out whose close then failed closed may still
+        # deliver one auth failure completion (credential_cleanup='failed').
+        self._completion_after_failed_cleanup = False
         self.claim_attempted = False
         self.model_call_attempted = False
         # None until a task is claimed; then one of HEARTBEAT_PHASES.
@@ -999,7 +1013,8 @@ class Worker:
         if error_code is not None:
             require(provider_errors.SAFE_CODE.fullmatch(error_code) is not None, 'completion_code_invalid')
             payload.update(error_code=error_code, model_call_attempted=bool(self.model_call_attempted))
-        require(self.cleaned, 'native_cleanup_required_before_completion')
+        require(self.cleaned or self._completion_after_failed_cleanup,
+                'native_cleanup_required_before_completion')
         require(self.completion_payload is None or self.completion_payload == payload,
                 'completion_payload_changed')
         self.completion_payload = dict(payload)
@@ -1315,6 +1330,30 @@ class Worker:
                 try:
                     self._close_for_span()
                 except Exception:
+                    # Vetted sign-out raised before the prompt (adapter's own
+                    # prompt-not-sent fact): deliver one auth completion even
+                    # though cleanup failed closed. Quarantine/stop-claiming
+                    # stay as today; credential_cleanup='failed' on the outcome.
+                    adapter_attempted = getattr(error, 'model_call_attempted', None)
+                    if (code in PRE_PROMPT_SIGN_OUT_CODES
+                            and adapter_attempted is False
+                            and self.task and isinstance(self.task, dict)
+                            and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', ''))):
+                        self.last_exit = 1
+                        self.model_call_attempted = False
+                        self._completion_after_failed_cleanup = True
+                        outcome.update(error_code=code, credential_cleanup='failed',
+                                       model_call_attempted=False,
+                                       claim_attempted=self.claim_attempted)
+                        outcome.pop('drain_code', None)
+                        text = ('The cloud worker stopped before it could deliver a verified answer ('
+                                + code + '). It did not automatically repeat the model request.')
+                        try:
+                            self._complete_for_span(text, 1, error_code=code)
+                        except Exception:
+                            outcome['completion_delivery'] = (
+                                'refused' if self.completion_refused else 'unconfirmed')
+                        return outcome
                     self.last_exit = 1
                     outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed',
                                    model_call_attempted=self.model_call_attempted,
@@ -1371,9 +1410,14 @@ class Worker:
                 try:
                     self._close_for_span()
                 except Exception:
-                    outcome.update(outcome='credential_cleanup_failed', error_code='credential_cleanup_failed')
-                    outcome.pop('drain_code', None)
-                    self.last_exit = 1
+                    if self._completion_after_failed_cleanup:
+                        # Auth evidence already recorded; do not replace it.
+                        pass
+                    else:
+                        outcome.update(outcome='credential_cleanup_failed',
+                                       error_code='credential_cleanup_failed')
+                        outcome.pop('drain_code', None)
+                        self.last_exit = 1
             measured = _usage_measured_at(self.handle)
             if measured is not None:
                 outcome['usage_measured_at'] = measured

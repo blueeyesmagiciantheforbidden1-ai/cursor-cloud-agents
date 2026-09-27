@@ -193,7 +193,14 @@ def _number(value, *, minimum=0, maximum=10**15):
     return value
 
 
-def _owner(value):
+def _owner(value, *, claim_recheck=False):
+    # Claimed-task re-check only: an intact auth.getStatus with isAuthenticated
+    # explicitly False is the hub provider_auth code. prepare() keeps today's
+    # copilot_owner_mismatch for the same shape (T121). Every other invalid
+    # status shape stays copilot_owner_mismatch on both paths.
+    if (claim_recheck and type(value) is dict
+            and value.get('isAuthenticated') is False):
+        raise CopilotError('copilot_account_not_authenticated')
     need(type(value) is dict and value.get('isAuthenticated') is True
          and value.get('authType') == 'user' and value.get('login') == EXPECTED_LOGIN
          and value.get('host') in ('github.com', 'https://github.com'), 'copilot_owner_mismatch')
@@ -592,10 +599,10 @@ def _renew(handle):
     return renewed
 
 
-def _fresh_metadata(handle):
+def _fresh_metadata(handle, *, claim_recheck=False):
     native = handle.native
     handle.owner_verified = False
-    account = _owner(native.request('auth.getStatus'))
+    account = _owner(native.request('auth.getStatus'), claim_recheck=claim_recheck)
     handle.owner_verified = True
     catalog = _catalog(native.request('models.list'))
     quota = _billing(native.request('account.getQuota'), handle.session.lease.canonical_account_ref)
@@ -831,7 +838,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
              'copilot_prompt_limit')
         need(time.monotonic() < handle.idle_deadline, 'copilot_idle_deadline_expired')
         handle.native.deadline = _deadline(task_deadline, maximum=900)
-        handle.preflight = _fresh_metadata(handle)  # Billing never reuses the idle-time snapshot.
+        # Claimed-task re-check: split explicit signed-out from other owner misses.
+        handle.preflight = _fresh_metadata(handle, claim_recheck=True)
         _applied(handle.native.request('session.model.getCurrent', {'sessionId': handle.sid}))
         if handle.lease_clock.degraded:  # never send the prompt on an unconfirmed lease
             handle.lease_clock.renew(handle.session.broker, handle.session.lease, strict=True)
@@ -864,8 +872,22 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
             'native_stopped': True, 'credential_writeback': 'committed',
             'credential_version_ref': hashlib.sha256(version.encode()).hexdigest()}
     except Exception as error:
+        close_error = None
         if not handle.finished and not handle.close_failed:
-            close(handle)
+            try:
+                close(handle)
+            except Exception as caught:
+                close_error = caught
+        # Preserve the vetted pre-prompt sign-out code when close fails closed.
+        # Other codes keep today's replacement (close_error wins).
+        auth = provider_errors.error_code(error)
+        if (auth == 'copilot_account_not_authenticated'
+                and isinstance(error, CopilotError)
+                and not handle.attempted):
+            error.model_call_attempted = False
+            raise error
+        if close_error is not None:
+            raise close_error from None
         if isinstance(error, CopilotError):
             raise
         raise CopilotError('copilot_task_outcome_requires_reconciliation') from None

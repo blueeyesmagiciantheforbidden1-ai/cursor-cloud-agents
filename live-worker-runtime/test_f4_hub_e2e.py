@@ -840,6 +840,57 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertEqual(seen['status'], 'completed')
         self.assertEqual(seen['messages'][-1]['envelope']['attempt'], 2)
 
+    def test_9_pre_prompt_sign_out_is_provider_auth_and_quarantines(self):
+        """Copilot/codex sign-out before the prompt → provider_auth_failed + quarantine."""
+        import provider_errors
+
+        class AuthErr(provider_errors.ProviderCodeError, RuntimeError):
+            pass
+
+        for agent, code in (
+                ('copilot', 'copilot_account_not_authenticated'),
+                ('codex', 'native_subscription_identity_required'),
+        ):
+            with self.subTest(agent=agent, code=code):
+                self.agent = agent
+                self.client = LoopbackClient(self.base, self.tokens[agent], agent)
+                room = self.create_room(agents=[agent], recovery='manual')
+
+                class Adapter(DieAdapter):
+                    def __init__(self_inner):
+                        super().__init__()
+                        self_inner.quarantined = False
+
+                    def execute(self_inner, handle, prompt, deadline, *, task_kind):
+                        self_inner.calls.append('execute')
+                        self_inner.quarantined = True
+                        err = AuthErr(code)
+                        err.model_call_attempted = False
+                        raise err
+
+                    def close(self_inner, handle):
+                        self_inner.calls.append('close')
+                        self_inner.quarantined = True
+                        raise RuntimeError('credential_reconciliation_required')
+
+                adapter = Adapter()
+                worker = Worker(
+                    Settings(agent, agent + '-e2e', warm_seconds=60),
+                    self.client, adapter, object(),
+                )
+                result = worker.run()
+                self.assertEqual(result.get('error_code'), code)
+                self.assertEqual(result.get('credential_cleanup'), 'failed')
+                self.assertIs(result.get('model_call_attempted'), False)
+                self.assertTrue(adapter.quarantined)
+                raw = self.raw(room['id'])
+                self.assertEqual(raw['status'], 'needs_reconciliation')
+                self.assertEqual(raw['failure_reason'], 'provider_auth_failed')
+                record = raw['attempt_records'][-1]
+                self.assertEqual(record.get('failure_class'), 'provider_auth')
+                self.assertEqual(record.get('error_code'), code)
+                self.assertIs(record.get('model_call_attempted'), False)
+
 
 if __name__ == '__main__':
     unittest.main()
