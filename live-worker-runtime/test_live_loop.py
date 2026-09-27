@@ -3738,5 +3738,246 @@ class HeartbeatPhaseTests(unittest.TestCase):
                 closer = getattr(hub.store, 'close', None)
                 if callable(closer): closer()
 
+    def test_heartbeat_phase_argument_advances_forward_only(self):
+        clock = Clock(); client = Client(clock)
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, Adapter(),
+                        object(), clock=clock, sleep=clock.sleep)
+        worker.task = dict(client.task)
+        worker.phase = 'model_call'
+        self.assertIs(worker.heartbeat(phase='finishing'), True)
+        self.assertEqual(worker.phase, 'finishing')
+        beats = [value for path, value in client.calls if path.endswith('/heartbeat')]
+        self.assertEqual(beats[-1]['phase'], 'finishing')
+        n = len(client.calls)
+        self.assertIs(worker.heartbeat(phase='model_call'), True)
+        self.assertEqual(worker.phase, 'finishing')
+        later = [value for path, value in client.calls[n:] if path.endswith('/heartbeat')]
+        self.assertEqual(later[-1]['phase'], 'finishing')
+        n = len(client.calls)
+        self.assertIs(worker.heartbeat(phase='bogus'), True)
+        self.assertEqual(worker.phase, 'finishing')
+        bogus = [value for path, value in client.calls[n:] if path.endswith('/heartbeat')]
+        self.assertEqual(bogus[-1]['phase'], 'finishing')
+        worker.task = None
+        worker.phase = None
+        client.calls.clear()
+        self.assertIs(worker.heartbeat(phase='finishing'), True)
+        self.assertEqual([path for path, _ in client.calls if path.endswith('/heartbeat')], [])
+        worker.task = dict(client.task)
+        worker.phase = 'model_call'
+        client.calls.clear()
+        self.assertIs(worker.heartbeat(), True)
+        self.assertEqual(worker.phase, 'model_call')
+        self.assertEqual(
+            [value['phase'] for path, value in client.calls if path.endswith('/heartbeat')],
+            ['model_call'])
+
+    def test_providers_call_finishing_beat_before_success_close(self):
+        """In each provider execute try-body, finishing_beat is the statement before close."""
+        for stem in ('claude', 'cursor', 'codex', 'grok', 'copilot'):
+            with self.subTest(provider=stem):
+                path = PROVIDERS / (stem + '.py')
+                tree = ast.parse(path.read_text(encoding='utf-8'))
+                execute = None
+                for node in tree.body:
+                    if isinstance(node, ast.FunctionDef) and node.name == 'execute':
+                        execute = node
+                        break
+                self.assertIsNotNone(execute, stem)
+                close_name = '_close' if stem == 'codex' else 'close'
+                found = []
+                for i, stmt in enumerate(execute.body):
+                    if isinstance(stmt, ast.Try):
+                        for j, inner in enumerate(stmt.body):
+                            if (isinstance(inner, ast.Assign)
+                                    and isinstance(inner.value, ast.Call)
+                                    and isinstance(inner.value.func, ast.Name)
+                                    and inner.value.func.id == close_name):
+                                found.append(('assign', stmt.body, j, inner))
+                            elif (isinstance(inner, ast.Expr)
+                                    and isinstance(inner.value, ast.Call)
+                                    and isinstance(inner.value.func, ast.Name)
+                                    and inner.value.func.id == close_name):
+                                found.append(('expr', stmt.body, j, inner))
+                    if (isinstance(stmt, ast.Assign)
+                            and isinstance(stmt.value, ast.Call)
+                            and isinstance(stmt.value.func, ast.Name)
+                            and stmt.value.func.id == close_name):
+                        found.append(('assign', execute.body, i, stmt))
+                    elif (isinstance(stmt, ast.Expr)
+                            and isinstance(stmt.value, ast.Call)
+                            and isinstance(stmt.value.func, ast.Name)
+                            and stmt.value.func.id == close_name):
+                        found.append(('expr', execute.body, i, stmt))
+                self.assertEqual(len(found), 1, stem + ' close sites in execute: %r' % (found,))
+                _, body, index, _ = found[0]
+                self.assertGreater(index, 0, stem)
+                prev = body[index - 1]
+                self.assertIsInstance(prev, ast.Expr, stem)
+                call = prev.value
+                self.assertIsInstance(call, ast.Call, stem)
+                self.assertIsInstance(call.func, ast.Attribute, stem)
+                self.assertEqual(call.func.attr, 'finishing_beat', stem)
+                self.assertIsInstance(call.func.value, ast.Name, stem)
+                self.assertEqual(call.func.value.id, 'broker_renew', stem)
+                self.assertEqual(len(call.args), 1, stem)
+                arg = call.args[0]
+                self.assertIsInstance(arg, ast.Attribute, stem)
+                self.assertEqual(arg.attr, 'heartbeat', stem)
+
+    def test_slow_close_needs_loop_finishing_beat(self):
+        """After a long execute with no beat, the loop finishing beat renews the lease."""
+        from agent_hub.worker import LeaseLost
+
+        class LeaseClient(Client):
+            def __init__(self, clock):
+                super().__init__(clock)
+                self.expires = None
+                self.complete_attempts = 0
+
+            def post(self, path, value):
+                self.calls.append((path, copy.deepcopy(value)))
+                if path.endswith('/claim'):
+                    self.claims += 1
+                    return {'task': copy.deepcopy(self.task)}
+                if path.endswith('/heartbeat'):
+                    if self.expires is not None and self.clock() > self.expires:
+                        raise LeaseLost('The hub revoked or expired this task lease',
+                                        reason='lease_expired_completable')
+                    self.expires = self.clock() + 45
+                    return {'active': True, 'deadline': self.task['deadline'], 'server_time': 700}
+                if path.endswith('/complete'):
+                    self.completions.append(copy.deepcopy(value))
+                    self.complete_attempts += 1
+                    if self.expires is not None and self.clock() > self.expires:
+                        raise LeaseLost('The hub revoked or expired this task lease',
+                                        reason='lease_expired_completable')
+                    if self.complete_attempts == 1:
+                        self.clock.now += 10
+                        raise OSError('lost acknowledgement')
+                    return {'room_id': ROOM, 'status': 'completed'}
+                return {'accepted': True}
+
+        clock = Clock(); client = LeaseClient(clock); adapter = Adapter()
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            clock.now += 40
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        adapter.execute = execute
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        paths = [path for path, _ in client.calls]
+        finish_idxs = [i for i, (path, value) in enumerate(client.calls)
+                       if path.endswith('/heartbeat') and value.get('phase') == 'finishing']
+        complete_idxs = [i for i, path in enumerate(paths) if path.endswith('/complete')]
+        self.assertTrue(finish_idxs)
+        self.assertTrue(complete_idxs)
+        self.assertLess(finish_idxs[0], complete_idxs[0])
+        self.assertEqual(client.complete_attempts, 2)
+        self.assertEqual(result['outcome'], 'completed')
+
+    def test_failed_loop_finishing_beat_never_costs_the_answer(self):
+        from agent_hub.worker import LeaseLost
+
+        def run_case(beat_effect, *, sigterm=False):
+            clock = Clock(); client = Client(clock); adapter = Adapter()
+            original = client.post
+            finishing_posts = {'n': 0}
+
+            def execute(handle, prompt, deadline, *, task_kind):
+                adapter.calls.append('execute')
+                clock.now += 40
+                return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+            def post(path, value):
+                if (path.endswith('/heartbeat') and isinstance(value, dict)
+                        and value.get('phase') == 'finishing'
+                        and adapter.calls.count('execute') >= 1
+                        and 'close' in adapter.calls):
+                    finishing_posts['n'] += 1
+                    client.calls.append((path, copy.deepcopy(value)))
+                    if sigterm:
+                        self.assertIs(worker.on_signal(), False)
+                    return beat_effect()
+                return original(path, value)
+
+            adapter.execute = execute
+            client.post = post
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            return worker.run(), worker, client, finishing_posts
+
+        for label, effect in (
+                ('lease_lost', lambda: (_ for _ in ()).throw(
+                    LeaseLost('gone', reason='lease_expired_completable'))),
+                ('oserror', lambda: (_ for _ in ()).throw(OSError('hub down'))),
+                ('inactive', lambda: {'active': False}),
+        ):
+            with self.subTest(effect=label):
+                result, worker, client, posts = run_case(effect)
+                self.assertGreaterEqual(posts['n'], 1)
+                self.assertEqual(len(client.completions), 1)
+                self.assertEqual(client.completions[0]['exit_code'], 0)
+                self.assertEqual(result['outcome'], 'completed')
+                self.assertIs(worker.lease_revoked, False)
+
+        result, worker, client, posts = run_case(
+            lambda: {'active': True, 'deadline': 1000, 'server_time': 700}, sigterm=True)
+        self.assertTrue(worker.stopping)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['exit_code'], 0)
+        self.assertEqual(result['outcome'], 'completed')
+
+        # No loop beat when the last ack was under 10 s ago.
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        beat = {}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare'); beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            self.assertTrue(beat['fn']()); self.assertTrue(beat['fn']())
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        def close(handle):
+            adapter.calls.append('close'); beat['fn']()
+
+        adapter.prepare, adapter.execute, adapter.close = prepare, execute, close
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        self.assertEqual(worker.run()['outcome'], 'completed')
+        phases = [value['phase'] for path, value in client.calls if path.endswith('/heartbeat')]
+        self.assertEqual(phases, ['setup', 'model_call', 'model_call', 'model_call', 'finishing'])
+
+        # No loop beat when clock() >= deadline.
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        finishing_after_close = {'n': 0}
+        original = client.post
+
+        def execute_past_deadline(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            clock.now = deadline
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        def post(path, value):
+            receipt = original(path, value)
+            if (path.endswith('/heartbeat') and isinstance(value, dict)
+                    and value.get('phase') == 'finishing'
+                    and 'close' in adapter.calls):
+                finishing_after_close['n'] += 1
+            return receipt
+
+        adapter.execute = execute_past_deadline
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        self.assertEqual(worker.run()['outcome'], 'completed')
+        self.assertEqual(finishing_after_close['n'], 0)
+
 
 if __name__ == '__main__': unittest.main()

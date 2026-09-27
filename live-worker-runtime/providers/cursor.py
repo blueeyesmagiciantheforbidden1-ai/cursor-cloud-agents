@@ -480,6 +480,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(handle.secret not in text, 'cursor_credential_in_answer')
         review.check_settings(handle.settings)
         counts = dict(handle.native.counts)
+        broker_renew.finishing_beat(handle.heartbeat)
         version = close(handle)
         return {'text': text, 'provider': 'cursor', 'model': MODEL, 'effort': 'not_exposed_in_native_catalog',
                 'fast': False, 'mode': MODE, 'usage': {'native_event_counts': counts,

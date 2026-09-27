@@ -177,6 +177,32 @@ class BrokerRenewTests(unittest.TestCase):
         self.assertEqual(broker_renew.next_due(None, 8, clock), 108)
         self.assertEqual(broker_renew.next_due(False, 25, clock), 110)
 
+    def test_finishing_beat_calls_once_with_phase(self):
+        calls = []
+
+        def heartbeat(*, phase=None):
+            calls.append(phase)
+            return False
+
+        broker_renew.finishing_beat(heartbeat)
+        self.assertEqual(calls, ['finishing'])
+
+    def test_finishing_beat_ignores_false_oserror_and_zero_arg(self):
+        broker_renew.finishing_beat(lambda *, phase=None: False)
+
+        def boom(*, phase=None):
+            raise OSError('hub down')
+
+        broker_renew.finishing_beat(boom)
+        broker_renew.finishing_beat(lambda: True)
+
+    def test_finishing_beat_propagates_keyboard_interrupt(self):
+        def stop(*, phase=None):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            broker_renew.finishing_beat(stop)
+
     def test_lease_seconds_matches_policy_default(self):
         default = dynamic_broker.Policy.__dataclass_fields__['lease_seconds'].default
         self.assertEqual(broker_renew.LEASE_SECONDS, default)

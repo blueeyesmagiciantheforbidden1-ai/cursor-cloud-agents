@@ -502,6 +502,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         result = handle.native.request('session/prompt', {'sessionId': handle.sid,
             'prompt': [{'type': 'text', 'text': prompt}], '_meta': {'verbatim': True, 'promptId': nonce}})
         text, usage = _answer(handle.native, result, handle.sid, nonce)
+        broker_renew.finishing_beat(handle.heartbeat)
         version = close(handle)
         need(set(handle.internal_acks) <= {'skills-reload', 'workflows-reload'}
              and all(type(value) is int and 1 <= value <= 8 for value in handle.internal_acks.values())

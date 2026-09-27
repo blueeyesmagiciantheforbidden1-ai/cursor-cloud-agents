@@ -533,6 +533,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
                               and all(isinstance(k, str) and k.removesuffix('[1m]') == MODEL for k in used)),
              'claude_usage_from_different_model')
         usage = _safe_usage(result)
+        broker_renew.finishing_beat(handle.heartbeat)
         version = close(handle)
         return {'text': text, 'provider': 'claude', 'model': MODEL, 'effort': EFFORT, 'usage': usage,
                 'preflight': handle.preflight, 'same_process_account_model_quota': False,

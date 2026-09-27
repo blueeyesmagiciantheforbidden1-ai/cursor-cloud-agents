@@ -57,6 +57,21 @@ def next_due(renewed, cadence, clock=None):
     return clock() + (RETRY_SECONDS if renewed is False else cadence)
 
 
+def finishing_beat(heartbeat):
+    """Tell the hub the model answered, before adapter close / broker finish.
+
+    Calls ``heartbeat(phase='finishing')`` once. A verified answer is never
+    dropped because this beat failed; the loop's beat before /complete is the
+    backstop. Swallows ``Exception`` (including a ``TypeError`` from a
+    zero-argument test double) but never ``BaseException``, so SIGTERM's
+    ``KeyboardInterrupt`` propagates.
+    """
+    try:
+        heartbeat(phase='finishing')
+    except Exception:
+        pass
+
+
 class LeaseClock:
     """The last confirmed renew of one lease, and the renew-failure policy."""
 

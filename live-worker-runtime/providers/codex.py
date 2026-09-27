@@ -616,6 +616,7 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         need(handle.native.clean_shutdown, 'native_clean_exit_unconfirmed')
         result = outcome.result()
         need(0 < len(result['output'].encode()) <= MAX_ANSWER, 'answer_exceeds_hub_limit')
+        broker_renew.finishing_beat(handle.heartbeat)
         _close(handle)
         return {'provider': 'codex', 'text': result['output'], 'model': MODEL, 'effort': EFFORT,
                 'usage': result['usage'], 'preflight': handle.preflight,

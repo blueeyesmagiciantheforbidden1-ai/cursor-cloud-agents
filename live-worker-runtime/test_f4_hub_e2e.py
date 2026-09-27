@@ -111,9 +111,10 @@ class LoopbackClient:
 class DieAdapter:
     """Fake provider. die_at='setup'|'execute' leaves no completion (close fails).
 
-    Real adapters call the prepare() heartbeat during close once phase is
-    finishing (see HeartbeatPhaseTests); this fake does the same so the hub
-    records last_phase=finishing on a successful run.
+    Real adapters beat phase='finishing' inside execute (via
+    broker_renew.finishing_beat) before their own close; the loop's close() is
+    then a no-op on a finished handle. This fake does the same on the success
+    path so the hub records last_phase=finishing.
     """
 
     def __init__(self, die_at=None):
@@ -134,14 +135,14 @@ class DieAdapter:
         self.calls.append('execute')
         if self.die_at == 'execute':
             raise RuntimeError('simulated worker death inside execute')
+        import broker_renew
+        broker_renew.finishing_beat(self._heartbeat)
         return {'text': self.answer, 'model': 'example', 'effort': 'max', 'usage': None}
 
     def close(self, handle):
         self.calls.append('close')
         if self.die_at in ('setup', 'execute'):
             raise RuntimeError('simulated worker death during credential close')
-        if self._heartbeat is not None:
-            self._heartbeat()
 
 
 @unittest.skipIf(_SKIP_REASON is not None, _SKIP_REASON or 'skipped')
@@ -692,6 +693,80 @@ class F4HubE2ETests(unittest.TestCase):
         record = seen['attempt_records'][-1]
         self.assertEqual(record.get('last_phase'), 'finishing')
         self.assertEqual(record.get('outcome'), 'succeeded')
+
+    def test_6_realistic_adapter_finishing_beats_against_hub(self):
+        """Adapter + loop both post finishing; slow broker close still completes."""
+        import broker_renew
+        case = self
+        room = self.create_room(recovery='auto')
+        finishing = []
+
+        class RecordingClient(LoopbackClient):
+            def post(self, path, value):
+                if path.endswith('/heartbeat') and isinstance(value, dict):
+                    if value.get('phase') == 'finishing':
+                        finishing.append('adapter' if 'close' not in adapter.calls else 'loop')
+                return super().post(path, value)
+
+        class RealisticAdapter(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                case.now += 20
+                broker_renew.finishing_beat(self._heartbeat)
+                case.now += 36
+                return {'text': self.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+            def close(self, handle):
+                self.calls.append('close')
+
+        adapter = RealisticAdapter()
+        client = RecordingClient(self.base, self.tokens[self.agent], self.agent)
+
+        def sleep(seconds):
+            case.now += seconds
+
+        worker = Worker(
+            Settings(self.agent, 'grok-e2e', warm_seconds=60),
+            client, adapter, object(),
+            clock=lambda: case.now, sleep=sleep,
+        )
+        result = worker.run()
+        self.assertEqual(result.get('outcome'), 'completed')
+        seen = self.seen(room['id'])
+        self.assertEqual(seen['status'], 'completed')
+        record = seen['attempt_records'][-1]
+        self.assertEqual(record.get('last_phase'), 'finishing')
+        self.assertEqual(record.get('outcome'), 'succeeded')
+        self.assertEqual(seen.get('recovery_audit'), [])
+        self.assertIn('adapter', finishing)
+        self.assertIn('loop', finishing)
+
+    def test_7_loss_after_answer_records_finishing(self):
+        """A loss after finishing_beat is visible as last_phase=finishing."""
+        import broker_renew
+        case = self
+        room = self.create_room(recovery='auto')
+
+        class LostAfterAnswer(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                broker_renew.finishing_beat(self._heartbeat)
+                raise RuntimeError('simulated worker death after answer')
+
+            def close(self, handle):
+                self.calls.append('close')
+                raise RuntimeError('simulated worker death during credential close')
+
+        worker = Worker(
+            Settings(self.agent, 'grok-e2e', warm_seconds=60),
+            self.client, LostAfterAnswer(), object(),
+            clock=lambda: case.now, sleep=lambda seconds: setattr(case, 'now', case.now + seconds),
+        )
+        result = worker.run()
+        self.assertNotEqual(result.get('outcome'), 'completed')
+        seen = self.expire(room['id'])
+        audit = seen['recovery_audit'][-1]
+        self.assertEqual(audit['last_phase'], 'finishing')
 
 
 if __name__ == '__main__':

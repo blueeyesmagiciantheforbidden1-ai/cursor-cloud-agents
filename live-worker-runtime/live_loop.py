@@ -238,6 +238,8 @@ MAX_REPAIR_ERRORS, MAX_REPAIR_ERROR_TEXT = 8, 160
 # Heartbeat phase for the hub's lost-worker policy (agent_hub.core.HEARTBEAT_PHASES).
 # It only moves forward. A hub from before it reads only lease_token (R3.1 server.py).
 HEARTBEAT_PHASES = ('setup', 'model_call', 'finishing')
+# The hub lease is 45 s, and complete() can take three 10 s POSTs plus 3 s of sleeps.
+FINISHING_BEAT_AFTER_SECONDS = 10
 
 
 def _repair_errors(task):
@@ -558,6 +560,8 @@ class Worker:
         self.model_call_attempted = False
         # None until a task is claimed; then one of HEARTBEAT_PHASES.
         self.phase = None
+        # Clock value taken just before the last task heartbeat that returned active.
+        self._task_ack_at = None
         self.completion_payload = None
         self.cleaned = False
         self.spans = []
@@ -667,6 +671,29 @@ class Worker:
         self.cleaned = True
         self._emit_span('close', started, 'ok', task=self.task, attempt_key=self._attempt_key)
 
+    def _finishing_beat(self, deadline):
+        """One finishing-phase task beat before /complete when the last ack is stale.
+
+        Never sets lease_revoked and never skips the success /complete: a retained
+        expired lease still accepts completion, and a 409 on /complete stays final.
+        """
+        if self.stopping:
+            return
+        if self._task_ack_at is not None and self.clock() - self._task_ack_at < FINISHING_BEAT_AFTER_SECONDS:
+            return
+        if self.clock() >= deadline:
+            return
+        try:
+            with self._critical():
+                ack_at = self.clock()
+                receipt = self.client.post(
+                    '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                    self._heartbeat_body(self.task))
+                if isinstance(receipt, dict) and receipt.get('active') is True:
+                    self._task_ack_at = ack_at
+        except Exception:
+            pass
+
     def _complete_for_span(self, output, exit_code, *, error_code=None):
         started = self.clock()
         try:
@@ -738,12 +765,22 @@ class Worker:
                 self.usage_rejected += len(usage_rows)
         self.next_report = self.clock() + 25
 
-    def heartbeat(self):
+    def heartbeat(self, phase=None):
+        # Optional phase advances self.phase only when a task is claimed, the
+        # value is a known HEARTBEAT_PHASES member, and it is strictly later
+        # than the current phase. Backward, unknown, or pre-claim values are
+        # ignored silently.
+        if (phase is not None and self.task
+                and phase in HEARTBEAT_PHASES
+                and self.phase in HEARTBEAT_PHASES
+                and HEARTBEAT_PHASES.index(phase) > HEARTBEAT_PHASES.index(self.phase)):
+            self.phase = phase
         if self.stopping:
             return False
         try:
             if self.task:
                 try:
+                    ack_at = self.clock()
                     receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                                                self._heartbeat_body(self.task))
                 except LeaseLost as error:
@@ -755,6 +792,7 @@ class Worker:
                 if not isinstance(receipt, dict) or receipt.get('active') is not True:
                     self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
                     return False
+                self._task_ack_at = ack_at
                 try:
                     self.report()
                 except Exception:
@@ -774,11 +812,13 @@ class Worker:
         timeout = task.get('timeout_seconds')
         require(type(timeout) is int and 30 <= timeout <= 900, 'task_timeout_invalid')
         started = self.clock()
+        ack_at = started
         receipt = self.client.post('/v1/tasks/' + task['room_id'] + '/heartbeat',
                                    self._heartbeat_body(task))
         if isinstance(receipt, dict) and receipt.get('active') is False:
             self.lease_revoked = True
         require(receipt.get('active') is True, 'task_lease_lost')
+        self._task_ack_at = ack_at
         deadline, now = receipt.get('deadline'), receipt.get('server_time')
         require(finite(deadline) and finite(now) and deadline == task.get('deadline'), 'task_deadline_changed')
         remaining = min(timeout, deadline - now) - (self.clock() - started) - self.settings.completion_reserve
@@ -1016,8 +1056,10 @@ class Worker:
                 # to setup. model_call_attempted flips only after active:true
                 # and a remaining execute floor of 5 s.
                 receipt = None
+                ack_at = None
                 for beat_attempt in range(2):
                     try:
+                        ack_at = self.clock()
                         receipt = self.client.post(
                             '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                             self._heartbeat_body(self.task))
@@ -1063,6 +1105,7 @@ class Worker:
                 # room reconcile), the safe side. Do not "fix" it by resetting.
                 # A malformed (non-object) answer is not a confirmation either.
                 require(isinstance(receipt, dict) and receipt.get('active') is True, 'task_lease_lost')
+                self._task_ack_at = ack_at
                 # Ack arrived but too little execute budget remains: fail before
                 # flipping the flag or entering execute.
                 require(deadline - self.clock() >= 5, 'task_deadline_insufficient')
@@ -1079,10 +1122,15 @@ class Worker:
                                     task=self.task, attempt_key=self._attempt_key)
                     raise
                 self._emit_span('model_call', model_started, 'ok', task=self.task, attempt_key=self._attempt_key)
-                # Adapters must finish the credential transaction before a
-                # verified result is delivered. close is independently safe
-                # and idempotent; it must never launch another native process.
+                # Adapters finish the credential transaction before a verified
+                # result is delivered: finishing_beat inside execute, then close.
+                # close is independently safe and idempotent; on a finished
+                # handle it is a no-op and must never launch another native
+                # process. When the last acknowledged task beat is stale, the
+                # loop posts one more finishing beat before /complete so the
+                # hub lease covers delivery.
                 self._close_for_span()
+                self._finishing_beat(deadline)
                 self.ready = False
                 self._last_turn_usage = reply.get('usage')
                 self._last_turn_observed_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
