@@ -1819,6 +1819,117 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(phases, sorted(phases, key=HUB_PHASES.index))
         return result, phases, client
 
+    def _run_mid_call_hub_error(self, kind):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        beat = {}
+        cancelled = False
+        original = client.post
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare'); beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            nonlocal cancelled
+            adapter.calls.append('execute')
+            cancelled = True
+            self.assertIs(beat['fn'](), False)
+            raise CodeError('grok_hub_heartbeat_lost')
+
+        def post(path, value):
+            if cancelled and path.endswith('/heartbeat'):
+                client.calls.append((path, copy.deepcopy(value)))
+                raise self._hub_shaped_error(kind)
+            return original(path, value)
+
+        adapter.prepare, adapter.execute = prepare, execute
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        return worker.run(), worker, client, adapter
+
+    def test_lease_lost_mid_call_skips_the_completion(self):
+        result, worker, client, adapter = self._run_mid_call_hub_error(409)
+        self.assertIs(worker.lease_revoked, True)
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertFalse(any(path.endswith('/complete') for path, _ in client.calls))
+        self.assertEqual(client.completions, [])
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertIs(result['model_call_attempted'], True)
+        self.assertEqual(worker.last_exit, 1)
+
+    def test_other_hub_error_mid_call_still_completes(self):
+        result, worker, client, adapter = self._run_mid_call_hub_error(403)
+        self.assertIs(worker.lease_revoked, False)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertEqual(client.completions[0]['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+
+    def test_report_lease_lost_does_not_revoke_the_task(self):
+        from agent_hub.worker import LeaseLost
+        clock = Clock(); client = Client(clock)
+        original = client.post
+
+        def post(path, value):
+            if path == '/v1/workers/report':
+                raise LeaseLost('report refused')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, Adapter(),
+                        object(), clock=clock, sleep=clock.sleep)
+        worker.task = dict(client.task)
+        worker.phase = 'model_call'
+        worker.next_report = 0
+        self.assertIs(worker.heartbeat(), False)
+        self.assertIs(worker.lease_revoked, False)
+
+    def _run_refused_completion(self, fail_execute=False, transport_first=False):
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        sleeps = []
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                client.calls.append((path, copy.deepcopy(value)))
+                client.completions.append(copy.deepcopy(value))
+                if transport_first and len(client.completions) == 1:
+                    raise OSError('lost transport')
+                raise self._hub_shaped_error(409)
+            return original(path, value)
+
+        if fail_execute:
+            def execute(handle, prompt, deadline, *, task_kind):
+                adapter.calls.append('execute')
+                raise CodeError('grok_turn_failed')
+            adapter.execute = execute
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=sleeps.append)
+        return worker.run(), worker, client, adapter, sleeps
+
+    def test_refused_success_completion_is_not_retried(self):
+        for transport_first in (False, True):
+            with self.subTest(transport_first=transport_first):
+                result, worker, client, adapter, sleeps = self._run_refused_completion(
+                    transport_first=transport_first)
+                self.assertEqual(len(client.completions), 2 if transport_first else 1)
+                self.assertEqual(sleeps, [1] if transport_first else [])
+                self.assertEqual(result['outcome'], 'failed')
+                self.assertEqual(result['error_code'], 'completion_refused')
+                self.assertEqual(result['completion_delivery'], 'refused')
+                self.assertEqual(worker.last_exit, 1)
+                self.assertEqual(adapter.calls.count('execute'), 1)
+
+    def test_refused_failure_completion_is_not_retried(self):
+        result, worker, client, adapter, sleeps = self._run_refused_completion(fail_execute=True)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result['error_code'], 'grok_turn_failed')
+        self.assertEqual(result['completion_delivery'], 'refused')
+
     def test_phase_sequence_of_a_completed_task(self):
         result, phases, client = self.run_worker()
         self.assertEqual(result['outcome'], 'completed')

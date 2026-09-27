@@ -42,6 +42,7 @@ else:
         from agent_hub.core import HEARTBEAT_PHASES, Hub, LEASE_SECONDS
         from agent_hub.server import ThreadingHTTPServer, make_handler
         from agent_hub.store import SQLiteStore
+        from agent_hub.worker import Config, HubClient
 
 
 class LoopbackClient:
@@ -345,6 +346,69 @@ class F4HubE2ETests(unittest.TestCase):
         record = seen['attempt_records'][-1]
         self.assertEqual(record.get('outcome'), 'succeeded')
         self.assertEqual(record.get('last_phase'), 'finishing')
+
+    def test_6_cancel_mid_call_stops_within_one_tick(self):
+        import provider_errors
+
+        TICK_SECONDS = 20
+        case = self
+        room = self.create_room()
+        beats = []
+        cancelled_at = []
+        stopped_at = []
+
+        class RecordingClient(HubClient):
+            def __init__(self):
+                super().__init__(Config(case.base, case.agent, case.tokens[case.agent],
+                                        'F4_E2E_TOKEN', {}))
+                self.opener = build_opener(ProxyHandler({}))
+                self.paths = []
+                self.reader = LoopbackClient(case.base, case.tokens[case.agent], case.agent)
+
+            def get_room(self, room_id):
+                return self.reader.get_room(room_id)
+
+            def post(self, path, value):
+                self.paths.append(path)
+                return super().post(path, value)
+
+        class TickError(provider_errors.ProviderCodeError, RuntimeError):
+            pass
+
+        class TickAdapter(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                for tick in range(10):
+                    case.now += TICK_SECONDS
+                    active = self._heartbeat()
+                    beats.append(active)
+                    if active is not True:
+                        stopped_at.append(case.now)
+                        raise TickError('grok_hub_heartbeat_lost')
+                    if tick == 1:
+                        LoopbackClient(case.base, case.tokens['manager'], 'manager').post(
+                            '/v1/rooms/' + room['id'] + '/cancel', {})
+                        cancelled_at.append(case.now)
+                raise AssertionError('cancel did not stop the call')
+
+        client = RecordingClient()
+        result, adapter = self.run_worker(client=client, adapter=TickAdapter())
+        self.assertEqual(beats, [True, True, False])
+        self.assertEqual(len(cancelled_at), 1)
+        self.assertEqual(len(stopped_at), 1)
+        self.assertLessEqual(stopped_at[0] - cancelled_at[0], TICK_SECONDS)
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertIs(result['model_call_attempted'], True)
+        self.assertFalse(any(path.endswith('/complete') for path in client.paths))
+        self.assertEqual(adapter.calls.count('close'), 1)
+        seen = self.seen(room['id'])
+        self.assertEqual(seen['status'], 'cancelled')
+        self.assertEqual(seen['messages'], [])
+        raw = self.raw(room['id'])
+        self.assertIsNone(raw['lease'])
+        self.assertFalse(raw.get('rejected_outputs'))
+        self.assertFalse(raw.get('completion_rejections'))
 
     def test_5_happy_path_finishing(self):
         """EXPECTED (normal completion):

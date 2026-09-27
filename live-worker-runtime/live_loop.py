@@ -469,6 +469,8 @@ class Worker:
         # Set only when the hub itself answered that this task lease is no
         # longer active; the hub refuses a completion for it.
         self.lease_revoked = False
+        # A completion HTTP 409 is a final refusal, not uncertain delivery.
+        self.completion_refused = False
         self.claim_attempted = False
         self.model_call_attempted = False
         # None until a task is claimed; then one of HEARTBEAT_PHASES.
@@ -623,8 +625,13 @@ class Worker:
             return False
         try:
             if self.task:
-                receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
-                                           self._heartbeat_body(self.task))
+                try:
+                    receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                                               self._heartbeat_body(self.task))
+                except LeaseLost:
+                    # Match the pre-execute model_call heartbeat's lease-loss rule.
+                    self.lease_revoked = True
+                    return False
                 if not isinstance(receipt, dict) or receipt.get('active') is not True:
                     self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
                     return False
@@ -699,6 +706,9 @@ class Worker:
                                                  'blocked_on_provider'),
                         'completion_unconfirmed')
                 return
+            except LeaseLost:
+                self.completion_refused = True
+                raise LiveError('completion_refused') from None
             except Exception:
                 if attempt == 2:
                     raise LiveError('completion_delivery_uncertain') from None
@@ -992,10 +1002,10 @@ class Worker:
             if quota:
                 outcome['provider_quota_exhausted'] = True
             if self.completion_payload is not None:
-                outcome['completion_delivery'] = 'unconfirmed'
+                outcome['completion_delivery'] = 'refused' if self.completion_refused else 'unconfirmed'
             elif self.lease_revoked:
                 # The hub revoked this lease; a completion for it would be
-                # refused after three POSTs. Its own expiry path records it.
+                # refused with 409. Its own expiry path records it.
                 outcome['completion_delivery'] = 'skipped_lease_revoked'
             elif self.cleaned and self.task and isinstance(self.task, dict) and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', '')):
                 if quota:
@@ -1008,7 +1018,7 @@ class Worker:
                 try:
                     self._complete_for_span(text, 1, error_code=code)
                 except Exception:
-                    outcome['completion_delivery'] = 'unconfirmed'
+                    outcome['completion_delivery'] = 'refused' if self.completion_refused else 'unconfirmed'
             return outcome
         finally:
             self.ready = False
