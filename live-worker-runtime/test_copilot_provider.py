@@ -1,6 +1,8 @@
 """Offline lifecycle, admission and transport tests; no provider/Cloud calls."""
+import ast
 import copy
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import time
@@ -14,6 +16,41 @@ import provider_errors
 from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
 from agent_hub.credential_broker_service import BoundaryError
 from providers import copilot as c
+
+
+SHOW_GAPS = os.environ.get('MYHERO_SHOW_GAPS') == '1'
+
+
+def gap(test):
+    """Fails at the base; the later fix removes this decorator."""
+    return test if SHOW_GAPS else unittest.expectedFailure(test)
+
+
+def runcrew_provider_auth_codes():
+    """Read the reference hub's auth codes without importing its package."""
+    roots = (
+        os.environ.get('RUNCREW_AGENT_HUB'),
+        Path(__file__).resolve().parents[2] / 'runcrew',
+        Path(__file__).resolve().parents[2] / 'runcrew' / 'source' / 'agent-hub',
+    )
+    for root in roots:
+        if not root:
+            continue
+        core = Path(root) / 'agent_hub' / 'core.py'
+        if not core.is_file():
+            continue
+        for node in ast.parse(core.read_text(encoding='utf-8')).body:
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == 'PROVIDER_AUTH_CODES'
+                            for target in node.targets)):
+                if (isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)
+                        and node.value.func.id == 'frozenset'
+                        and len(node.value.args) == 1):
+                    return frozenset(ast.literal_eval(node.value.args[0]))
+                raise AssertionError('PROVIDER_AUTH_CODES is not a literal frozenset in ' + str(core))
+        raise AssertionError('No module-level PROVIDER_AUTH_CODES assignment in ' + str(core))
+    return None
 
 
 class StepClock:
@@ -228,6 +265,41 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(native.native_stopped)
         self.session.finish.assert_not_called()
         self.broker.quarantine.assert_called_once()
+
+    def test_runcrew_provider_auth_codes_are_readable(self):
+        codes = runcrew_provider_auth_codes()
+        if codes is None:
+            self.skipTest('runcrew agent_hub/core.py is unavailable; set RUNCREW_AGENT_HUB')
+        self.assertIn('claude_authentication_failed', codes)
+        for code in codes:
+            self.assertIsNotNone(provider_errors.SAFE_CODE.fullmatch(code), msg=repr(code))
+
+    def test_signed_out_before_prompt_sends_nothing_and_commits_nothing(self):
+        handle = self.prepare()
+        native = handle.native
+        native.owner = {'isAuthenticated': False}
+        with self.assertRaises(c.CopilotError) as caught:
+            c.execute(handle, 'project', time.monotonic()+100)
+        self.assertNotIn('session.send', [call[0] for call in native.calls])
+        self.assertFalse(handle.attempted)
+        self.session.finish.assert_not_called()
+        self.assertTrue(native.native_stopped)
+        self.assertIsNotNone(provider_errors.error_code(caught.exception))
+
+    @gap
+    def test_signed_out_before_prompt_reports_a_hub_auth_code(self):
+        codes = runcrew_provider_auth_codes()
+        if codes is None:
+            self.skipTest('runcrew agent_hub/core.py is unavailable; set RUNCREW_AGENT_HUB')
+        handle = self.prepare()
+        native = handle.native
+        native.owner = {'isAuthenticated': False}
+        with self.assertRaises(c.CopilotError) as caught:
+            c.execute(handle, 'project', time.monotonic()+100)
+        code = provider_errors.error_code(caught.exception)
+        self.assertIn(code, codes, msg=(
+            f'{code}: absent from hub PROVIDER_AUTH_CODES; '
+            'classify_completion then gives post_model (model_call_attempted=True)'))
 
     def test_unknown_send_failure_remains_uncertain_commits_no_replay(self):
         handle = self.prepare(); native = handle.native; native.fail_send = True
