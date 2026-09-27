@@ -1,6 +1,7 @@
 import ast
 import copy
 import hashlib
+import io
 import json
 import os
 import re
@@ -1151,6 +1152,39 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(worker.last_exit, 0)
         self.assertTrue(worker.cleaned)
         self.assertEqual(session.state, 'committed')
+
+    def test_unprepared_release_that_fails_is_not_a_clean_drain(self):
+        """finish() failing is not a release: no idle drain, cleaned stays False, one attempt."""
+        for quarantine_fails in (False, True):
+            with self.subTest(quarantine_fails=quarantine_fails):
+                clock = Clock()
+                client = Client(clock)
+                adapter = Adapter()
+                quarantine = Mock(side_effect=RuntimeError('broker') if quarantine_fails else None)
+                finish = Mock(side_effect=RuntimeError('finish'))
+                session = SimpleNamespace(state='active', finish=finish,
+                                          broker=SimpleNamespace(quarantine=quarantine), lease=object())
+                worker = Worker(
+                    Settings('grok', 'grok-live', warm_seconds=60),
+                    client, adapter, session,
+                    clock=clock, sleep=clock.sleep, log=lambda record: None)
+                first = [True]
+
+                def post(path, value):
+                    if path.endswith('/report') and first[0]:
+                        first[0] = False
+                        raise KeyboardInterrupt
+                    return {'accepted': True}
+
+                client.post = post
+                result = worker.run()
+                finish.assert_called_once_with(native_stopped=True)
+                quarantine.assert_called_once()
+                self.assertNotIn('prepare', adapter.calls)
+                self.assertNotEqual(result['outcome'], 'idle_drained')
+                self.assertEqual(result['credential_cleanup'], 'failed')
+                self.assertFalse(worker.cleaned)
+                self.assertEqual(live_loop.finish_exit('grok', result, worker.last_exit, io.StringIO()), 1)
 
     def test_idle_hub_heartbeat_codes_from_maintain_are_retried(self):
         for error in (CodeError('hub_lease_lost'),

@@ -657,6 +657,8 @@ class Worker:
         self._finishing_beat_transport_failed = False
         self.completion_payload = None
         self.cleaned = False
+        # _release_unprepared_session's result; set once so it never runs twice.
+        self._unprepared_release = None
         self.spans = []
         self._attempt_key = None
         self._capability_ready = False
@@ -771,11 +773,18 @@ class Worker:
         finally only finishes when worker is None. An interrupt during the first
         report(force=True) (before prepare) must still release the lease here.
         prepare()'s own cleanup leaves session non-active, so this is a no-op then.
+
+        Returns None when there was nothing to release, else 'released',
+        'quarantined' or 'failed' (the same value on a repeat call). Only a
+        successful finish sets ``cleaned``: a quarantine or a double failure is
+        not a release, so the run must not end as a clean idle drain.
         """
+        if self._unprepared_release is not None:
+            return self._unprepared_release
         if self.handle is not None or self.cleaned:
-            return
+            return None
         if getattr(self.session, 'state', None) != 'active':
-            return
+            return None
         try:
             with self._critical():
                 self.session.finish(native_stopped=True)
@@ -783,8 +792,13 @@ class Worker:
             try:
                 self.session.broker.quarantine(self.session.lease, 'provider_refresh_uncertain')
             except Exception:
-                pass
+                self._unprepared_release = 'failed'
+            else:
+                self._unprepared_release = 'quarantined'
+            return self._unprepared_release
+        self._unprepared_release = 'released'
         self.cleaned = True
+        return self._unprepared_release
 
     def _finishing_beat(self, deadline):
         """One finishing-phase task beat before /complete when the last ack is stale.
@@ -1382,8 +1396,8 @@ class Worker:
                                    claim_attempted=self.claim_attempted)
                     outcome.pop('drain_code', None)
                     return outcome
-            else:
-                self._release_unprepared_session()
+            elif self._release_unprepared_session() in ('quarantined', 'failed'):
+                outcome['credential_cleanup'] = 'failed'
             # A stop before any claim is the same clean end as a drain.
             idle_session_lost = idle_session_lost or (
                 code == 'worker_stopping' and self.task is None and not self.model_call_attempted)
@@ -1442,8 +1456,8 @@ class Worker:
                                        error_code='credential_cleanup_failed')
                         outcome.pop('drain_code', None)
                         self.last_exit = 1
-            else:
-                self._release_unprepared_session()
+            elif self._release_unprepared_session() in ('quarantined', 'failed'):
+                outcome['credential_cleanup'] = 'failed'
             measured = _usage_measured_at(self.handle)
             if measured is not None:
                 outcome['usage_measured_at'] = measured
