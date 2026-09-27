@@ -92,9 +92,35 @@ def inspect_environment(workspace, task_text, deadline):
         raw = Path("/proc/self/environ").read_bytes()
         assert all(value.encode() not in raw for value in forbidden.values())
     assert os.environ["TASK_MESSAGE"] == "safe"
-    assert Path(os.environ["HOME"]) == workspace
-    assert Path(os.environ["TEMP"]) == workspace
+    home = workspace.parent / "provider-home"
+    for key in ("HOME", "TMP", "TEMP", "TMPDIR"):
+        assert Path(os.environ[key]) == home
+    assert home != workspace
+    if os.name == "nt":
+        assert Path(os.environ["USERPROFILE"]) == home
     (workspace / "environment-ok").write_text("ok")
+
+
+def provider_scratch(workspace, task_text, deadline):
+    fd, _ = tempfile.mkstemp(prefix="provider-scratch-")
+    os.close(fd)
+    cache = Path(os.path.expanduser("~")) / ".cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "x").write_text("cache")
+    edit(workspace, task_text, deadline)
+
+
+def provider_home_git(workspace, task_text, deadline):
+    (Path(os.environ["HOME"]) / ".git").mkdir()
+
+
+def provider_home_sibling(workspace, task_text, deadline):
+    Path(os.environ["HOME"] + "-x.txt").write_text("escape")
+
+
+def provider_home_big(workspace, task_text, deadline):
+    (Path(os.environ["HOME"]) / "big").write_bytes(b"x" * 4096)
+    edit(workspace, task_text, deadline)
 
 
 def inspect_rlimits(workspace, task_text, deadline):
@@ -199,6 +225,40 @@ class WorkspaceRunnerTests(unittest.TestCase):
         self.assertEqual(result["runner_receipt"]["files_changed"], 1)
         self.assertNotIn(b"__pycache__", result["diff"])
         self.assertNotIn(b"leftover-", result["diff"])
+
+    def test_provider_scratch_stays_out_of_the_receipt(self):
+        original = runner._discard
+        recorded = {}
+
+        def capturing(path, root):
+            recorded["tree_sha256"] = runner._tree_hash(path)
+            files = []
+            for dirpath, _, filenames in os.walk(path):
+                for name in filenames:
+                    files.append(Path(dirpath, name).relative_to(path).as_posix())
+            recorded["files"] = sorted(files)
+            return original(path, root)
+
+        with mock.patch.object(runner, "_discard", side_effect=capturing):
+            result = self.run_task(provider_scratch)
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertEqual(result["runner_receipt"]["files_changed"], 1)
+        diff_lines = [line for line in result["diff"].split(b"\n")
+                      if line.startswith(b"diff --git")]
+        self.assertEqual(diff_lines, [b"diff --git a/answer.txt b/answer.txt"])
+        self.assertIn(b"-base\n+changed\n", result["diff"].replace(b"\r\n", b"\n"))
+        self.assertNotIn(b"provider-scratch-", result["diff"])
+        self.assertNotIn(b".cache", result["diff"])
+        self.assertIn("provider-home/.cache/x", recorded["files"])
+        scratch = [f for f in recorded["files"]
+                   if f.startswith("provider-home/provider-scratch-")]
+        self.assertEqual(len(scratch), 1, recorded["files"])
+        under_work = [f for f in recorded["files"] if f.startswith("work/")]
+        self.assertEqual(under_work, ["work/answer.txt"], recorded["files"])
+        proof = result["discard_proof"]
+        self.assertEqual(proof["tree_sha256"], recorded["tree_sha256"])
+        self.assertTrue(proof["directory_absent"])
+        self.assertFalse(os.path.lexists(Path(proof["path"]) / "provider-home"))
 
     def test_test_cwd_artifacts_and_edits_stay_out_of_the_receipt(self):
         # Demand probe: pytest cache, coverage, and a test-mutated model file
@@ -455,6 +515,16 @@ class WorkspaceRunnerTests(unittest.TestCase):
 
     def test_caught_escape_still_refused(self):
         self.assertEqual(self.run_task(swallowed_escape)["error_code"], "outside_write")
+
+    def test_provider_home_git_refused(self):
+        self.assertEqual(self.run_task(provider_home_git)["error_code"], "unsafe_path")
+
+    def test_provider_home_sibling_refused(self):
+        self.assertEqual(self.run_task(provider_home_sibling)["error_code"], "outside_write")
+
+    def test_provider_home_byte_limit(self):
+        self.assertEqual(self.run_task(provider_home_big, {"bytes": 1024})["error_code"],
+                         "byte_limit")
 
     def test_external_symlink_refused(self):
         self.assertEqual(self.run_task(outside_link)["error_code"], "unsafe_link")

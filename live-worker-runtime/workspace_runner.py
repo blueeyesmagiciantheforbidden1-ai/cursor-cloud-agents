@@ -144,7 +144,7 @@ def _materialize(base, workspace, limits):
     _snapshot(workspace, limits)
 
 
-def _guard(workspace):
+def _guard(workspace, home):
     """Child-only audit guard for cooperative test doubles; sticky violations."""
     refused = []
     def deny(code):
@@ -154,9 +154,13 @@ def _guard(workspace):
         if isinstance(value, int) or dir_fd not in (None, -1):
             deny("outside_write")
         target = Path(os.fsdecode(value)).resolve()
-        if target != workspace and workspace not in target.parents:
+        if target == workspace or workspace in target.parents:
+            root = workspace
+        elif target == home or home in target.parents:
+            root = home
+        else:
             deny("outside_write")
-        if any(p.casefold() == ".git" for p in target.relative_to(workspace).parts):
+        if any(p.casefold() == ".git" for p in target.relative_to(root).parts):
             deny("unsafe_path")
     def audit(event, args):
         if event == "open":
@@ -191,8 +195,9 @@ def _provider_entry(payload):
     for part in payload["qualname"].split("."):
         provider = getattr(provider, part)
     workspace = Path(payload["workspace"]).resolve()
+    home = Path(payload["home"]).resolve()
     os.chdir(workspace)
-    refused = _guard(workspace)
+    refused = _guard(workspace, home)
     code = None
     try:
         provider(workspace, payload["text"], payload["deadline"])
@@ -203,12 +208,12 @@ def _provider_entry(payload):
     return codes.index(refused[0] if refused else code)
 
 
-def _provider(provider_fn, workspace, text, deadline, env, bound):
+def _provider(provider_fn, workspace, text, deadline, env, bound, home):
     # exec with env= is essential: clearing os.environ after spawn still leaks
     # the original environment through /proc/self/environ on Linux.
     payload = dict(module=provider_fn.__module__, qualname=provider_fn.__qualname__,
                    import_paths=[os.path.abspath(p) for p in sys.path],
-                   workspace=str(workspace), text=text, deadline=deadline)
+                   workspace=str(workspace), home=str(home), text=text, deadline=deadline)
     request = workspace.parent / "control" / "provider-request.json"
     request.write_text(json.dumps(payload), encoding="utf-8")
     bootstrap = ("import json,sys; sys.path.insert(0,sys.argv[1]); "
@@ -227,9 +232,9 @@ def _provider(provider_fn, workspace, text, deadline, env, bound):
     _need(code == 0, codes.get(code, "provider_error"))
 
 
-def _child_environment(workspace, task_env, home=None):
+def _child_environment(home, task_env):
     _need(type(task_env) is dict, "invalid_task_env")
-    home = str(workspace if home is None else home)
+    home = str(home)
     env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": home,
            "TMP": home, "TEMP": home, "TMPDIR": home,
            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
@@ -239,6 +244,7 @@ def _child_environment(workspace, task_env, home=None):
         for key in ("SYSTEMROOT", "COMSPEC"):
             if key in os.environ:
                 env[key] = os.environ[key]
+        env["USERPROFILE"] = home
     for key, value in task_env.items():
         _need(type(key) is str and key and "=" not in key and "\0" not in key
               and type(value) is str and "\0" not in value, "invalid_task_env")
@@ -506,14 +512,16 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
     patch = None
     try:
         workspace.mkdir(); control.mkdir()
+        provider_home = run / "provider-home"
+        provider_home.mkdir()
         _materialize(spec["base_snapshot"], workspace, bound)
         env = _environment(control)
-        child_env = _child_environment(workspace, {} if task_env is None else task_env)
-        # Test scratch (HOME/TMP) and the disposable test-work tree sit beside
-        # the receipt workspace; both are discarded with the run.
+        child_env = _child_environment(provider_home, {} if task_env is None else task_env)
+        # Provider and test scratch (HOME/TMP) sit beside the receipt workspace;
+        # both are discarded with the run. Provider scratch never enters the receipt.
         test_home = run / "test-home"
         test_home.mkdir()
-        test_env = _child_environment(workspace, {} if task_env is None else task_env, home=test_home)
+        test_env = _child_environment(test_home, {} if task_env is None else task_env)
         git = shutil.which("git")
         _need(git is not None, "git_unavailable")
         def git_run(*args, cap=None):
@@ -534,7 +542,10 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
         base_commit = git_run("rev-parse", "HEAD").decode().strip()
         result["model_call_attempted"] = True
         _provider(provider_fn, workspace, text,
-                  min(deadline, time.monotonic() + bound["provider_seconds"]), child_env, bound)
+                  min(deadline, time.monotonic() + bound["provider_seconds"]),
+                  child_env, bound, provider_home)
+        # Bound provider-home to the same file/byte/link/name limits as the workspace.
+        _snapshot(provider_home, bound)
         # Commit the provider result BEFORE tests so test side effects never
         # enter the receipt. Tests run in a disposable sibling copy.
         pre_test = _snapshot(workspace, bound)
