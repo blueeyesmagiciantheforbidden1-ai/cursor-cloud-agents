@@ -3913,7 +3913,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(result['completion_delivery'], 'refused')
 
     def test_hub_4xx_on_first_complete_is_final_rejection(self):
-        for status in (400, 401, 403, 404, 413):
+        for status in (400, 404, 410, 413, 422):
             with self.subTest(status=status):
                 result, worker, client, adapter, sleeps = self._run_completion_effects([status])
                 self.assertEqual(len(client.completions), 1)
@@ -3928,14 +3928,14 @@ class HeartbeatPhaseTests(unittest.TestCase):
                 self.assertNotIn('Hub request failed', blob)
                 self.assertNotIn('HTTP ', blob)
 
-    def test_failure_completion_hub_403_is_final_refused(self):
+    def test_failure_completion_hub_404_is_final_refused(self):
         result, worker, client, adapter, sleeps = self._run_completion_effects(
-            [403], fail_execute=True)
+            [404], fail_execute=True)
         self.assertEqual(len(client.completions), 1)
         self.assertEqual(sleeps, [])
         self.assertEqual(result['error_code'], 'grok_turn_failed')
         self.assertEqual(result['completion_delivery'], 'refused')
-        self.assertEqual(result['completion_attempts'], ['http_403'])
+        self.assertEqual(result['completion_attempts'], ['http_404'])
         self.assertIs(worker.completion_refused, True)
 
     def test_transport_and_5xx_complete_retry_then_ok(self):
@@ -3966,15 +3966,31 @@ class HeartbeatPhaseTests(unittest.TestCase):
                 self.assertEqual(result['completion_attempts'], [code, 'ok'])
                 self.assertEqual(sleeps, [1])
 
+    def test_complete_401_and_403_stay_retryable(self):
+        """Rollouts split revisions across token versions: 401/403 retry (Light on T151)."""
+        for status in (401, 403):
+            with self.subTest(status=status, case='then_ok'):
+                result, worker, client, adapter, sleeps = self._run_completion_effects([status, 'ok'])
+                self.assertEqual(result['outcome'], 'completed')
+                self.assertEqual(result['completion_attempts'], ['http_' + str(status), 'ok'])
+                self.assertEqual(sleeps, [1])
+            with self.subTest(status=status, case='exhausted'):
+                result, worker, client, adapter, sleeps = self._run_completion_effects([status])
+                self.assertEqual(len(client.completions), 3)
+                self.assertEqual(result['error_code'], 'completion_delivery_uncertain')
+                self.assertEqual(result['completion_delivery'], 'unconfirmed')
+                self.assertIs(worker.completion_refused, False)
+                self.assertEqual(result['completion_attempts'], ['http_' + str(status)] * 3)
+
     def test_complete_4xx_after_uncertain_stays_unconfirmed(self):
         result, worker, client, adapter, sleeps = self._run_completion_effects(
-            ['connection', 403])
+            ['connection', 404])
         self.assertEqual(len(client.completions), 2)
         self.assertEqual(sleeps, [1])
         self.assertEqual(result['error_code'], 'completion_delivery_uncertain')
         self.assertEqual(result['completion_delivery'], 'unconfirmed')
         self.assertIs(worker.completion_refused, False)
-        self.assertEqual(result['completion_attempts'], ['transport', 'http_403'])
+        self.assertEqual(result['completion_attempts'], ['transport', 'http_404'])
 
     def test_identity_path_403_on_complete_is_not_hub_answer(self):
         result, worker, client, adapter, sleeps = self._run_completion_effects(

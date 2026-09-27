@@ -110,14 +110,19 @@ def _completion_attempt_code(error):
 
 
 def _is_final_completion_4xx(code):
-    """True for http_<s> with s in 400-499 except 408, 409, and 429."""
+    """True for http_<s> with s in 400-499 except 401, 403, 408, 409, and 429.
+
+    401/403 stay retryable (Light on T151): during a rollout or a token
+    rotation, revisions pinned to different HUB_TOKENS_JSON versions split
+    traffic, so a retry can reach a revision that knows the worker's token.
+    """
     if not isinstance(code, str) or not code.startswith('http_'):
         return False
     rest = code[5:]
     if not rest.isdigit():
         return False
     status = int(rest)
-    return 400 <= status <= 499 and status not in (408, 409, 429)
+    return 400 <= status <= 499 and status not in (401, 403, 408, 409, 429)
 
 
 # The adapter's own warm deadline starts when prepare() does, so it expires
