@@ -5372,6 +5372,28 @@ class HeartbeatPhaseTests(unittest.TestCase):
 
 
 class FinishingRenewerTests(unittest.TestCase):
+    def test_main_thread_posts_take_the_renewer_lock_only_when_sharing(self):
+        """Light on T175: a shared client must be mutually excluded, not only on the renewer side."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        seen = []
+
+        def post(path, value):
+            seen.append(worker._finishing_renew_client_lock.locked())
+            return {'accepted': True}
+
+        client.post = post
+        cases = ((False, None, False), (True, None, False), (False, object(), False), (True, object(), True))
+        for shares, thread, locked in cases:
+            with self.subTest(shares=shares, active=thread is not None):
+                worker._finishing_renew_shares_client = shares
+                worker._finishing_renew_thread = thread
+                seen.clear()
+                worker._client_post('/v1/workers/report', {})
+                self.assertEqual(seen, [locked])
+        worker._finishing_renew_thread = None
+
     """T175: background finishing renewer through close and /complete."""
 
     def _lease_client(self, clock):

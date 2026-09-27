@@ -955,13 +955,23 @@ class Worker:
         try:
             with self._critical():
                 ack_at = self.clock()
-                receipt = self.client.post(
+                receipt = self._client_post(
                     '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                     self._heartbeat_body(self.task))
                 if isinstance(receipt, dict) and receipt.get('active') is True:
                     self._task_ack_at = ack_at
         except Exception:
             pass
+
+    def _client_post(self, path, body):
+        """Main-thread hub POST. While a renewer shares this client (test doubles
+        and any client that cannot be cloned), take the same lock the renewer
+        takes, so the two threads never use one client at once (Light on T175).
+        """
+        if self._finishing_renew_shares_client and self._finishing_renew_thread is not None:
+            with self._finishing_renew_client_lock:
+                return self.client.post(path, body)
+        return self.client.post(path, body)
 
     def _make_finishing_renew_client(self):
         """Client used by the finishing renewer thread.
@@ -1024,7 +1034,14 @@ class Worker:
         trigger (i) (an answer 1 s before the deadline).
 
         Uses a separate HubClient when available so the main thread's /complete
-        is never blocked waiting for this thread's opener. Transport errors
+        is never blocked waiting for this thread's opener. When the client must be
+        shared, every main-thread POST takes the same lock (_client_post).
+
+        Stopping is cooperative: a renew POST already in flight when /complete
+        gets its definitive answer is not cancelled and may still reach the hub
+        afterwards. That is harmless (the hub answers 409 for an inactive or
+        replaced lease token, and the renewer only records it), so "no heartbeat
+        after the definitive completion" means none STARTED after it. Transport errors
         increment finishing_renew_failures and wait the full interval; a 409
         records getattr(error, 'reason', None) and stops renewing without
         altering lease_revoked or skipping /complete.
@@ -1105,7 +1122,7 @@ class Worker:
         if capability_valid(capability):
             payload['capability'] = dict(capability)
         try:
-            receipt = self.client.post('/v1/workers/report', payload)
+            receipt = self._client_post('/v1/workers/report', payload)
             require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
         except Exception as error:
             usage_rows = payload.get('usage')
@@ -1120,7 +1137,7 @@ class Worker:
             retry_payload = dict(payload)
             retry_payload['usage'] = []
             retry_payload.pop('capability', None)
-            receipt = self.client.post('/v1/workers/report', retry_payload)
+            receipt = self._client_post('/v1/workers/report', retry_payload)
             require(receipt.get('accepted') is True, 'heartbeat_not_acknowledged')
             # After an accepted retry: a dropped capability is not usage rejection
             # (hubs keep the report when a usage row is bad). Count usage_rejected
@@ -1173,7 +1190,7 @@ class Worker:
         window = TASK_HEARTBEAT_RETRY_WINDOW_SECONDS
         try:
             ack_at = self.clock()
-            receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+            receipt = self._client_post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                                        self._heartbeat_body(self.task))
         except LeaseLost as error:
             # Stop the call in every case. A retained expired lease can
@@ -1207,7 +1224,7 @@ class Worker:
             self.task_heartbeat_retries += 1
             try:
                 ack_at = self.clock()
-                receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                receipt = self._client_post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                                            self._heartbeat_body(self.task))
             except LeaseLost as error:
                 self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
@@ -1234,7 +1251,7 @@ class Worker:
         require(type(timeout) is int and 30 <= timeout <= 900, 'task_timeout_invalid')
         started = self.clock()
         ack_at = started
-        receipt = self.client.post('/v1/tasks/' + task['room_id'] + '/heartbeat',
+        receipt = self._client_post('/v1/tasks/' + task['room_id'] + '/heartbeat',
                                    self._heartbeat_body(task))
         if isinstance(receipt, dict) and receipt.get('active') is False:
             self.lease_revoked = True
@@ -1287,7 +1304,7 @@ class Worker:
         try:
             for attempt in range(3):
                 try:
-                    result = self.client.post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
+                    result = self._client_post('/v1/tasks/' + self.task['room_id'] + '/complete', payload)
                     status = result.get('status') if isinstance(result, dict) else None
                     require(isinstance(result, dict) and
                             result.get('room_id') == self.task['room_id'] and
@@ -1449,7 +1466,7 @@ class Worker:
                 claim_started = self.clock()
                 try:
                     try:
-                        result = self.client.post(path, self._claim_body())
+                        result = self._client_post(path, self._claim_body())
                     except Exception as error:
                         if provider_errors.error_code(error) is not None:
                             raise
@@ -1503,7 +1520,7 @@ class Worker:
                 for beat_attempt in range(2):
                     try:
                         ack_at = self.clock()
-                        receipt = self.client.post(
+                        receipt = self._client_post(
                             '/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                             self._heartbeat_body(self.task))
                     except Exception as error:
