@@ -72,6 +72,54 @@ def _hub_rejected_request(error):
     return isinstance(cause, HTTPError) and getattr(cause, 'code', None) == 400
 
 
+def _hub_answer_status(error):
+    """Hub HTTP status only when the error is HubClient's hub-answer shape.
+
+    Requires the 'Hub request failed (HTTP ' prefix and an HTTPError cause
+    with an int code. Never parses the number out of the message text.
+    Identity-path failures and bare transport errors return None.
+    """
+    message = str(error) if error is not None else ''
+    if not message.startswith('Hub request failed (HTTP '):
+        return None
+    cause = getattr(error, '__cause__', None)
+    if isinstance(cause, HTTPError):
+        code = getattr(cause, 'code', None)
+        if type(code) is int:
+            return code
+    return None
+
+
+def _completion_attempt_code(error):
+    """Fixed SAFE_CODE for one /complete POST failure. Never reads body text."""
+    if provider_errors.error_code(error) == 'completion_unconfirmed':
+        return 'completion_unconfirmed'
+    status = _hub_answer_status(error)
+    if status is not None:
+        if 500 <= status <= 599:
+            return 'http_5xx'
+        if status in (408, 429) or 400 <= status <= 499:
+            return 'http_' + str(status)
+        return 'http_other'
+    for candidate in (error, getattr(error, '__cause__', None)):
+        if isinstance(candidate, HTTPError):
+            continue
+        if isinstance(candidate, (OSError, URLError)):
+            return 'transport'
+    return 'unclassified'
+
+
+def _is_final_completion_4xx(code):
+    """True for http_<s> with s in 400-499 except 408, 409, and 429."""
+    if not isinstance(code, str) or not code.startswith('http_'):
+        return False
+    rest = code[5:]
+    if not rest.isdigit():
+        return False
+    status = int(rest)
+    return 400 <= status <= 499 and status not in (408, 409, 429)
+
+
 # The adapter's own warm deadline starts when prepare() does, so it expires
 # while this loop still has startup time left on warm_seconds. That expiry is
 # the end of the idle window, not a crashed worker.
@@ -640,8 +688,12 @@ class Worker:
         # Skip completion when the hub reports an inactive lease, or an old
         # hub's 409 does not say whether the expired lease is still completable.
         self.lease_revoked = False
-        # A completion HTTP 409 is a final refusal, not uncertain delivery.
+        # A completion HTTP 409, or a hub 4xx on the first POST, is a final
+        # refusal, not uncertain delivery.
         self.completion_refused = False
+        # One SAFE_CODE per /complete POST ('ok', 'http_409', …). Empty until
+        # the first attempt; omitted from the outcome when every entry is 'ok'.
+        self.completion_attempts = []
         # Narrow exception to native_cleanup_required_before_completion: a
         # vetted pre-prompt sign-out whose close then failed closed may still
         # deliver one auth failure completion (credential_cleanup='failed').
@@ -1096,6 +1148,7 @@ class Worker:
                         result.get('room_id') == self.task['room_id'] and
                         isinstance(status, str) and status in HUB_ROOM_STATUSES,
                         'completion_unconfirmed')
+                self.completion_attempts.append('ok')
                 return
             except LeaseLost:
                 # A 409 on /complete is final: the hub checks completed_leases (an
@@ -1104,9 +1157,21 @@ class Worker:
                 # room/step mismatch, input_changed). completion_payload_conflict is
                 # also a 409, but the completion_payload_changed guard above stops a
                 # changed payload before it is sent.
+                self.completion_attempts.append('http_409')
                 self.completion_refused = True
                 raise LiveError('completion_refused') from None
-            except Exception:
+            except Exception as error:
+                # Record before deciding: a final hub 4xx on the first POST is
+                # refused; the same 4xx after an earlier uncertain attempt stays
+                # unconfirmed. transport/5xx/408/429/unclassified still retry.
+                first_post = len(self.completion_attempts) == 0
+                code = _completion_attempt_code(error)
+                self.completion_attempts.append(code)
+                if _is_final_completion_4xx(code):
+                    if first_post:
+                        self.completion_refused = True
+                        raise LiveError('completion_rejected') from None
+                    raise LiveError('completion_delivery_uncertain') from None
                 if attempt == 2:
                     raise LiveError('completion_delivery_uncertain') from None
                 self.sleep(attempt + 1)
@@ -1512,6 +1577,8 @@ class Worker:
                 outcome['report_failures'] = self.report_failures
             if self.task_heartbeat_retries > 0:
                 outcome['task_heartbeat_retries'] = self.task_heartbeat_retries
+            if any(code != 'ok' for code in self.completion_attempts):
+                outcome['completion_attempts'] = list(self.completion_attempts)
             if self.capability_dropped:
                 outcome['capability_dropped'] = True
             self.log(outcome)

@@ -3845,6 +3845,53 @@ class HeartbeatPhaseTests(unittest.TestCase):
                         object(), clock=clock, sleep=sleeps.append)
         return worker.run(), worker, client, adapter, sleeps
 
+    def _run_completion_effects(self, effects, *, fail_execute=False):
+        """Run one task with ordered /complete effects; last effect repeats.
+
+        effects entries: 'ok' (original post), a _hub_shaped_error kind
+        (e.g. 'connection', 'timeout', 503, 409), 'bare_oserror', or
+        'identity_403'. Records every /complete in client.calls and
+        client.completions. Returns (result, worker, client, adapter, sleeps).
+        """
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        sleeps = []
+        original = client.post
+        effect_i = {'n': 0}
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                i = effect_i['n']
+                effect_i['n'] += 1
+                effect = effects[i] if i < len(effects) else effects[-1]
+                if effect == 'ok':
+                    return original(path, value)
+                client.calls.append((path, copy.deepcopy(value)))
+                client.completions.append(copy.deepcopy(value))
+                if effect == 'bare_oserror':
+                    raise OSError('lost acknowledgement')
+                if effect == 'identity_403':
+                    from urllib.error import HTTPError
+                    from agent_hub.worker import WorkerError
+                    try:
+                        raise WorkerError(
+                            'Could not obtain the configured GCE service identity'
+                        ) from HTTPError(
+                            'http://metadata.google.internal/...', 403, 'Forbidden', {}, None)
+                    except WorkerError as exc:
+                        raise exc
+                raise self._hub_shaped_error(effect)
+            return original(path, value)
+
+        if fail_execute:
+            def execute(handle, prompt, deadline, *, task_kind):
+                adapter.calls.append('execute')
+                raise CodeError('grok_turn_failed')
+            adapter.execute = execute
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=sleeps.append)
+        return worker.run(), worker, client, adapter, sleeps
+
     def test_refused_success_completion_is_not_retried(self):
         for transport_first in (False, True):
             with self.subTest(transport_first=transport_first):
@@ -3864,6 +3911,152 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(sleeps, [])
         self.assertEqual(result['error_code'], 'grok_turn_failed')
         self.assertEqual(result['completion_delivery'], 'refused')
+
+    def test_hub_4xx_on_first_complete_is_final_rejection(self):
+        for status in (400, 401, 403, 404, 413):
+            with self.subTest(status=status):
+                result, worker, client, adapter, sleeps = self._run_completion_effects([status])
+                self.assertEqual(len(client.completions), 1)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(result['outcome'], 'failed')
+                self.assertEqual(result['error_code'], 'completion_rejected')
+                self.assertEqual(result['completion_delivery'], 'refused')
+                self.assertIs(worker.completion_refused, True)
+                self.assertEqual(result['completion_attempts'], ['http_' + str(status)])
+                self.assertEqual(worker.last_exit, 1)
+                blob = json.dumps(result)
+                self.assertNotIn('Hub request failed', blob)
+                self.assertNotIn('HTTP ', blob)
+
+    def test_failure_completion_hub_403_is_final_refused(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            [403], fail_execute=True)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result['error_code'], 'grok_turn_failed')
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertEqual(result['completion_attempts'], ['http_403'])
+        self.assertIs(worker.completion_refused, True)
+
+    def test_transport_and_5xx_complete_retry_then_ok(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            ['connection', 503, 'ok'])
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(len(client.completions), 3)
+        self.assertEqual(result['completion_attempts'], ['transport', 'http_5xx', 'ok'])
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_transport_and_5xx_complete_exhausted_is_uncertain(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            ['timeout', 500, 502])
+        self.assertEqual(result['error_code'], 'completion_delivery_uncertain')
+        self.assertEqual(result['completion_delivery'], 'unconfirmed')
+        self.assertEqual(len(client.completions), 3)
+        self.assertEqual(result['completion_attempts'],
+                         ['transport', 'http_5xx', 'http_5xx'])
+        self.assertEqual(sleeps, [1, 2])
+
+    def test_complete_408_and_429_retry_then_ok(self):
+        for status, code in ((429, 'http_429'), (408, 'http_408')):
+            with self.subTest(status=status):
+                result, worker, client, adapter, sleeps = self._run_completion_effects(
+                    [status, 'ok'])
+                self.assertEqual(result['outcome'], 'completed')
+                self.assertEqual(len(client.completions), 2)
+                self.assertEqual(result['completion_attempts'], [code, 'ok'])
+                self.assertEqual(sleeps, [1])
+
+    def test_complete_4xx_after_uncertain_stays_unconfirmed(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            ['connection', 403])
+        self.assertEqual(len(client.completions), 2)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(result['error_code'], 'completion_delivery_uncertain')
+        self.assertEqual(result['completion_delivery'], 'unconfirmed')
+        self.assertIs(worker.completion_refused, False)
+        self.assertEqual(result['completion_attempts'], ['transport', 'http_403'])
+
+    def test_identity_path_403_on_complete_is_not_hub_answer(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            ['identity_403'])
+        self.assertEqual(len(client.completions), 3)
+        self.assertEqual(result['completion_delivery'], 'unconfirmed')
+        self.assertEqual(result['error_code'], 'completion_delivery_uncertain')
+        self.assertEqual(result['completion_attempts'], ['unclassified'] * 3)
+        self.assertEqual(sleeps, [1, 2])
+        self.assertIs(worker.completion_refused, False)
+
+    def test_complete_409_is_recorded_as_http_409(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects([409])
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertEqual(result['completion_attempts'], ['http_409'])
+        self.assertIs(worker.completion_refused, True)
+
+    def test_bare_oserror_then_409_complete_is_refused(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            ['bare_oserror', 409])
+        self.assertEqual(len(client.completions), 2)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertEqual(result['completion_attempts'], ['transport', 'http_409'])
+        self.assertIs(worker.completion_refused, True)
+
+    def test_real_hub_client_404_on_complete_is_final_rejection(self):
+        """Real HubClient 404 shape classifies as final completion_rejected."""
+        import io
+        from urllib.error import HTTPError
+        from agent_hub.worker import Config, HubClient
+
+        clock = Clock()
+        fake = Client(clock)
+        config = Config('https://hub.example', 'grok', 'fake', 'FAKE', {})
+        client = HubClient(config)
+        client.get_room = fake.get_room
+        complete_opens = []
+
+        class Response(io.BytesIO):
+            headers = {}
+
+        class Opener:
+            def open(self, request, timeout):
+                path = request.full_url.removeprefix(config.hub_url)
+                value = json.loads(request.data)
+                if path.endswith('/complete'):
+                    complete_opens.append(path)
+                    fake.calls.append((path, copy.deepcopy(value)))
+                    fake.completions.append(copy.deepcopy(value))
+                    raise HTTPError(request.full_url, 404, 'Not Found', {}, io.BytesIO(b'{}'))
+                result = fake.post(path, value)
+                return Response(json.dumps(result).encode())
+
+        client.opener = Opener()
+        adapter = Adapter()
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(len(complete_opens), 1)
+        self.assertEqual(result['error_code'], 'completion_rejected')
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertEqual(result['completion_attempts'], ['http_404'])
+        self.assertIs(worker.completion_refused, True)
+
+    def test_clean_completion_omits_completion_attempts(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(['ok'])
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('completion_attempts', result)
+        self.assertEqual(worker.completion_attempts, ['ok'])
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_recovered_transport_blip_on_complete_is_recorded(self):
+        result, worker, client, adapter, sleeps = self._run_completion_effects(
+            ['bare_oserror', 'ok'])
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(result['completion_attempts'], ['transport', 'ok'])
+        self.assertEqual(len(client.completions), 2)
+        self.assertEqual(sleeps, [1])
 
     def test_phase_sequence_of_a_completed_task(self):
         result, phases, client = self.run_worker()
