@@ -20,6 +20,21 @@ PRIOR = POLICY.profile.job_name + '/executions/' + POLICY.profile.job_id + '-pri
 NEXT = POLICY.profile.job_name + '/executions/' + POLICY.profile.job_id + '-next01'
 
 
+class ExitCodeParity(unittest.TestCase):
+    """The controller image does not ship provider_errors.py, so it keeps its
+    own copies of the worker's special exit codes. They must stay equal, or a
+    quota park (75) or a room refusal (76) would be counted as a strike."""
+
+    def test_controller_exit_codes_match_the_worker(self):
+        import fleet_controller
+        import provider_errors
+        self.assertEqual(fleet_controller.QUOTA_EXIT_CODE, provider_errors.QUOTA_EXIT_CODE)
+        self.assertEqual(fleet_controller.ROOM_REFUSED_EXIT_CODE,
+                         provider_errors.ROOM_REFUSED_EXIT_CODE)
+        self.assertNotEqual(fleet_controller.QUOTA_EXIT_CODE,
+                            fleet_controller.ROOM_REFUSED_EXIT_CODE)
+
+
 class Store:
     def __init__(self): self.state = None; self.version = 0; self.archives = []
     def read(self): return deepcopy(self.state), self.version if self.state else None
