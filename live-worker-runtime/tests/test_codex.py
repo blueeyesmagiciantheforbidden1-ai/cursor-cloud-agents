@@ -404,6 +404,23 @@ class CodexLive(unittest.TestCase):
                 self.session.finish.assert_called_once()
                 self.session.broker.quarantine.assert_not_called()
 
+    def test_included_usage_codes_after_the_prompt_are_not_quota(self):
+        """The mapping is structural: after turn/start the code stays post_model."""
+        errors = (
+            c.LiveCodexError('included_usage_unavailable'),
+            c.protocol_gate.GateError('included_usage_unavailable_credit_integration_required'),
+        )
+        for error in errors:
+            with self.subTest(code=str(error)):
+                self._fresh_session()
+                handle = self.prepare()
+                handle.prompt_attempted = True
+                with self.assertRaises(c.LiveCodexError) as caught:
+                    c._fail(handle, error)
+                self.assertEqual(str(caught.exception), str(error))
+                self.assertFalse(c.provider_errors.is_quota(str(caught.exception)))
+                self.assertIs(caught.exception.model_call_attempted, True)
+
     def test_fail_preserves_unmapped_codes_and_rejects_unvetted_quota_strings(self):
         cases = (
             (RuntimeError('included_usage_unavailable'), 'codex_live_operation_failed'),

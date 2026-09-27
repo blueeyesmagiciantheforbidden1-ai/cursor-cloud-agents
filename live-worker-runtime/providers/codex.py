@@ -463,7 +463,9 @@ def _fail(handle, error):
     else:
         code = str(error) if isinstance(error, (LiveCodexError, transport.TransportError,
             metadata.MetadataError, protocol_gate.GateError)) else ''
-        if code in _CODEX_INCLUDED_USAGE_UNAVAILABLE_CODES:
+        # Only before the prompt: the hub checks quota first and parks, so a
+        # mapping after turn/start would hide a post_model outcome (Light on T147).
+        if code in _CODEX_INCLUDED_USAGE_UNAVAILABLE_CODES and handle.prompt_attempted is False:
             code = 'codex_quota_exhausted'
         code = code if SAFE_CODE.fullmatch(code) else 'codex_live_operation_failed'
     failure = LiveCodexError(code)
