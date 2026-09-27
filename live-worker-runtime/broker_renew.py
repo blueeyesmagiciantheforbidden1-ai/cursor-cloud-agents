@@ -75,6 +75,11 @@ def finishing_beat(heartbeat, deadline=None, *, clock=None, post_timeout=None):
     seconds (default: HUB_POST_TIMEOUT_SECONDS) remain before it, so a hung
     opener cannot eat the completion reserve. The loop's heartbeat closure
     applies the same guard when it can see the execute deadline.
+
+    Today no provider passes ``deadline``: the effective guard is
+    Worker.heartbeat's, on the Worker's own clock. A caller that passes a
+    deadline must pass the clock that deadline was computed with, because
+    ``clock`` defaults to time.monotonic.
     """
     if deadline is not None:
         if clock is None:
