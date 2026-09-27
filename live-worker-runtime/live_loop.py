@@ -86,6 +86,19 @@ _IDLE_RETRY_CODES = frozenset({
     'hub_lease_lost', 'claude_hub_heartbeat_lost', 'grok_hub_heartbeat_lost',
     'cursor_hub_heartbeat_lost', 'cursor_lease_lost', 'copilot_hub_heartbeat_lost',
 })
+# Fixed codes meaning the provider account is signed out, signed in to the
+# wrong owner, or not on the subscription route. Before a task is claimed
+# there is no completion, so only the worker report can carry them.
+STARTUP_AUTH_CODES = frozenset({
+    'claude_authentication_failed',            # hub PROVIDER_AUTH_CODES
+    'grok_cached_subscription_auth_required',  # hub PROVIDER_AUTH_CODES; grok prepare
+    'native_account_not_authenticated',        # hub PROVIDER_AUTH_CODES; cursor prepare
+    'native_account_owner_mismatch',           # cursor prepare
+    'claude_subscription_account_unverified',  # claude prepare
+    'grok_owner_mismatch',                     # grok prepare (_owner)
+    'copilot_owner_mismatch',                  # copilot prepare (_owner; also signed-out)
+})
+assert all(provider_errors.SAFE_CODE.fullmatch(code) for code in STARTUP_AUTH_CODES)
 
 
 # Consecutive idle maintain() retries before the execution fails with the code.
@@ -526,6 +539,7 @@ class Worker:
         self.handle = None
         self.task = None
         self.ready = False
+        self.auth_failed = False
         self.stopping = False
         # SIGTERM handling (entrypoint): interrupt at most once, and never
         # while `critical` is non-zero (credential close, completion POST).
@@ -676,9 +690,14 @@ class Worker:
                 usage = []
         except Exception:
             usage = []
+        if self.auth_failed:
+            status, auth_status = 'error', 'failed'
+        else:
+            status = 'busy' if self.task and self.ready else 'idle' if self.ready else 'offline'
+            auth_status = 'verified' if self.ready else 'unknown'
         payload = {'worker_id': self.settings.worker_id,
-                   'status': 'busy' if self.task and self.ready else 'idle' if self.ready else 'offline',
-                   'auth_status': 'verified' if self.ready else 'unknown',
+                   'status': status,
+                   'auth_status': auth_status,
                    'current_room_id': self.task.get('room_id') if self.task else None,
                    'last_exit_code': self.last_exit, 'usage': usage,
                    'process_started_at': _PROCESS_STARTED_AT}
@@ -1096,6 +1115,10 @@ class Worker:
             # failed release stays a failure.
             idle_session_lost = (code == 'copilot_warm_session_lost'
                                  and self.task is None and not self.model_call_attempted)
+            if (code in STARTUP_AUTH_CODES and self.task is None
+                    and not self.model_call_attempted):
+                self.auth_failed = True
+                outcome['auth_failed'] = True
             if self.handle is not None and not self.cleaned:
                 try:
                     self._close_for_span()

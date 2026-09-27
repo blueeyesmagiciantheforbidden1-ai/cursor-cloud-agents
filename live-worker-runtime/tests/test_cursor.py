@@ -20,6 +20,7 @@ for entry in (str(SOURCE / 'deploy' / 'cursor-worker'), str(HERE.parent), str(HU
 
 import broker_renew  # noqa: E402
 import live_loop  # noqa: E402
+import provider_errors  # noqa: E402
 from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain  # noqa: E402
 from agent_hub.credential_broker_service import BoundaryError  # noqa: E402
 from providers import cursor as c  # noqa: E402
@@ -57,9 +58,11 @@ def catalog(model=None):
 
 
 class Fixture:
-    def __init__(self, *, status_email=OWNER_EMAIL, overrides=None, prompt_hook=None, close_error=None, finish_error=None):
+    def __init__(self, *, status_email=OWNER_EMAIL, overrides=None, prompt_hook=None,
+                 close_error=None, finish_error=None, status_payload=None):
         self.events, self.metadata_calls, self.calls = [], [], []
         self.status_email = status_email
+        self.status_payload = status_payload
         self.overrides = overrides or {}
         self.prompt_hook = prompt_hook
         self.close_error, self.finish_error = close_error, finish_error
@@ -88,6 +91,8 @@ class Fixture:
                 if command == ('models',):
                     settings.write_text('{}', encoding='utf-8')
                     return b'human model list'
+                if owner.status_payload is not None:
+                    return json.dumps(owner.status_payload).encode()
                 return json.dumps({'status': 'authenticated', 'isAuthenticated': True,
                                    'userInfo': {'email': owner.status_email}}).encode()
         return FakeMetadata()
@@ -260,6 +265,36 @@ class CursorAdapter(unittest.TestCase):
             self.assertIsNone(fixture.native)
             self.assertEqual(fixture.events, ['metadata-stop', 'metadata-stop', 'commit-release'])
             session.finish.assert_called_once_with(native_stopped=True)
+
+    def test_account_failures_raise_vetted_codes_before_acp(self):
+        cases = (
+            ({'status': 'unauthenticated', 'isAuthenticated': False},
+             'native_account_not_authenticated', True),
+            (None, 'native_account_owner_mismatch', True),  # status_email path
+            ({'status': 'authenticated', 'isAuthenticated': True},
+             'fresh_native_account_identity_unavailable', False),
+        )
+        for status_payload, code, in_allowlist in cases:
+            with self.subTest(code=code):
+                if status_payload is None:
+                    fixture = Fixture(status_email='other@example.com')
+                else:
+                    fixture = Fixture(status_payload=status_payload)
+                with tempfile.TemporaryDirectory() as root:
+                    session = fixture.session(root)
+                    with patch.object(c, '_metadata_process', fixture.metadata_process), \
+                            patch.object(c, '_acp_process', fixture.acp_process):
+                        with self.assertRaises(c.NativeError) as caught:
+                            c.prepare(session, lambda: True, time.monotonic() + 30)
+                    self.assertEqual(str(caught.exception), code)
+                    self.assertEqual(provider_errors.error_code(caught.exception), code)
+                    self.assertIsNone(fixture.native)
+                    self.assertEqual(fixture.events,
+                                     ['metadata-stop', 'metadata-stop', 'commit-release'])
+                    if in_allowlist:
+                        self.assertIn(code, live_loop.STARTUP_AUTH_CODES)
+                    else:
+                        self.assertNotIn(code, live_loop.STARTUP_AUTH_CODES)
 
     def test_missing_model_in_catalog_rejected_and_cleaned_up(self):
         fixture = Fixture(overrides={'cursor/list_available_models': catalog('other-model')})

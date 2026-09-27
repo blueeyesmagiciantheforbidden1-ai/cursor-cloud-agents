@@ -20,6 +20,7 @@ for entry in (str(SOURCE), str(HUB), str(HERE)):
 
 import broker_renew  # noqa: E402
 import live_loop  # noqa: E402
+import provider_errors  # noqa: E402
 from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain  # noqa: E402
 from agent_hub.credential_broker_service import BoundaryError  # noqa: E402
 from providers import claude as c  # noqa: E402
@@ -278,6 +279,39 @@ class ClaudeAdapter(unittest.TestCase):
                 self.prepare(fixture, root)
             self.assertEqual(fixture.events, ['stop', 'commit-release'])
             self.assertEqual(fixture.prompts, [])
+
+    def test_account_check_failure_raises_a_fixed_code(self):
+        accounts = (
+            {'apiProvider': 'firstParty', 'tokenSource': 'CLAUDE_CODE_OAUTH_TOKEN',
+             'subscriptionType': 'max', 'email': 'other@example.com'},
+            {'apiProvider': 'firstParty', 'tokenSource': 'CLAUDE_CODE_OAUTH_TOKEN',
+             'subscriptionType': 'team'},
+            {'apiProvider': 'firstParty', 'tokenSource': 'ANTHROPIC_API_KEY'},
+            {'apiProvider': 'firstParty', 'tokenSource': 'CLAUDE_CODE_OAUTH_TOKEN',
+             'subscriptionType': 'max', 'email': '  '},
+        )
+        for account in accounts:
+            with self.subTest(account=account):
+                fixture = Fixture(overrides={'initialize': {'account': account}})
+                with tempfile.TemporaryDirectory() as root:
+                    with self.assertRaises(c.NativeError) as caught:
+                        self.prepare(fixture, root)
+                self.assertEqual(str(caught.exception), 'claude_subscription_account_unverified')
+                self.assertEqual(provider_errors.error_code(caught.exception),
+                                 'claude_subscription_account_unverified')
+                self.assertIn('claude_subscription_account_unverified',
+                              live_loop.STARTUP_AUTH_CODES)
+                self.assertEqual(fixture.events, ['stop', 'commit-release'])
+                self.assertEqual(fixture.prompts, [])
+
+    def test_settings_failure_is_not_mapped_to_the_account_code(self):
+        settings = {'effective': {}, 'sources': [],
+                    'applied': {'model': c.MODEL, 'effort': 'high', 'ultracode': False}}
+        fixture = Fixture(overrides={'get_settings': settings})
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(c.rt.ClaudeRuntimeError) as caught:
+                self.prepare(fixture, root)
+            self.assertNotIsInstance(caught.exception, c.NativeError)
 
     def test_settings_outside_clean_profile_or_wrong_effort_rejected(self):
         for settings in ({'effective': {}, 'sources': [], 'applied': {'model': c.MODEL, 'effort': 'high', 'ultracode': False}},

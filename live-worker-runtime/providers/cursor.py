@@ -75,6 +75,9 @@ WARM_SECONDS = 3600
 # miss is not one of these: the warm cap above is what keeps the pump inside
 # its window. Renew failures are broker errors, not protocol frames.
 _IDLE_PROTOCOL = frozenset(('native_metadata_output_bound', 'native_metadata_frame_bound'))
+_ACCOUNT_CODES = frozenset(('native_account_not_authenticated',
+                            'fresh_native_account_identity_unavailable',
+                            'native_account_owner_mismatch'))
 SEQUENCE = ('initialize', 'cursor/list_available_models', 'session/new',
             'session/set_config_option', 'session/set_config_option',
             'session/set_config_option', 'session/prompt')
@@ -376,7 +379,13 @@ def prepare(session, heartbeat, deadline):
         handle.stopped_proven = False
         try:
             with _metadata_process(('status', '--format', 'json'), environment, workspace, deadline, renew) as native:
-                account = metadata.account_metadata(review.strict_json(native.completed_output()), ACCOUNT_REF)
+                status_payload = review.strict_json(native.completed_output())
+                try:
+                    account = metadata.account_metadata(status_payload, ACCOUNT_REF)
+                except metadata.MetadataError as error:
+                    if str(error) in _ACCOUNT_CODES:
+                        raise NativeError(str(error)) from None
+                    raise
         finally:
             handle.stopped_proven = True
         handle.settings = session.home / '.cursor' / 'cli-config.json'

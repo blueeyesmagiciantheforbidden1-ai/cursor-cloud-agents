@@ -64,6 +64,55 @@ def require_dev_hub(test):
                     'agent_hub.core claims through mutate_room_with_state; this store.py predates it')
 
 
+def load_runcrew_telemetry(pkg_name='_capability_parity_runcrew_agent_hub'):
+    """Load runcrew agent_hub.telemetry with a stub core (same roots as parity).
+
+    Returns (telemetry_module, HubError) or (None, None) when runcrew is absent.
+    """
+    import importlib.util
+    import types
+    roots = [
+        os.environ.get('RUNCREW_AGENT_HUB'),
+        Path(__file__).resolve().parents[2] / 'runcrew',
+        Path(__file__).resolve().parents[2] / 'runcrew' / 'source' / 'agent-hub',
+    ]
+    runcrew_ah = None
+    for root in roots:
+        if not root:
+            continue
+        telemetry = Path(root) / 'agent_hub' / 'telemetry.py'
+        if telemetry.is_file() and 'def validate_capability' in telemetry.read_text(encoding='utf-8'):
+            runcrew_ah = Path(root) / 'agent_hub'
+            break
+    if runcrew_ah is None:
+        return None, None
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [str(runcrew_ah)]
+        sys.modules[pkg_name] = pkg
+    core_name = pkg_name + '.core'
+    if core_name not in sys.modules:
+        core = types.ModuleType(core_name)
+
+        class HubError(Exception):
+            def __init__(self, message, status=400):
+                Exception.__init__(self, message)
+                self.status = status
+
+        core.HubError = HubError
+        core.AGENTS = ('codex', 'claude', 'cursor', 'copilot', 'grok')
+        sys.modules[core_name] = core
+    tel_name = pkg_name + '.telemetry'
+    if tel_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(tel_name, runcrew_ah / 'telemetry.py')
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[tel_name] = mod
+        spec.loader.exec_module(mod)
+    else:
+        mod = sys.modules[tel_name]
+    return mod, sys.modules[core_name].HubError
+
+
 def arm_manifest(adapter):
     adapter.CLI_NAME = 'runcrew-live-grok'
     adapter.CLI_VERSION = '1'
@@ -315,6 +364,169 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(client.claims, 0)
         self.assertFalse(result['model_call_attempted'])
         self.assertTrue(all(v['status'] == 'offline' for p, v in client.calls if p.endswith('/report')))
+
+    def test_startup_auth_codes_are_exact(self):
+        expected = frozenset({
+            'claude_authentication_failed',
+            'grok_cached_subscription_auth_required',
+            'native_account_not_authenticated',
+            'native_account_owner_mismatch',
+            'claude_subscription_account_unverified',
+            'grok_owner_mismatch',
+            'copilot_owner_mismatch',
+        })
+        self.assertEqual(live_loop.STARTUP_AUTH_CODES, expected)
+        for code in live_loop.STARTUP_AUTH_CODES:
+            self.assertRegex(code, provider_errors.SAFE_CODE.pattern)
+            self.assertTrue(provider_errors.SAFE_CODE.fullmatch(code))
+        self.assertNotIn('fresh_native_account_identity_unavailable',
+                         live_loop.STARTUP_AUTH_CODES)
+
+    def test_prepare_auth_failure_reports_failed_auth_and_never_claims(self):
+        for code in live_loop.STARTUP_AUTH_CODES:
+            with self.subTest(code=code):
+                worker, client, adapter, _ = self.setup_worker()
+
+                def prepare(session, heartbeat, deadline, code=code):
+                    adapter.calls.append('prepare')
+                    raise CodeError(code)
+
+                adapter.prepare = prepare
+                result = worker.run()
+                self.assertEqual(client.claims, 0)
+                self.assertEqual(client.completions, [])
+                self.assertEqual(result['error_code'], code)
+                self.assertIs(result['auth_failed'], True)
+                self.assertEqual(worker.last_exit, 1)
+                reports = [v for p, v in client.calls if p.endswith('/report')]
+                self.assertTrue(reports)
+                last = reports[-1]
+                self.assertEqual(last['status'], 'error')
+                self.assertEqual(last['auth_status'], 'failed')
+                self.assertIsNone(last['current_room_id'])
+                self.assertEqual(last['last_exit_code'], 1)
+                for earlier in reports[:-1]:
+                    self.assertEqual(earlier['status'], 'offline')
+                    self.assertEqual(earlier['auth_status'], 'unknown')
+                self.assertFalse(any(r['status'] == 'idle' for r in reports))
+
+    def test_idle_auth_failure_before_a_claimed_task_reports_failed_auth(self):
+        worker, client, adapter, _ = self.setup_worker()
+        client.empty = True
+        seen = {'n': 0}
+
+        def maintain(handle):
+            adapter.calls.append('maintain')
+            seen['n'] += 1
+            if seen['n'] == 2:
+                raise CodeError('copilot_owner_mismatch')
+
+        adapter.maintain = maintain
+        result = worker.run()
+        self.assertEqual(client.claims, 1)
+        self.assertEqual(client.completions, [])
+        self.assertIs(result['auth_failed'], True)
+        reports = [v for p, v in client.calls if p.endswith('/report')]
+        self.assertTrue(any(r['status'] == 'idle' and r['auth_status'] == 'verified'
+                            for r in reports[:-1]))
+        last = reports[-1]
+        self.assertEqual(last['status'], 'error')
+        self.assertEqual(last['auth_status'], 'failed')
+
+    def test_non_auth_or_unvetted_startup_failure_keeps_offline_report(self):
+        cases = (
+            ('vetted_non_auth', CodeError('grok_session_identity_required'),
+             'grok_session_identity_required'),
+            ('unvetted_text', ValueError('native_account_not_authenticated'),
+             'native_or_connection_failure'),
+        )
+        for label, error, expected_code in cases:
+            with self.subTest(case=label):
+                worker, client, adapter, _ = self.setup_worker()
+
+                def prepare(session, heartbeat, deadline, error=error):
+                    adapter.calls.append('prepare')
+                    raise error
+
+                adapter.prepare = prepare
+                result = worker.run()
+                self.assertEqual(result['error_code'], expected_code)
+                self.assertNotIn('auth_failed', result)
+                reports = [v for p, v in client.calls if p.endswith('/report')]
+                self.assertTrue(reports)
+                self.assertEqual(reports[-1]['status'], 'offline')
+                self.assertEqual(reports[-1]['auth_status'], 'unknown')
+
+    def test_auth_code_after_a_claim_keeps_the_completion_path(self):
+        worker, client, adapter, _ = self.setup_worker()
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            raise CodeError('claude_authentication_failed')
+
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'], 'claude_authentication_failed')
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+        self.assertNotIn('auth_failed', result)
+        reports = [v for p, v in client.calls if p.endswith('/report')]
+        self.assertEqual(reports[-1]['status'], 'offline')
+        self.assertEqual(reports[-1]['auth_status'], 'unknown')
+
+    def test_failed_auth_report_is_accepted_by_the_hub(self):
+        import tempfile
+        worker, client, adapter, _ = self.setup_worker()
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            raise CodeError('grok_owner_mismatch')
+
+        adapter.prepare = prepare
+        worker.run()
+        reports = [v for p, v in client.calls if p.endswith('/report')]
+        payload = reports[-1]
+        self.assertEqual(payload['status'], 'error')
+        self.assertEqual(payload['auth_status'], 'failed')
+
+        # (a) Vendored hub.
+        require_dev_hub(self)
+        from agent_hub.core import Hub
+        from agent_hub.store import SQLiteStore
+        import agent_hub.telemetry as vendored_telemetry
+        with tempfile.TemporaryDirectory() as root:
+            hub = Hub(SQLiteStore(Path(root) / 'hub.sqlite3'))
+            try:
+                receipt = vendored_telemetry.report_worker(hub, 'grok', payload)
+                self.assertTrue(receipt.get('accepted'))
+                snapshot = vendored_telemetry.status_snapshot(hub)
+                grok = next(a for a in snapshot['agents'] if a['id'] == 'grok')
+                self.assertEqual(grok['auth_status'], 'failed')
+                self.assertEqual(grok['error'], 'Provider authentication failed')
+                auth_alerts = [a for a in snapshot['alerts'] if a['id'] == 'grok-auth']
+                self.assertEqual(len(auth_alerts), 1)
+                self.assertEqual(auth_alerts[0]['severity'], 'critical')
+            finally:
+                if hasattr(hub.store, 'close'):
+                    hub.store.close()
+
+        # (b) runcrew hub.
+        mod, _HubError = load_runcrew_telemetry('_failed_auth_runcrew_agent_hub')
+        if mod is None:
+            self.skipTest('runcrew agent_hub not found: set RUNCREW_AGENT_HUB to runcrew source/agent-hub')
+        for code in live_loop.STARTUP_AUTH_CODES:
+            with self.subTest(runcrew_code=code):
+                rows = []
+                stub = SimpleNamespace(
+                    clock=lambda: 1_790_000_000.0,
+                    store=SimpleNamespace(
+                        get_worker=lambda key: None,
+                        put_worker=lambda key, entry: rows.append(entry)))
+                receipt = mod.report_worker(stub, 'grok', payload)
+                self.assertTrue(receipt.get('accepted'))
+                self.assertEqual(rows[-1]['status'], 'error')
+                self.assertEqual(rows[-1]['auth_status'], 'failed')
 
     def test_lost_claim_response_is_not_retried(self):
         # A lost /v1/tasks/claim may have assigned a room, so it is not polled
@@ -1752,50 +1964,9 @@ class LoopTests(unittest.TestCase):
                 self.assertTrue(live_loop.capability_valid(ok, now=now), field + '=' + good)
 
     def test_capability_valid_matches_runcrew_validate_capability(self):
-        import importlib.util
-        import types
-        roots = [
-            os.environ.get('RUNCREW_AGENT_HUB'),
-            Path(__file__).resolve().parents[2] / 'runcrew',
-            Path(__file__).resolve().parents[2] / 'runcrew' / 'source' / 'agent-hub',
-        ]
-        runcrew_ah = None
-        for root in roots:
-            if not root:
-                continue
-            telemetry = Path(root) / 'agent_hub' / 'telemetry.py'
-            if telemetry.is_file() and 'def validate_capability' in telemetry.read_text(encoding='utf-8'):
-                runcrew_ah = Path(root) / 'agent_hub'
-                break
-        if runcrew_ah is None:
+        mod, HubError = load_runcrew_telemetry()
+        if mod is None:
             self.skipTest('runcrew agent_hub not found: set RUNCREW_AGENT_HUB to runcrew source/agent-hub')
-
-        pkg_name = '_capability_parity_runcrew_agent_hub'
-        if pkg_name not in sys.modules:
-            pkg = types.ModuleType(pkg_name)
-            pkg.__path__ = [str(runcrew_ah)]
-            sys.modules[pkg_name] = pkg
-        core_name = pkg_name + '.core'
-        if core_name not in sys.modules:
-            core = types.ModuleType(core_name)
-
-            class HubError(Exception):
-                def __init__(self, message, status=400):
-                    Exception.__init__(self, message)
-                    self.status = status
-
-            core.HubError = HubError
-            core.AGENTS = ('codex', 'claude', 'cursor', 'copilot', 'grok')
-            sys.modules[core_name] = core
-        tel_name = pkg_name + '.telemetry'
-        if tel_name not in sys.modules:
-            spec = importlib.util.spec_from_file_location(tel_name, runcrew_ah / 'telemetry.py')
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[tel_name] = mod
-            spec.loader.exec_module(mod)
-        else:
-            mod = sys.modules[tel_name]
-        HubError = sys.modules[core_name].HubError
         CapabilityRejected = mod.CapabilityRejected
         validate_capability = mod.validate_capability
 

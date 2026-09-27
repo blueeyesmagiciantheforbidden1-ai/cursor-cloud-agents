@@ -468,7 +468,10 @@ def prepare(session, heartbeat, deadline):
             handle.stopped_proven = True
             raise
         account = handle.native.control('initialize')
-        rt._verify_account(account, selection)
+        try:
+            rt._verify_account(account, selection)
+        except rt.ClaudeRuntimeError:
+            raise NativeError('claude_subscription_account_unverified') from None
         settings = handle.native.control('get_settings')
         rt._verify_settings(settings, selection)
         evidence = AuthEvidence('claude', 'subscription_login', time.time(), 'vendor_cli_status', True)
