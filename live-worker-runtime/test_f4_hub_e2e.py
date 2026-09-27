@@ -20,6 +20,14 @@ from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+SHOW_GAPS = os.environ.get('MYHERO_SHOW_GAPS') == '1'
+
+
+def gap(test):
+    """Fails at the base; the later fix removes this decorator."""
+    return test if SHOW_GAPS else unittest.expectedFailure(test)
+
+
 F4_HUB_PATH = os.environ.get('F4_HUB_PATH')
 _SKIP_REASON = None
 Hub = HEARTBEAT_PHASES = LEASE_SECONDS = None
@@ -740,6 +748,37 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertEqual(seen.get('recovery_audit'), [])
         self.assertIn('adapter', finishing)
         self.assertIn('loop', finishing)
+
+    @gap
+    def test_10_answer_near_deadline_with_slow_close_is_kept(self):
+        import broker_renew
+        case = self
+        room = self.create_room(recovery='auto')
+
+        class LateAnswerAdapter(DieAdapter):
+            def execute(self, handle, prompt, deadline, *, task_kind):
+                self.calls.append('execute')
+                while case.now < deadline - 1:
+                    case.now = min(case.now + 20, deadline - 1)
+                    case.assertTrue(self._heartbeat())
+                broker_renew.finishing_beat(self._heartbeat)
+                case.now += 30
+                return {'text': self.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        adapter = LateAnswerAdapter()
+        worker = Worker(
+            Settings(self.agent, 'grok-e2e', warm_seconds=60),
+            self.client, adapter, object(), clock=lambda: case.now,
+            sleep=lambda seconds: setattr(case, 'now', case.now + seconds),
+        )
+        result = worker.run()
+        seen = self.seen(room['id'])
+        self.assertEqual(
+            seen['status'], 'completed',
+            'status=%s; messages=%s; recovery_audit=%r; worker=%r'
+            % (seen['status'], len(seen['messages']), seen.get('recovery_audit'), result),
+        )
+        self.assertEqual(seen['messages'][-1]['text'], adapter.answer)
 
     def test_7_loss_after_answer_records_finishing(self):
         """A loss after finishing_beat is visible as last_phase=finishing."""

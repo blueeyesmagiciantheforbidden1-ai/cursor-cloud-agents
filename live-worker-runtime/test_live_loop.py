@@ -31,6 +31,14 @@ TRACE = '01234567-89ab-cdef-0123-456789abcdef'
 HUB_REFUSED_CONSTANTS = set()
 
 
+SHOW_GAPS = os.environ.get('MYHERO_SHOW_GAPS') == '1'
+
+
+def gap(test):
+    """Fails at the base; the later fix removes this decorator."""
+    return test if SHOW_GAPS else unittest.expectedFailure(test)
+
+
 @contextmanager
 def capability_env(**values):
     """Set manifest env for one assertion and restore whatever was there."""
@@ -327,6 +335,72 @@ class Adapter:
         if self.fail_execute: raise ValueError('provider detail must not leak')
         return {'text': self.answer, 'model': 'example', 'effort': 'max', 'usage': None}
     def close(self, handle): self.calls.append('close')
+
+
+class PostAnswerLeaseBudgetTests(unittest.TestCase):
+    def _run(self, close_seconds, first_complete_times_out=False):
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        complete_times = []
+        original_post = client.post
+
+        def post(path, value):
+            if path.endswith('/heartbeat'):
+                client.calls.append((path, copy.deepcopy(value)))
+                return {'active': True, 'deadline': client.task['deadline'],
+                        'server_time': clock.now + 600}
+            if path.endswith('/complete'):
+                complete_times.append(clock.now + 600)
+                if first_complete_times_out and len(complete_times) == 1:
+                    client.calls.append((path, copy.deepcopy(value)))
+                    clock.now += live_loop.HUB_POST_TIMEOUT_SECONDS
+                    raise OSError('timed out')
+            return original_post(path, value)
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            # These lanes use the execute deadline for the native answer, then
+            # run their finishing beat and close inside execute.
+            clock.now = deadline - 1
+            clock.now += close_seconds
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        client.post = post
+        adapter.execute = execute
+        worker = Worker(
+            Settings('grok', 'grok-live', warm_seconds=60, completion_reserve=25),
+            client, adapter, object(), clock=clock, sleep=clock.sleep,
+        )
+        return worker.run(), client, adapter, complete_times
+
+    def test_fast_close_completes_before_hub_lease_deadline(self):
+        result, client, adapter, complete_times = self._run(close_seconds=2)
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(len(complete_times), 1)
+        self.assertEqual(sum(path.endswith('/complete') for path, _ in client.calls), 1)
+        self.assertLess(complete_times[0], client.task['deadline'])
+
+    @gap
+    def test_slow_close_completes_before_hub_lease_deadline(self):
+        _, client, _, complete_times = self._run(close_seconds=25 + 5)
+        self.assertLess(
+            complete_times[-1], client.task['deadline'],
+            'last /complete hub time %s must be before hub lease deadline %s'
+            % (complete_times[-1], client.task['deadline']),
+        )
+
+    @gap
+    def test_complete_retry_lands_before_hub_lease_deadline(self):
+        _, client, _, complete_times = self._run(
+            close_seconds=25 - 5, first_complete_times_out=True,
+        )
+        self.assertLess(
+            complete_times[-1], client.task['deadline'],
+            'last /complete hub time %s must be before hub lease deadline %s'
+            % (complete_times[-1], client.task['deadline']),
+        )
 
 
 class LoopTests(unittest.TestCase):
