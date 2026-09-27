@@ -34,9 +34,13 @@ import provider_errors
 MODEL = 'claude-fable-5-1'
 EFFORT = 'max'
 TOOLS_POLICY = 'read_only_tools_dontask_restricted'
+# Binary basename the adapter executes (/opt/runcrew/claude/claude).
+CLI_NAME = 'claude'
 # Keep this binding identical to the enrolled Claude Ryan profile (never derived from a prompt).
 ACCOUNT_REF = 'fb55abaefbe43b9b1cbd82a01f04c398968b29182c598cda9b77477c9110b29f'
 EXECUTABLE = str(auth.CLAUDE_EXECUTABLE)
+CLI_EXECUTABLE = EXECUTABLE
+# CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 WORKSPACE = auth.CLAUDE_WORKSPACE
 MAX_PROMPT_BYTES = 200000
 MAX_ANSWER_BYTES = 15000
@@ -530,7 +534,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
                 'review_sha256': hashlib.sha256(text.encode()).hexdigest(),
                 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
                 'prompt_sent_once_by_wrapper': True, 'automatic_retry': False,
-                'tools_policy': 'read_only_tools_dontask_restricted', 'full_coding_ready': False,
+                'tools_policy': 'read_only_tools_dontask_restricted', 'cli_name': 'claude',
+                'full_coding_ready': False,
                 'actual_charge': 'unverified', 'native_stopped': True, 'credential_writeback': 'committed',
                 'credential_version_ref': hashlib.sha256(version.encode()).hexdigest()}
     except Exception:

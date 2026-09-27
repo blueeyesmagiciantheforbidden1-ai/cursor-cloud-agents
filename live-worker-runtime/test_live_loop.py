@@ -23,8 +23,9 @@ PROVIDERS = Path(__file__).resolve().parent / 'providers'
 SPAN_FIELDS = ('trace_id', 'room_id', 'step', 'attempt_key', 'span', 'duration_ms', 'outcome', 'error_code')
 DIGEST = 'sha256:' + ('ab' * 32)
 TRACE = '01234567-89ab-cdef-0123-456789abcdef'
-# Empty: every assigned CLI_NAME / CLI_VERSION / TOOLS_POLICY constant must pass
+# Empty: every assigned CLI_NAME / TOOLS_POLICY constant must pass
 # live_loop.capability_valid when substituted into a filler manifest.
+# CLI_VERSION is runtime-probed, not a static constant.
 HUB_REFUSED_CONSTANTS = set()
 
 
@@ -139,42 +140,80 @@ class ProviderErrorTests(unittest.TestCase):
         self.assertIsNone(error_code(ValueError('native_not_running')))
 
     def test_capability_constants_repeat_an_existing_literal(self):
-        # Versions and policies are published only when the module already
-        # contains that exact literal. A newly invented version fails this.
-        names = ('CLI_NAME', 'CLI_VERSION', 'TOOLS_POLICY')
-        seen = {name: 0 for name in names}
+        # TOOLS_POLICY is published only when the module already contains that
+        # exact literal. CLI_NAME must be the basename of CLI_EXECUTABLE.
+        # CLI_VERSION must not be a static placeholder (runtime probe only).
+        from pathlib import Path as PureCheck
+        seen = {'CLI_NAME': 0, 'TOOLS_POLICY': 0, 'CLI_VERSION': 0}
         now = datetime(2026, 9, 23, tzinfo=timezone.utc)
         for path in sorted(PROVIDERS.glob('*.py')):
+            if path.name.startswith('_') or path.stem == 'cli_version':
+                continue
             tree = ast.parse(path.read_text(encoding='utf-8'))
             assigned = {}
             for node in tree.body:
                 if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                        and isinstance(node.targets[0], ast.Name) and node.targets[0].id in names
-                        and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                        and isinstance(node.targets[0], ast.Name)
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str)):
                     assigned[node.targets[0].id] = node.value.value
+            self.assertNotIn('CLI_VERSION', assigned, path.name + ' must not hard-code CLI_VERSION')
             literals = [node.value for node in ast.walk(tree)
                         if isinstance(node, ast.Constant) and isinstance(node.value, str)]
-            for name, value in assigned.items():
-                seen[name] += 1
-                self.assertGreaterEqual(literals.count(value), 2, path.name + ':' + name + '=' + value)
+            if 'TOOLS_POLICY' in assigned:
+                seen['TOOLS_POLICY'] += 1
+                value = assigned['TOOLS_POLICY']
+                self.assertGreaterEqual(literals.count(value), 2, path.name + ':TOOLS_POLICY=' + value)
                 filler = {
                     'runner': 'local', 'region': 'us-central1', 'cli_name': 'grok', 'cli_version': '1',
                     'workspace_mode': 'read_only', 'tools_policy': 'deny_all', 'model': 'grok-4.7',
                     'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
                     'started_at': '2020-01-01T00:00:00Z',
                 }
-                filler[name.lower()] = value
+                filler['tools_policy'] = value
                 self.assertTrue(
                     live_loop.capability_valid(filler, now=now)
-                    is ((path.stem, name) not in HUB_REFUSED_CONSTANTS),
-                    path.name + ':' + name)
-        # A built image carries one provider; only the checkout carries all
-        # five, and only there must every constant appear at least once.
+                    is ((path.stem, 'TOOLS_POLICY') not in HUB_REFUSED_CONSTANTS),
+                    path.name + ':TOOLS_POLICY')
+            if 'CLI_NAME' in assigned:
+                seen['CLI_NAME'] += 1
+                value = assigned['CLI_NAME']
+                exe = assigned.get('CLI_EXECUTABLE')
+                if exe is None:
+                    # CLI_EXECUTABLE may be assigned from another name (EXECUTABLE/NATIVE).
+                    for node in tree.body:
+                        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                                and isinstance(node.targets[0], ast.Name)
+                                and node.targets[0].id == 'CLI_EXECUTABLE'
+                                and isinstance(node.value, ast.Name)):
+                            exe = assigned.get(node.value.id)
+                            if exe is None and node.value.id in ('EXECUTABLE', 'NATIVE'):
+                                # Look for string assignment to that name.
+                                for n2 in tree.body:
+                                    if (isinstance(n2, ast.Assign) and len(n2.targets) == 1
+                                            and isinstance(n2.targets[0], ast.Name)
+                                            and n2.targets[0].id == node.value.id
+                                            and isinstance(n2.value, ast.Constant)
+                                            and isinstance(n2.value.value, str)):
+                                        exe = n2.value.value
+                if isinstance(exe, str) and exe:
+                    self.assertEqual(value, PureCheck(exe).name, path.name + ':CLI_NAME basename')
+                self.assertGreaterEqual(literals.count(value), 2, path.name + ':CLI_NAME=' + value)
+                filler = {
+                    'runner': 'local', 'region': 'us-central1', 'cli_name': value, 'cli_version': '1',
+                    'workspace_mode': 'read_only', 'tools_policy': 'deny_all', 'model': 'grok-4.7',
+                    'effort': 'xhigh', 'auth_alias': 'grok', 'image_digest': DIGEST,
+                    'started_at': '2020-01-01T00:00:00Z',
+                }
+                self.assertTrue(
+                    live_loop.capability_valid(filler, now=now)
+                    is ((path.stem, 'CLI_NAME') not in HUB_REFUSED_CONSTANTS),
+                    path.name + ':CLI_NAME')
         present = {path.stem for path in PROVIDERS.glob('*.py')}
         if {'claude', 'codex', 'copilot', 'cursor', 'grok'} <= present:
-            self.assertGreaterEqual(seen['CLI_NAME'], 1)
-            self.assertGreaterEqual(seen['CLI_VERSION'], 1)
-            self.assertGreaterEqual(seen['TOOLS_POLICY'], 1)
+            self.assertGreaterEqual(seen['CLI_NAME'], 5)
+            self.assertGreaterEqual(seen['TOOLS_POLICY'], 5)
+            self.assertEqual(seen['CLI_VERSION'], 0)
 
 
 class Clock:
@@ -1905,6 +1944,197 @@ class LoopTests(unittest.TestCase):
             payload = client.calls[-1][1]
             self.assertIn('capability', payload)
             self.assertEqual(payload['capability']['tools_policy'], policy)
+
+    def _import_provider_lane(self, lane):
+        """Load providers.<lane> with image-only stubs when the checkout lacks them."""
+        import importlib
+        import types
+        root = Path(__file__).resolve().parent
+        hub = root.parent / 'agent-hub'
+        codex_pkg = hub / 'deploy' / 'codex-worker'
+        for entry in (str(root), str(hub), str(codex_pkg)):
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+        if lane == 'codex' and 'transport' not in sys.modules:
+            # Image-only module; enough surface for providers.codex to import.
+            transport = types.ModuleType('transport')
+
+            class TurnRPC:
+                pass
+
+            class TransportError(Exception):
+                pass
+
+            class TurnResult:
+                def __init__(self, *args, **kwargs):
+                    self.complete = True
+
+                def consume(self, event):
+                    return None
+
+                def result(self):
+                    return {'output': 'x', 'usage': {}}
+
+            transport.TurnRPC = TurnRPC
+            transport.TransportError = TransportError
+            transport.TurnResult = TurnResult
+            sys.modules['transport'] = transport
+        return importlib.import_module('providers.' + lane)
+
+    def test_real_provider_modules_publish_capability_manifest(self):
+        # Per-lane: real module constants + probed CLI_VERSION. No fake adapters.
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        started = '2020-01-01T00:00:00Z'
+        lanes = ('claude', 'codex', 'cursor', 'copilot', 'grok')
+        present = {p.stem for p in PROVIDERS.glob('*.py')}
+        if not set(lanes) <= present:
+            self.skipTest('full provider checkout required')
+
+        for lane in lanes:
+            with self.subTest(lane=lane):
+                mod = self._import_provider_lane(lane)
+                saved = {
+                    'CLI_VERSION': getattr(mod, 'CLI_VERSION', None),
+                    'CLI_VERSION_REASON': getattr(mod, 'CLI_VERSION_REASON', None),
+                    '_cli_version_probed': getattr(mod, '_cli_version_probed', False),
+                }
+                try:
+                    # Without image digest the manifest must be omitted.
+                    mod.CLI_VERSION = '2.3.4-test'
+                    mod.CLI_VERSION_REASON = None
+                    mod._cli_version_probed = True
+                    bare = live_loop.capability_manifest(
+                        mod, lane, started, environ={}, now=now)
+                    self.assertIsNone(bare)
+                    self.assertEqual(
+                        live_loop.capability_omit_reason(mod, lane, started, environ={}, now=now),
+                        'missing_image_digest')
+
+                    environ = {'RUNCREW_IMAGE_DIGEST': DIGEST}
+                    # With a probed, non-placeholder version the real module publishes.
+                    manifest = live_loop.capability_manifest(
+                        mod, lane, started, environ=environ, now=now)
+                    self.assertIsNotNone(manifest, lane)
+                    self.assertTrue(live_loop.capability_valid(manifest, now=now), lane)
+                    self.assertTrue(
+                        live_loop._hub_label_valid(live_loop._TOOLS_POLICY, manifest['tools_policy']),
+                        lane)
+                    self.assertTrue(
+                        live_loop._hub_label_valid(live_loop._MODEL, manifest['model']), lane)
+                    self.assertNotEqual(manifest['cli_version'], '1',
+                                        lane + ' must not publish placeholder cli_version 1')
+                    self.assertEqual(manifest['cli_name'], mod.CLI_NAME)
+                    self.assertEqual(manifest['auth_alias'], lane)
+
+                    # Drop version: omit with a documented reason (no invented version).
+                    mod.CLI_VERSION = None
+                    mod.CLI_VERSION_REASON = 'cli_missing'
+                    mod._cli_version_probed = True
+                    omitted = live_loop.capability_manifest(
+                        mod, lane, started, environ=environ, now=now)
+                    self.assertIsNone(omitted, lane)
+                    reason = live_loop.capability_omit_reason(
+                        mod, lane, started, environ=environ, now=now)
+                    self.assertEqual(reason, 'cli_missing', lane)
+                finally:
+                    for key, value in saved.items():
+                        setattr(mod, key, value)
+
+    def test_cli_version_probe_success_failure_and_unparseable(self):
+        import os
+        import stat
+        import tempfile
+        from providers import cli_version as cli_ver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            if os.name == 'nt':
+                fake = tmp_path / 'fakecli.bat'
+                fake.write_text('@echo off\r\necho fakecli 9.8.7\r\n', encoding='utf-8')
+            else:
+                fake = tmp_path / 'fakecli'
+                fake.write_text('#!/bin/sh\necho fakecli 9.8.7\n', encoding='utf-8')
+                fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            version, reason = cli_ver.probe_cli_version(str(fake))
+            self.assertEqual(version, '9.8.7')
+            self.assertIsNone(reason)
+
+            missing, miss_reason = cli_ver.probe_cli_version(str(tmp_path / 'no-such-cli'))
+            self.assertIsNone(missing)
+            self.assertEqual(miss_reason, 'cli_missing')
+
+            if os.name == 'nt':
+                bad = tmp_path / 'badcli.bat'
+                bad.write_text('@echo off\r\necho ???\r\n', encoding='utf-8')
+            else:
+                bad = tmp_path / 'badcli'
+                bad.write_text('#!/bin/sh\necho "???"\n', encoding='utf-8')
+                bad.chmod(bad.stat().st_mode | stat.S_IEXEC)
+            unparsed, unparsed_reason = cli_ver.probe_cli_version(str(bad))
+            self.assertIsNone(unparsed)
+            self.assertEqual(unparsed_reason, 'cli_version_unparseable')
+
+            # Same success path via PATH lookup (basename only).
+            path_dir = tmp_path / 'bindir'
+            path_dir.mkdir()
+            if os.name == 'nt':
+                path_cli = path_dir / 'pathcli.bat'
+                path_cli.write_text('@echo off\r\necho pathcli 3.2.1\r\n', encoding='utf-8')
+                which_name = 'pathcli.bat'
+            else:
+                path_cli = path_dir / 'pathcli'
+                path_cli.write_text('#!/bin/sh\necho pathcli 3.2.1\n', encoding='utf-8')
+                path_cli.chmod(path_cli.stat().st_mode | stat.S_IEXEC)
+                which_name = 'pathcli'
+            old_path = os.environ.get('PATH', '')
+            os.environ['PATH'] = str(path_dir) + os.pathsep + old_path
+            try:
+                path_version, path_reason = cli_ver.probe_cli_version(which_name)
+            finally:
+                os.environ['PATH'] = old_path
+            self.assertEqual(path_version, '3.2.1')
+            self.assertIsNone(path_reason)
+
+            # Bind onto a stand-in adapter: success publishes; failure omits with reason.
+            now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+            adapter = SimpleNamespace(
+                CLI_NAME='fakecli', CLI_EXECUTABLE=str(fake),
+                TOOLS_POLICY='deny_all_and_abort_on_observed_tool',
+                MODEL='grok-4.7', EFFORT='xhigh')
+            bound, bound_reason = cli_ver.bind_cli_version(adapter)
+            self.assertEqual(bound, '9.8.7')
+            self.assertIsNone(bound_reason)
+            manifest = live_loop.capability_manifest(
+                adapter, 'grok', '2020-01-01T00:00:00Z',
+                environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now)
+            self.assertIsNotNone(manifest)
+            self.assertEqual(manifest['cli_version'], '9.8.7')
+
+            adapter_fail = SimpleNamespace(
+                CLI_NAME='missing', CLI_EXECUTABLE=str(tmp_path / 'absent'),
+                TOOLS_POLICY='deny_all_and_abort_on_observed_tool',
+                MODEL='grok-4.7', EFFORT='xhigh')
+            fail_v, fail_r = cli_ver.bind_cli_version(adapter_fail)
+            self.assertIsNone(fail_v)
+            self.assertEqual(fail_r, 'cli_missing')
+            self.assertIsNone(live_loop.capability_manifest(
+                adapter_fail, 'grok', '2020-01-01T00:00:00Z',
+                environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now))
+            self.assertEqual(
+                live_loop.capability_omit_reason(
+                    adapter_fail, 'grok', '2020-01-01T00:00:00Z',
+                    environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now),
+                'cli_missing')
+
+            # Timeout path via a runner that raises.
+            import subprocess as sp
+
+            def boom(*args, **kwargs):
+                raise sp.TimeoutExpired(cmd='x', timeout=10)
+
+            timed, timed_reason = cli_ver.probe_cli_version(str(fake), runner=boom)
+            self.assertIsNone(timed)
+            self.assertEqual(timed_reason, 'cli_version_timeout')
 
     def test_report_400_with_manifest_retries_once_without_it(self):
         from urllib.error import HTTPError

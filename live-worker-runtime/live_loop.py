@@ -396,6 +396,39 @@ def _adapter_attr(adapter, name):
         return None
 
 
+def capability_omit_reason(adapter, agent, started_at, environ=None, now=None):
+    """Fixed reason when capability_manifest would return None; else None.
+
+    Reasons are short snake_case tokens for logs and tests. They never carry
+    native --version text.
+    """
+    try:
+        if environ is None:
+            environ = os.environ
+        if not environ.get('RUNCREW_IMAGE_DIGEST'):
+            return 'missing_image_digest'
+        version = _adapter_attr(adapter, 'CLI_VERSION')
+        if not isinstance(version, str) or not version:
+            reason = _adapter_attr(adapter, 'CLI_VERSION_REASON')
+            if isinstance(reason, str) and reason:
+                return reason
+            return 'missing_cli_version'
+        if not isinstance(_adapter_attr(adapter, 'CLI_NAME'), str) or not _adapter_attr(adapter, 'CLI_NAME'):
+            return 'missing_cli_name'
+        if not isinstance(_adapter_attr(adapter, 'TOOLS_POLICY'), str) or not _adapter_attr(adapter, 'TOOLS_POLICY'):
+            return 'missing_tools_policy'
+        if not isinstance(_adapter_attr(adapter, 'MODEL'), str) or not _adapter_attr(adapter, 'MODEL'):
+            return 'missing_model'
+        if not isinstance(_adapter_attr(adapter, 'EFFORT'), str) or not _adapter_attr(adapter, 'EFFORT'):
+            return 'missing_effort'
+        manifest = capability_manifest(adapter, agent, started_at, environ=environ, now=now)
+        if manifest is None:
+            return 'capability_invalid'
+        return None
+    except Exception:
+        return 'capability_omit_error'
+
+
 def capability_manifest(adapter, agent, started_at, environ=None, now=None):
     """One complete manifest, or None when any field is missing or invalid.
 
@@ -525,11 +558,24 @@ class Worker:
             return self._capability_value
         self._capability_ready = True
         try:
+            from providers import cli_version as cli_version_mod
+            cli_version_mod.bind_cli_version(self.adapter, log=self.log)
+        except Exception:
+            pass
+        try:
             self._capability_value = capability_manifest(
                 self.adapter, self.settings.agent, _PROCESS_STARTED_AT)
         except Exception:
             self._capability_value = None
         if not capability_valid(self._capability_value):
+            reason = capability_omit_reason(
+                self.adapter, self.settings.agent, _PROCESS_STARTED_AT)
+            if reason:
+                try:
+                    self.log({'kind': 'runcrew_capability_omit', 'reason': reason,
+                              'agent': self.settings.agent})
+                except Exception:
+                    pass
             self._capability_value = None
         return self._capability_value
 

@@ -28,8 +28,12 @@ import provider_errors
 import transport
 
 MODEL, EFFORT = 'gpt-6-astra', 'ultra'
-CLI_NAME = 'runcrew_codex_live'
-CLI_VERSION = '1'
+# Binary basename under /opt/runcrew/codex/bin/codex (clientInfo name stays separate).
+CLI_NAME = 'codex'
+CLI_EXECUTABLE = '/opt/runcrew/codex/bin/codex'
+# Sandbox on turn/start: workspaceWrite, networkAccess false (protocol_gate.SANDBOX).
+TOOLS_POLICY = 'workspace_write_network_access_false'
+# CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 MAX_PROMPT, MAX_ANSWER = 200000, 15000
 WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
 # execute() refuses a task deadline shorter than this. The live loop's claim
@@ -618,7 +622,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
                 'prompt_correlation': 'matching_thread_turn_and_completed_final_item',
                 'native_stopped': True, 'credential_writeback': 'committed',
                 'credential_version_ref': handle.credential_version_ref, 'automatic_retry': False,
-                'model_execution_attested': False, 'tools_enabled': False, 'full_coding_ready': False}
+                'model_execution_attested': False, 'tools_enabled': False, 'full_coding_ready': False,
+                'tools_policy': 'workspace_write_network_access_false', 'cli_name': 'codex'}
     except Exception as error:
         _fail(handle, error)
     finally:

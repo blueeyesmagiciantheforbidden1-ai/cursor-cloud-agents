@@ -23,9 +23,11 @@ from ._grok_protocol import Native, NativeError, NativeStartupStopped, need, unw
 
 MODEL = 'grok-4.7'
 EFFORT = 'xhigh'
-CLI_NAME = 'runcrew-live-grok'
-CLI_VERSION = '1'
+# Binary basename the adapter executes (/opt/runcrew/grok/grok); clientInfo name stays separate.
+CLI_NAME = 'grok'
+CLI_EXECUTABLE = '/opt/runcrew/grok/grok'
 TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+# CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 OWNER = 'cursor-owner@example.invalid'
 # Keep this binding identical to the enrolled profile (never derived from a prompt).
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
@@ -511,7 +513,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
                 'prompt_correlation': 'matching_final_response_and_non_replay_text_chunks',
                 'prompt_sent_once_by_wrapper': True, 'automatic_retry': False,
                 'native_internal_reload_acks': handle.internal_acks,
-                'tools_policy': 'deny_all_and_abort_on_observed_tool', 'full_coding_ready': False,
+                'tools_policy': 'deny_all_and_abort_on_observed_tool', 'cli_name': 'grok',
+                'full_coding_ready': False,
                 'actual_charge': 'unverified', 'native_stopped': True, 'credential_writeback': 'committed',
                 'credential_version_ref': hashlib.sha256(version.encode()).hexdigest()}
     except Exception:

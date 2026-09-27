@@ -55,6 +55,12 @@ metadata, review = _load_native()
 MODEL = review.MODEL
 FAST, MODE = 'false', 'ask'
 TOOLS_POLICY = 'ask_mode_deny_all_abort_on_observed_tool'
+# Native catalog does not expose an effort knob (ask mode / fast=false only).
+EFFORT = 'not_exposed_in_native_catalog'
+# Binary basename the adapter executes (/opt/runcrew/cursor/cursor-agent).
+CLI_NAME = 'cursor-agent'
+CLI_EXECUTABLE = metadata.EXECUTABLE
+# CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 # Keep this binding identical to the enrolled Blueeyes profile (never derived from a prompt).
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 MAX_PROMPT_BYTES = 200000
@@ -472,7 +478,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
                 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
                 'native_session_ref_sha256': hashlib.sha256(handle.sid.encode()).hexdigest(),
                 'prompt_sent_once_by_wrapper': True, 'automatic_retry': False,
-                'tools_policy': 'ask_mode_deny_all_abort_on_observed_tool', 'full_coding_ready': False,
+                'tools_policy': 'ask_mode_deny_all_abort_on_observed_tool',
+                'cli_name': 'cursor-agent', 'full_coding_ready': False,
                 'actual_charge': 'unverified', 'native_stopped': True, 'credential_writeback': 'committed',
                 'credential_version_ref': hashlib.sha256(version.encode()).hexdigest()}
     except Exception:

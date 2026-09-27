@@ -27,6 +27,9 @@ import provider_errors
 MODEL, EFFORT = 'kimi-k3', 'max'
 RENEW_SECONDS = 20
 TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+# Binary basename the adapter executes (/opt/runcrew/copilot/copilot).
+CLI_NAME = 'copilot'
+# CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 # The prepare() argument is only the startup budget. The live loop then waits
 # up to an hour. This cap does not slide; maintain() must not push it forward.
 WARM_SECONDS = 3600
@@ -86,6 +89,7 @@ IDLE_SESSION_LOSS = frozenset((
 ACCOUNT_REF = '9ddbfe0cce4b6653b86b2057f45c398360541f21a100c1589a67a01cbc80aadc'
 EXPECTED_LOGIN = 'blueeyesmagiciantheforbidden1-ai'
 NATIVE = '/opt/runcrew/copilot/copilot'
+CLI_EXECUTABLE = NATIVE
 NATIVE_SHA256 = 'be0152ea29b06d54dd23e1fc5512e978b4e84097f6da5314df96b3731a2dd6aa'
 ARGS = ('--no-auto-update', '--no-custom-instructions', '--disable-builtin-mcps',
         '--headless', '--log-level', 'none', '--stdio')
@@ -841,7 +845,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
             'prompt_sent_once_by_wrapper': True, 'automatic_retry': False, 'server_usage_verified': True,
             'effort_verified_by': 'native_applied_settings_before_and_after',
             'automatic_improvement_ready': False, 'full_coding_ready': False,
-            'tools_policy': 'deny_all_and_abort_on_observed_tool', 'actual_charge': 'unverified',
+            'tools_policy': 'deny_all_and_abort_on_observed_tool', 'cli_name': 'copilot',
+            'actual_charge': 'unverified',
             'native_stopped': True, 'credential_writeback': 'committed',
             'credential_version_ref': hashlib.sha256(version.encode()).hexdigest()}
     except Exception as error:
