@@ -27,6 +27,8 @@ import provider_errors
 MODEL, EFFORT = 'kimi-k3', 'max'
 RENEW_SECONDS = 20
 TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+# Tools denied; adapter aborts if a tool event is observed.
+WORKSPACE_MODE = 'read_only'
 # Binary basename the adapter executes (/opt/runcrew/copilot/copilot).
 CLI_NAME = 'copilot'
 # CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.

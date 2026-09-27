@@ -27,6 +27,8 @@ EFFORT = 'xhigh'
 CLI_NAME = 'grok'
 CLI_EXECUTABLE = '/opt/runcrew/grok/grok'
 TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+# Config denies every tool and sets write_file=false.
+WORKSPACE_MODE = 'read_only'
 # CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 OWNER = 'cursor-owner@example.invalid'
 # Keep this binding identical to the enrolled profile (never derived from a prompt).

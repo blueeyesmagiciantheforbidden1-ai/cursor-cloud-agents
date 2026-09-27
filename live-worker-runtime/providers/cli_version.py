@@ -10,6 +10,8 @@ import subprocess
 
 # Match live_loop._CLI_VERSION / hub telemetry._CLI_VERSION.
 _CLI_VERSION = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,31}')
+# stderr fallback when stdout is empty: "<name> <version>" on the first line.
+_STDERR_VERSION_LINE = re.compile(r'^\S+ v?(\d[\w.+-]*)')
 _PROBE_TIMEOUT_SECONDS = 10
 
 
@@ -89,9 +91,25 @@ def probe_cli_version(executable, *, timeout=_PROBE_TIMEOUT_SECONDS, runner=subp
         # An error message can carry digits ("request failed (401)"); taking a
         # token from it would publish a version the CLI never reported.
         return None, 'cli_version_exit_nonzero'
-    text = (completed.stdout or '') + ('\n' if completed.stdout and completed.stderr else '') + (completed.stderr or '')
-    version = sanitise_version(text)
-    if version is None:
+    # Prefer stdout alone. stderr is only a fallback when stdout is empty
+    # (exit already 0) and its first line has a "<name> <version>" shape.
+    stdout = completed.stdout or ''
+    if stdout.strip():
+        version = sanitise_version(stdout)
+        if version is None:
+            return None, 'cli_version_unparseable'
+        return version, None
+    stderr = completed.stderr or ''
+    first = ''
+    for line in stderr.splitlines():
+        if line.strip():
+            first = line.strip()
+            break
+    matched = _STDERR_VERSION_LINE.match(first)
+    if matched is None:
+        return None, 'cli_version_unparseable'
+    version = matched.group(1)
+    if not _CLI_VERSION.fullmatch(version):
         return None, 'cli_version_unparseable'
     return version, None
 

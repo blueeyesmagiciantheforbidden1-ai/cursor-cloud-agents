@@ -68,6 +68,7 @@ def arm_manifest(adapter):
     adapter.CLI_NAME = 'runcrew-live-grok'
     adapter.CLI_VERSION = '1'
     adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+    adapter.WORKSPACE_MODE = 'read_only'
     adapter.MODEL = 'grok-4.7'
     adapter.EFFORT = 'xhigh'
 BUILTIN_EXCEPTIONS = {'BaseException', 'Exception', 'RuntimeError', 'ValueError', 'OSError',
@@ -1587,6 +1588,8 @@ class LoopTests(unittest.TestCase):
             ('long_version', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'CLI_VERSION': 'a' * 33}),
             ('missing_tools', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'TOOLS_POLICY': None}),
             ('digit_tools', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'TOOLS_POLICY': '1deny'}),
+            ('missing_workspace_mode', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'WORKSPACE_MODE': None}),
+            ('bad_workspace_mode', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'WORKSPACE_MODE': 'admin'}),
             ('missing_model', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'MODEL': None}),
             ('spaced_model', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'MODEL': 'grok 4'}),
             ('missing_effort', {'RUNCREW_IMAGE_DIGEST': DIGEST}, {'EFFORT': None}),
@@ -1654,6 +1657,7 @@ class LoopTests(unittest.TestCase):
             clock = Clock(); client = Client(clock); adapter = RaisingAdapter()
             adapter.CLI_VERSION = '1'
             adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+            adapter.WORKSPACE_MODE = 'read_only'
             adapter.MODEL = 'grok-4.7'
             adapter.EFFORT = 'xhigh'
             worker = Worker(Settings('grok', 'grok-live'), client, adapter, object(),
@@ -1846,7 +1850,7 @@ class LoopTests(unittest.TestCase):
             obj[field] = bad
             rows.append((field + '=' + str(bad), obj))
 
-        const_names = ('CLI_NAME', 'CLI_VERSION', 'TOOLS_POLICY', 'MODEL', 'EFFORT')
+        const_names = ('CLI_NAME', 'CLI_VERSION', 'TOOLS_POLICY', 'WORKSPACE_MODE', 'MODEL', 'EFFORT')
         provider_stems = ('claude', 'codex', 'copilot', 'cursor', 'grok')
         for path in sorted(PROVIDERS.glob('*.py')):
             if path.stem not in provider_stems:
@@ -1898,6 +1902,7 @@ class LoopTests(unittest.TestCase):
             SimpleNamespace(
                 CLI_NAME='grok', CLI_VERSION='1',
                 TOOLS_POLICY='read_only_tools_dontAsk_restricted',
+                WORKSPACE_MODE='read_only',
                 MODEL='claude-fable-5-1', EFFORT='max'),
             'claude', '2020-01-01T00:00:00Z',
             environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now)
@@ -1927,6 +1932,7 @@ class LoopTests(unittest.TestCase):
             SimpleNamespace(
                 CLI_NAME='claude', CLI_VERSION='1',
                 TOOLS_POLICY=policy,
+                WORKSPACE_MODE='read_only',
                 MODEL='claude-fable-5-1', EFFORT='max'),
             'claude', '2020-01-01T00:00:00Z',
             environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now)
@@ -1937,6 +1943,7 @@ class LoopTests(unittest.TestCase):
             adapter.CLI_NAME = 'claude'
             adapter.CLI_VERSION = '1'
             adapter.TOOLS_POLICY = policy
+            adapter.WORKSPACE_MODE = 'read_only'
             adapter.MODEL = 'claude-fable-5-1'
             adapter.EFFORT = 'max'
             worker.ready = True
@@ -2025,6 +2032,9 @@ class LoopTests(unittest.TestCase):
                                         lane + ' must not publish placeholder cli_version 1')
                     self.assertEqual(manifest['cli_name'], mod.CLI_NAME)
                     self.assertEqual(manifest['auth_alias'], lane)
+                    self.assertEqual(manifest['workspace_mode'], mod.WORKSPACE_MODE, lane)
+                    if lane == 'codex':
+                        self.assertEqual(manifest['workspace_mode'], 'write')
 
                     # Drop version: omit with a documented reason (no invented version).
                     mod.CLI_VERSION = None
@@ -2039,6 +2049,27 @@ class LoopTests(unittest.TestCase):
                 finally:
                     for key, value in saved.items():
                         setattr(mod, key, value)
+
+    def test_missing_workspace_mode_omits_manifest(self):
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        adapter = SimpleNamespace(
+            CLI_NAME='grok', CLI_VERSION='1',
+            TOOLS_POLICY='deny_all_and_abort_on_observed_tool',
+            MODEL='grok-4.7', EFFORT='xhigh')
+        environ = {'RUNCREW_IMAGE_DIGEST': DIGEST}
+        self.assertIsNone(live_loop.capability_manifest(
+            adapter, 'grok', '2020-01-01T00:00:00Z', environ=environ, now=now))
+        self.assertEqual(
+            live_loop.capability_omit_reason(
+                adapter, 'grok', '2020-01-01T00:00:00Z', environ=environ, now=now),
+            'missing_workspace_mode')
+        adapter.WORKSPACE_MODE = 'admin'
+        self.assertIsNone(live_loop.capability_manifest(
+            adapter, 'grok', '2020-01-01T00:00:00Z', environ=environ, now=now))
+        self.assertEqual(
+            live_loop.capability_omit_reason(
+                adapter, 'grok', '2020-01-01T00:00:00Z', environ=environ, now=now),
+            'missing_workspace_mode')
 
     def test_cli_version_probe_success_failure_and_unparseable(self):
         import os
@@ -2100,6 +2131,7 @@ class LoopTests(unittest.TestCase):
             adapter = SimpleNamespace(
                 CLI_NAME='fakecli', CLI_EXECUTABLE=str(fake),
                 TOOLS_POLICY='deny_all_and_abort_on_observed_tool',
+                WORKSPACE_MODE='read_only',
                 MODEL='grok-4.7', EFFORT='xhigh')
             bound, bound_reason = cli_ver.bind_cli_version(adapter)
             self.assertEqual(bound, '9.8.7')
@@ -2113,6 +2145,7 @@ class LoopTests(unittest.TestCase):
             adapter_fail = SimpleNamespace(
                 CLI_NAME='missing', CLI_EXECUTABLE=str(tmp_path / 'absent'),
                 TOOLS_POLICY='deny_all_and_abort_on_observed_tool',
+                WORKSPACE_MODE='read_only',
                 MODEL='grok-4.7', EFFORT='xhigh')
             fail_v, fail_r = cli_ver.bind_cli_version(adapter_fail)
             self.assertIsNone(fail_v)
@@ -2145,6 +2178,121 @@ class LoopTests(unittest.TestCase):
             self.assertIsNone(errored)
             self.assertEqual(errored_reason, 'cli_version_exit_nonzero')
 
+            # Stdout-first: empty stdout + stderr warning must not publish digits.
+            def warn_stderr(*args, **kwargs):
+                return sp.CompletedProcess(
+                    args[0], 0, stdout='', stderr='(node) Node 18 is deprecated\n')
+
+            warn_v, warn_r = cli_ver.probe_cli_version(str(fake), runner=warn_stderr)
+            self.assertIsNone(warn_v)
+            self.assertEqual(warn_r, 'cli_version_unparseable')
+
+            # Empty stdout + shaped stderr name/version at exit 0.
+            def stderr_version(*args, **kwargs):
+                return sp.CompletedProcess(
+                    args[0], 0, stdout='', stderr='grok 1.2.3\n')
+
+            shaped_v, shaped_r = cli_ver.probe_cli_version(str(fake), runner=stderr_version)
+            self.assertEqual(shaped_v, '1.2.3')
+            self.assertIsNone(shaped_r)
+
+            # Non-empty stdout wins over a stderr warning.
+            def stdout_wins(*args, **kwargs):
+                return sp.CompletedProcess(
+                    args[0], 0, stdout='codex-cli 0.44.0\n',
+                    stderr='(node) Node 18 is deprecated\n')
+
+            win_v, win_r = cli_ver.probe_cli_version(str(fake), runner=stdout_wins)
+            self.assertEqual(win_v, '0.44.0')
+            self.assertIsNone(win_r)
+
+    def test_cli_version_probe_bound_at_worker_start_not_in_report(self):
+        import os
+        import stat
+        import subprocess as sp
+        import tempfile
+        from providers import cli_version as cli_ver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            if os.name == 'nt':
+                fake = tmp_path / 'startcli.bat'
+                fake.write_text('@echo off\r\necho startcli 4.5.6\r\n', encoding='utf-8')
+            else:
+                fake = tmp_path / 'startcli'
+                fake.write_text('#!/bin/sh\necho startcli 4.5.6\n', encoding='utf-8')
+                fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+
+            probe_calls = []
+            real_probe = cli_ver.probe_cli_version
+
+            def counting_probe(*args, **kwargs):
+                probe_calls.append(1)
+                return real_probe(*args, **kwargs)
+
+            clock = Clock()
+            client = Client(clock)
+            adapter = Adapter()
+            adapter.CLI_NAME = 'startcli'
+            adapter.CLI_EXECUTABLE = str(fake)
+            adapter.TOOLS_POLICY = 'deny_all_and_abort_on_observed_tool'
+            adapter.WORKSPACE_MODE = 'read_only'
+            adapter.MODEL = 'grok-4.7'
+            adapter.EFFORT = 'xhigh'
+            original_probe = cli_ver.probe_cli_version
+            cli_ver.probe_cli_version = counting_probe
+            try:
+                worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                                object(), clock=clock, sleep=clock.sleep)
+            finally:
+                cli_ver.probe_cli_version = original_probe
+            self.assertEqual(len(probe_calls), 1)
+            self.assertEqual(adapter.CLI_VERSION, '4.5.6')
+
+            def forbid_run(*args, **kwargs):
+                self.fail('cli version probe must not run after worker start')
+
+            real_run = sp.run
+            sp.run = forbid_run
+            try:
+                with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+                    worker.report()
+                    worker.report(force=True)
+                    worker.ready = True
+                    worker.handle = SimpleNamespace(state='ready', preflight=None)
+                    worker.task = dict(client.task)
+                    worker.phase = 'setup'
+                    deadline, prompt = worker._prepare_task()
+                    self.assertIsNotNone(deadline)
+                    self.assertTrue(isinstance(prompt, str) and prompt)
+            finally:
+                sp.run = real_run
+
+    def test_process_started_at_on_every_report(self):
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            arm_manifest(adapter)
+            worker.report(force=True)
+            with_manifest = client.calls[-1][1]
+            self.assertEqual(with_manifest['process_started_at'], live_loop._PROCESS_STARTED_AT)
+            self.assertIn('capability', with_manifest)
+            self.assertEqual(
+                with_manifest['process_started_at'],
+                with_manifest['capability']['started_at'])
+
+            adapter.CLI_VERSION = None
+            worker._capability_ready = False
+            worker._capability_value = None
+            worker.report(force=True)
+            without = client.calls[-1][1]
+            self.assertNotIn('capability', without)
+            self.assertEqual(without['process_started_at'], live_loop._PROCESS_STARTED_AT)
+            self.assertEqual(without['process_started_at'], with_manifest['process_started_at'])
+
+            worker.report(force=True)
+            again = client.calls[-1][1]
+            self.assertEqual(again['process_started_at'], with_manifest['process_started_at'])
+
     def test_report_400_with_manifest_retries_once_without_it(self):
         from urllib.error import HTTPError
         from agent_hub.worker import WorkerError
@@ -2176,6 +2324,8 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(len(reports), 2)
             self.assertIn('capability', reports[0])
             self.assertNotIn('capability', reports[1])
+            self.assertEqual(reports[0]['process_started_at'], live_loop._PROCESS_STARTED_AT)
+            self.assertEqual(reports[1]['process_started_at'], live_loop._PROCESS_STARTED_AT)
             self.assertEqual(reports[1]['usage'], [])
             self.assertTrue(worker.capability_dropped)
             self.assertEqual(worker.usage_rejected, 0)

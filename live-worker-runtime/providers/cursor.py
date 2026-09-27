@@ -55,6 +55,8 @@ metadata, review = _load_native()
 MODEL = review.MODEL
 FAST, MODE = 'false', 'ask'
 TOOLS_POLICY = 'ask_mode_deny_all_abort_on_observed_tool'
+# Ask mode + deny-all local permissions; aborts on any observed tool event.
+WORKSPACE_MODE = 'read_only'
 # Native catalog does not expose an effort knob (ask mode / fast=false only).
 EFFORT = 'not_exposed_in_native_catalog'
 # Binary basename the adapter executes (/opt/runcrew/cursor/cursor-agent).

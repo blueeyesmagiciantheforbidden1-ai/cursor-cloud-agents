@@ -417,6 +417,8 @@ def capability_omit_reason(adapter, agent, started_at, environ=None, now=None):
             return 'missing_cli_name'
         if not isinstance(_adapter_attr(adapter, 'TOOLS_POLICY'), str) or not _adapter_attr(adapter, 'TOOLS_POLICY'):
             return 'missing_tools_policy'
+        if _adapter_attr(adapter, 'WORKSPACE_MODE') not in ('read_only', 'write'):
+            return 'missing_workspace_mode'
         if not isinstance(_adapter_attr(adapter, 'MODEL'), str) or not _adapter_attr(adapter, 'MODEL'):
             return 'missing_model'
         if not isinstance(_adapter_attr(adapter, 'EFFORT'), str) or not _adapter_attr(adapter, 'EFFORT'):
@@ -444,7 +446,7 @@ def capability_manifest(adapter, agent, started_at, environ=None, now=None):
             'region': region,
             'cli_name': _adapter_attr(adapter, 'CLI_NAME'),
             'cli_version': _adapter_attr(adapter, 'CLI_VERSION'),
-            'workspace_mode': 'read_only',
+            'workspace_mode': _adapter_attr(adapter, 'WORKSPACE_MODE'),
             'tools_policy': _adapter_attr(adapter, 'TOOLS_POLICY'),
             'model': _adapter_attr(adapter, 'MODEL'),
             'effort': _adapter_attr(adapter, 'EFFORT'),
@@ -551,17 +553,21 @@ class Worker:
         self.usage_rejected = 0
         # Set when a hub HTTP 400 forced a retry that dropped the capability manifest.
         self.capability_dropped = False
-
-    def _capability(self):
-        """Build the manifest once per run. Failure omits it; it never raises."""
-        if self._capability_ready:
-            return self._capability_value
-        self._capability_ready = True
+        # Probe CLI --version once at start so report() / task setup never spawn it.
         try:
             from providers import cli_version as cli_version_mod
             cli_version_mod.bind_cli_version(self.adapter, log=self.log)
         except Exception:
             pass
+
+    def _capability(self):
+        """Build the manifest once per run. Failure omits it; it never raises.
+
+        Reads adapter.CLI_VERSION already bound at worker start; never probes.
+        """
+        if self._capability_ready:
+            return self._capability_value
+        self._capability_ready = True
         try:
             self._capability_value = capability_manifest(
                 self.adapter, self.settings.agent, _PROCESS_STARTED_AT)
@@ -673,7 +679,8 @@ class Worker:
                    'status': 'busy' if self.task and self.ready else 'idle' if self.ready else 'offline',
                    'auth_status': 'verified' if self.ready else 'unknown',
                    'current_room_id': self.task.get('room_id') if self.task else None,
-                   'last_exit_code': self.last_exit, 'usage': usage}
+                   'last_exit_code': self.last_exit, 'usage': usage,
+                   'process_started_at': _PROCESS_STARTED_AT}
         try:
             capability = self._capability()
         except Exception:

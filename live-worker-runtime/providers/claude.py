@@ -34,6 +34,8 @@ import provider_errors
 MODEL = 'claude-fable-5-1'
 EFFORT = 'max'
 TOOLS_POLICY = 'read_only_tools_dontask_restricted'
+# Read/Grep/Glob only (--tools / --allowedTools); no workspace writes.
+WORKSPACE_MODE = 'read_only'
 # Binary basename the adapter executes (/opt/runcrew/claude/claude).
 CLI_NAME = 'claude'
 # Keep this binding identical to the enrolled Claude Ryan profile (never derived from a prompt).

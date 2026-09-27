@@ -33,6 +33,8 @@ CLI_NAME = 'codex'
 CLI_EXECUTABLE = '/opt/runcrew/codex/bin/codex'
 # Sandbox on turn/start: workspaceWrite, networkAccess false (protocol_gate.SANDBOX).
 TOOLS_POLICY = 'workspace_write_network_access_false'
+# Truthful hub label: native sandbox is workspaceWrite with writableRoots.
+WORKSPACE_MODE = 'write'
 # CLI_VERSION is set once at worker start via providers.cli_version.bind_cli_version.
 MAX_PROMPT, MAX_ANSWER = 200000, 15000
 WARM_SECONDS, NATIVE_SECONDS, FINALIZE_RESERVE = 3600, 600, 45
