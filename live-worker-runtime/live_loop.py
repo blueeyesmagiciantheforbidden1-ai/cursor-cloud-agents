@@ -551,6 +551,7 @@ class Worker:
         self._last_turn_usage = None
         self._last_turn_observed_at = None
         self.usage_rejected = 0
+        self.report_failures = 0
         # Set when a hub HTTP 400 forced a retry that dropped the capability manifest.
         self.capability_dropped = False
         # Probe CLI --version once at start so report() / task setup never spawn it.
@@ -733,6 +734,12 @@ class Worker:
                 if not isinstance(receipt, dict) or receipt.get('active') is not True:
                     self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
                     return False
+                try:
+                    self.report()
+                except Exception:
+                    # Telemetry only: the task lease was renewed just above.
+                    self.report_failures += 1
+                return True
             self.report()
             return True
         except Exception:
@@ -836,14 +843,22 @@ class Worker:
         return remaining
 
     def _prepare_task(self):
-        """Deadline, room, and prompt. Transport errors retry; vetted codes do not."""
+        """Deadline, room, and prompt. Transport errors retry; vetted codes do not.
+
+        A failed busy report is counted, not raised, because the lease and the
+        room were just confirmed.
+        """
         for attempt in range(3):
             try:
                 deadline = self.checked_deadline(self.task)
                 room = self.client.get_room(self.task['room_id'])
                 prompt = task_prompt(self.task, room, self.settings.agent)
                 require(self.clock() + 5 < deadline, 'task_deadline_insufficient')
-                self.report(force=True)
+                try:
+                    self.report(force=True)
+                except Exception:
+                    # Telemetry only: the task lease was renewed just above.
+                    self.report_failures += 1
                 return deadline, prompt
             except Exception as error:
                 if idle_fault(error) != 'retry' or attempt == 2:
@@ -1145,6 +1160,8 @@ class Worker:
                 outcome['offline_report'] = 'unconfirmed'
             if self.usage_rejected > 0:
                 outcome['usage_rejected'] = self.usage_rejected
+            if self.report_failures > 0:
+                outcome['report_failures'] = self.report_failures
             if self.capability_dropped:
                 outcome['capability_dropped'] = True
             self.log(outcome)

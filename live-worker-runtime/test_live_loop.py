@@ -799,23 +799,32 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn('transient room read', str(result) + str(client.completions))
         self.assertIn('(task_setup_unavailable)', client.completions[0]['output'])
 
-    def test_report_error_after_claim_still_fails(self):
-        worker, client, adapter, _ = self.setup_worker()
-        original = client.post
-        def post(path, value):
-            if path.endswith('/report') and value.get('status') == 'busy':
-                client.calls.append((path, copy.deepcopy(value)))
-                raise OSError('transient hub socket')
-            return original(path, value)
-        client.post = post
-        result = worker.run()
-        self.assertEqual(result['outcome'], 'failed')
-        self.assertEqual(result['error_code'], 'task_setup_unavailable')
-        self.assertFalse(result['model_call_attempted'])
-        self.assertNotIn('execute', adapter.calls)
-        self.assertNotIn('transient hub socket', str(result) + str(client.completions))
-        self.assertIn('(task_setup_unavailable)', client.completions[0]['output'])
-        self.assertEqual(worker.last_exit, 1)
+    def test_report_error_during_setup_is_counted_and_the_task_runs(self):
+        for failure in (OSError('transient hub socket'), {'accepted': False}):
+            with self.subTest(failure=failure):
+                worker, client, adapter, _ = self.setup_worker()
+                original = client.post
+
+                def post(path, value, _failure=failure):
+                    if path.endswith('/report') and value.get('status') == 'busy':
+                        client.calls.append((path, copy.deepcopy(value)))
+                        if isinstance(_failure, dict):
+                            return _failure
+                        raise _failure
+                    return original(path, value)
+
+                client.post = post
+                result = worker.run()
+                self.assertEqual(result['outcome'], 'completed')
+                self.assertEqual(adapter.calls.count('execute'), 1)
+                self.assertEqual(len(client.completions), 1)
+                self.assertEqual(client.completions[0]['exit_code'], 0)
+                self.assertEqual(worker.last_exit, 0)
+                self.assertEqual(result['report_failures'], 1)
+                setup_beats = [value for path, value in client.calls
+                               if path.endswith('/heartbeat') and value.get('phase') == 'setup']
+                self.assertEqual(len(setup_beats), 1)
+                self.assertNotIn('transient hub socket', str(result) + str(client.completions))
 
     def test_provider_error_is_never_retried_or_leaked(self):
         worker, client, adapter, _ = self.setup_worker(); adapter.fail_execute = True
@@ -2755,9 +2764,12 @@ class HeartbeatPhaseTests(unittest.TestCase):
         from agent_hub.worker import LeaseLost
         clock = Clock(); client = Client(clock)
         original = client.post
+        report_posts = {'n': 0}
 
         def post(path, value):
             if path == '/v1/workers/report':
+                report_posts['n'] += 1
+                client.calls.append((path, copy.deepcopy(value)))
                 raise LeaseLost('report refused')
             return original(path, value)
 
@@ -2767,8 +2779,87 @@ class HeartbeatPhaseTests(unittest.TestCase):
         worker.task = dict(client.task)
         worker.phase = 'model_call'
         worker.next_report = 0
-        self.assertIs(worker.heartbeat(), False)
+        self.assertIs(worker.heartbeat(), True)
         self.assertIs(worker.lease_revoked, False)
+        self.assertEqual(worker.report_failures, 1)
+        beats = [value for path, value in client.calls if path.endswith('/heartbeat')]
+        self.assertTrue(any(value.get('phase') == 'model_call' for value in beats))
+        self.assertIs(worker.heartbeat(), True)
+        self.assertEqual(report_posts['n'], 2)
+        self.assertEqual(worker.report_failures, 2)
+
+    def test_report_failure_during_model_call_keeps_the_task(self):
+        cases = (500, 'connection', 403, 409, 'not_accepted')
+        for kind in cases:
+            with self.subTest(kind=kind):
+                clock = Clock(); client = Client(clock); adapter = Adapter()
+                beat = {}
+                in_execute = {'on': False}
+                reports_in_execute = {'n': 0}
+                original = client.post
+                failure = ({'accepted': False} if kind == 'not_accepted'
+                           else self._hub_shaped_error(kind))
+
+                def prepare(session, heartbeat, deadline):
+                    adapter.calls.append('prepare')
+                    beat['fn'] = heartbeat
+                    return SimpleNamespace(state='ready')
+
+                def execute(handle, prompt, deadline, *, task_kind):
+                    adapter.calls.append('execute')
+                    in_execute['on'] = True
+                    clock.now += 30
+                    ok = beat['fn']()
+                    in_execute['on'] = False
+                    if ok is not True:
+                        raise CodeError('grok_hub_heartbeat_lost')
+                    return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+                def post(path, value):
+                    if in_execute['on'] and path == '/v1/workers/report':
+                        client.calls.append((path, copy.deepcopy(value)))
+                        reports_in_execute['n'] += 1
+                        if isinstance(failure, dict):
+                            return failure
+                        raise failure
+                    return original(path, value)
+
+                adapter.prepare, adapter.execute = prepare, execute
+                client.post = post
+                worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                                object(), clock=clock, sleep=clock.sleep)
+                result = worker.run()
+                self.assertGreaterEqual(reports_in_execute['n'], 1)
+                self.assertEqual(result['outcome'], 'completed')
+                self.assertEqual(len(client.completions), 1)
+                self.assertEqual(client.completions[0]['exit_code'], 0)
+                self.assertNotIn('error_code', client.completions[0])
+                self.assertIs(worker.lease_revoked, False)
+                self.assertEqual(result['report_failures'], 1)
+                self.assertEqual(adapter.calls.count('execute'), 1)
+                blob = str(result) + str(client.completions)
+                for fragment in ('Hub request failed', 'Hub connection failed',
+                                 'The hub revoked', 'report refused', 'connection refused',
+                                 'timed out', 'HTTP 500', 'HTTP 403', 'HTTP 409'):
+                    self.assertNotIn(fragment, blob)
+
+    def test_idle_heartbeat_report_failure_still_returns_false(self):
+        clock = Clock(); client = Client(clock)
+        original = client.post
+
+        def post(path, value):
+            if path == '/v1/workers/report':
+                client.calls.append((path, copy.deepcopy(value)))
+                raise OSError('transient hub socket')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, Adapter(),
+                        object(), clock=clock, sleep=clock.sleep)
+        worker.task = None
+        worker.next_report = 0
+        self.assertIs(worker.heartbeat(), False)
+        self.assertEqual(getattr(worker, 'report_failures', 0), 0)
 
     def _run_refused_completion(self, fail_execute=False, transport_first=False):
         clock = Clock(); client = Client(clock); adapter = Adapter()
