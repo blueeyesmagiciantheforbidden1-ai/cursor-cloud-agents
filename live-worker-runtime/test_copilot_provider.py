@@ -934,6 +934,64 @@ class Lifecycle(unittest.TestCase):
                                  c._NATIVE_REQUEST_CAP - c._EXECUTE_NATIVE_REQUESTS)
             c.close(handle)
 
+    def test_keyboard_interrupt_during_prepare_heartbeat_stops_and_releases(self):
+        self.heartbeat.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.prepare()
+        self.assertTrue(FakeNative.instances[-1].native_stopped)
+        self.session.finish.assert_called_once()
+        self.broker.quarantine.assert_not_called()
+
+    def test_keyboard_interrupt_during_fresh_metadata_quarantines(self):
+        with patch.object(c, '_fresh_metadata', side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.prepare()
+        self.assertTrue(FakeNative.instances[-1].native_stopped)
+        self.broker.quarantine.assert_called_once()
+        self.session.finish.assert_not_called()
+
+    def test_pre_native_digest_mismatch_releases_without_quarantine(self):
+        before = len(FakeNative.instances)
+        c.verify_native.side_effect = c.CopilotError('copilot_native_digest_mismatch')
+
+        def finish(*, native_stopped):
+            self.assertTrue(native_stopped)
+            self.session.state = 'committed'
+            return 'version/42'
+
+        self.session.finish = Mock(side_effect=finish)
+        with self.assertRaises(c.CopilotError) as caught:
+            self.prepare()
+        self.assertEqual(str(caught.exception), 'copilot_native_digest_mismatch')
+        self.session.finish.assert_called_once()
+        self.broker.quarantine.assert_not_called()
+        self.assertEqual(len(FakeNative.instances), before)
+
+    def test_pre_native_keyboard_interrupt_releases_without_quarantine(self):
+        before = len(FakeNative.instances)
+        c.verify_native.side_effect = KeyboardInterrupt
+
+        def finish(*, native_stopped):
+            self.assertTrue(native_stopped)
+            self.session.state = 'committed'
+            return 'version/42'
+
+        self.session.finish = Mock(side_effect=finish)
+        with self.assertRaises(KeyboardInterrupt):
+            self.prepare()
+        self.session.finish.assert_called_once()
+        self.broker.quarantine.assert_not_called()
+        self.assertEqual(len(FakeNative.instances), before)
+
+    def test_native_startup_stopped_still_quarantines(self):
+        with patch.object(c, 'NativeProcess',
+                          side_effect=c.NativeStartupStopped('copilot_native_startup_stopped')), \
+                self.assertRaises(c.CopilotError) as caught:
+            self.prepare()
+        self.assertEqual(str(caught.exception), 'copilot_native_startup_stopped')
+        self.broker.quarantine.assert_called_once()
+        self.session.finish.assert_not_called()
+
 
 class Admission(unittest.TestCase):
     def test_permission_flags_are_required_and_false_is_not_zero(self):

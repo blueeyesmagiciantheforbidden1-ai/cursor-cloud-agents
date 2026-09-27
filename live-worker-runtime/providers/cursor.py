@@ -420,7 +420,7 @@ def prepare(session, heartbeat, deadline):
         # so idle pumping covers the live loop's wait. execute() replaces it.
         handle.native.deadline = max(started + WARM_SECONDS, time.monotonic() + WARM_SECONDS)
         return handle
-    except Exception:
+    except BaseException:
         if not handle.finished and not handle.close_failed:
             close(handle)
         raise

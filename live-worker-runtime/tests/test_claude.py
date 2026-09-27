@@ -886,6 +886,64 @@ class ClaudeAdapter(unittest.TestCase):
         self.assertEqual(argv[argv.index('--permission-mode') + 1], 'dontAsk')
         self.assertTrue(c.auth._command_matches(c.command(), execution_mode='read_only'))
 
+    def test_keyboard_interrupt_during_prepare_heartbeat_stops_and_releases(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+
+            def heartbeat():
+                raise KeyboardInterrupt
+
+            with patch.object(c, 'NativeProcess', fixture.factory), \
+                    patch.object(c, 'launch_context_error', lambda *a: None), \
+                    self.assertRaises(KeyboardInterrupt):
+                c.prepare(session, heartbeat, time.monotonic() + 30)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+            session.finish.assert_called_once_with(native_stopped=True)
+            self.assertEqual(session.state, 'committed')
+            session.broker.quarantine.assert_not_called()
+
+
+class ClaudePrepareInterruptLoop(unittest.TestCase):
+    def test_worker_prepare_interrupt_releases_without_claim(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            paths = []
+
+            class Client:
+                def post(self, path, value):
+                    paths.append(path)
+                    return {'accepted': True}
+
+            holder = [None]
+
+            def prepare(session, heartbeat, deadline):
+                def beat():
+                    if holder[0].on_signal():
+                        raise KeyboardInterrupt
+                    return heartbeat()
+                return c.prepare(session, beat, deadline)
+
+            adapter = SimpleNamespace(prepare=prepare, maintain=c.maintain,
+                                      execute=c.execute, close=c.close)
+            with patch.object(c, 'NativeProcess', fixture.factory), \
+                    patch.object(c, 'launch_context_error', lambda *a: None):
+                worker = live_loop.Worker(
+                    live_loop.Settings('claude', 'claude-live'),
+                    Client(), adapter, session,
+                    clock=time.monotonic, sleep=lambda s: None, log=lambda r: None)
+                holder[0] = worker
+                result = worker.run()
+            self.assertEqual(result['outcome'], 'failed')
+            self.assertEqual(result['error_code'], 'worker_stopping')
+            self.assertEqual(worker.last_exit, 1)
+            self.assertFalse(any(path.endswith('/claim') for path in paths))
+            self.assertIsNone(worker.handle)
+            session.finish.assert_called_once()
+            self.assertEqual(session.state, 'committed')
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+
 
 if __name__ == '__main__':
     unittest.main()

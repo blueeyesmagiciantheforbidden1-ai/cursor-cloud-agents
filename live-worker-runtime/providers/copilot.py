@@ -575,6 +575,7 @@ class Handle:
     close_failed: bool = False
     credential_version: str = field(default='', repr=False)
     next_quota_refresh: float = 0
+    native_launched: bool = False
 
     @property
     def readiness(self):
@@ -616,7 +617,10 @@ def close(handle):
             handle.native = None
         need(handle.stopped_proven, 'copilot_native_stop_unconfirmed')
         # A changed credential may only be published after native identity proof.
-        need(handle.owner_verified, 'copilot_owner_unverified_at_close')
+        # Before any native was launched, the credential file still holds exactly
+        # the bytes that restore() wrote, so committing it cannot publish a
+        # credential the native changed.
+        need(handle.owner_verified or not handle.native_launched, 'copilot_owner_unverified_at_close')
         handle.credential_version = handle.session.finish(native_stopped=True)
         need(type(handle.credential_version) is str and bool(handle.credential_version)
              and handle.session.state == 'committed', 'copilot_credential_commit_unconfirmed')
@@ -657,6 +661,7 @@ def prepare(session, heartbeat, deadline):
         _home(session)
         handle.stopped_proven = False
         try:
+            handle.native_launched = True
             handle.native = NativeProcess(session.home, lambda: _renew(handle), deadline)
         except NativeStartupStopped:
             handle.stopped_proven = True
@@ -695,6 +700,12 @@ def prepare(session, heartbeat, deadline):
         if isinstance(error, CopilotError):
             raise
         raise CopilotError('copilot_prepare_requires_reconciliation') from None
+    except BaseException:
+        try:
+            close(handle)
+        except CopilotError:
+            pass
+        raise
 
 
 def _refresh_quota(handle):

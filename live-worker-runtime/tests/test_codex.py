@@ -1130,6 +1130,21 @@ class CodexLive(unittest.TestCase):
             self.assertEqual(live_loop.maintain_fault(caught.exception), 'drain')
             self.assertEqual(handle.native.protocol_state, 'denied')
 
+    def test_keyboard_interrupt_during_final_renew_stops_and_releases(self):
+        self.heartbeat.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.prepare()
+        self.assertEqual(self.native.order, ['stop', 'commit-release'])
+        self.session.finish.assert_called_once()
+        self.session.broker.quarantine.assert_not_called()
+
+    def test_keyboard_interrupt_during_collect_quarantines_after_stop(self):
+        with patch.object(c, '_collect', side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.prepare()
+        self.assertEqual(self.native.order, ['stop'])
+        self.session.broker.quarantine.assert_called_once()
+        self.session.finish.assert_not_called()
 
 
 @unittest.skipIf(c is None, SKIP_REASON)

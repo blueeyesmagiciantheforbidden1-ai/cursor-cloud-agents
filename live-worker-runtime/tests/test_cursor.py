@@ -770,5 +770,28 @@ class LiveProtocol(unittest.TestCase):
         self.assertIn(b'session/prompt', live.process.stdin.getvalue())
 
 
+class CursorPrepareInterrupt(unittest.TestCase):
+    def test_keyboard_interrupt_after_acp_start_stops_and_releases(self):
+        fixture = Fixture()
+        calls = {'n': 0}
+
+        def heartbeat():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return True
+            raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            with patch.object(c, '_metadata_process', fixture.metadata_process), \
+                    patch.object(c, '_acp_process', fixture.acp_process), \
+                    self.assertRaises(KeyboardInterrupt):
+                c.prepare(session, heartbeat, time.monotonic() + 30)
+            self.assertEqual(fixture.events, ['metadata-stop', 'metadata-stop', 'stop', 'commit-release'])
+            session.finish.assert_called_once_with(native_stopped=True)
+            self.assertEqual(session.state, 'committed')
+            session.broker.quarantine.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

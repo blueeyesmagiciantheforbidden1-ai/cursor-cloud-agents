@@ -1140,6 +1140,21 @@ class GrokAdapter(unittest.TestCase):
             self.assertEqual(fixture.events, ['stop', 'commit-release'])
             session.finish.assert_called_once_with(native_stopped=True)
 
+    def test_keyboard_interrupt_during_session_new_stops_and_releases(self):
+        def raise_interrupt(*_a, **_k):
+            raise KeyboardInterrupt
+
+        fixture = Fixture(overrides={'session/new': raise_interrupt})
+        with tempfile.TemporaryDirectory() as root:
+            session = fixture.session(root)
+            with patch.object(g, 'NativeProcess', fixture.factory), \
+                    self.assertRaises(KeyboardInterrupt):
+                g.prepare(session, lambda: True, time.monotonic() + 30)
+            self.assertEqual(fixture.events, ['stop', 'commit-release'])
+            session.finish.assert_called_once_with(native_stopped=True)
+            self.assertEqual(session.state, 'committed')
+            session.broker.quarantine.assert_not_called()
+
 
 class BillingPolicy(unittest.TestCase):
     def test_native_omissions_are_unavailable_and_cent_empty_is_zero(self):

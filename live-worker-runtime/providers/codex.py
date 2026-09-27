@@ -473,6 +473,12 @@ def prepare(session, heartbeat, deadline):
         return handle
     except Exception as error:
         _fail(handle, error)
+    except BaseException:
+        try:
+            _close(handle)
+        except Exception:
+            pass
+        raise
 
 
 # WarmRPC._send raises these through need() as LiveCodexError: stdin is dead or

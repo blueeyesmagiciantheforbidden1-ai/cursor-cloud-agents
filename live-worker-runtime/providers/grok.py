@@ -322,7 +322,7 @@ def prepare(session, heartbeat, deadline):
         handle.sid = created['sessionId']
         need(heartbeat() is True, 'grok_hub_heartbeat_lost')
         return handle
-    except Exception:
+    except BaseException:
         if not handle.finished and not handle.close_failed:
             close(handle)
         raise
