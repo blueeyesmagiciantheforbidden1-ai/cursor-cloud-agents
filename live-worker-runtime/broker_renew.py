@@ -57,7 +57,12 @@ def next_due(renewed, cadence, clock=None):
     return clock() + (RETRY_SECONDS if renewed is False else cadence)
 
 
-def finishing_beat(heartbeat):
+# HubClient.post opener timeout (agent_hub.worker.HubClient.post). Kept here so
+# finishing_beat can guard without importing live_loop.
+HUB_POST_TIMEOUT_SECONDS = 10
+
+
+def finishing_beat(heartbeat, deadline=None, *, clock=None, post_timeout=None):
     """Tell the hub the model answered, before adapter close / broker finish.
 
     Calls ``heartbeat(phase='finishing')`` once. A verified answer is never
@@ -65,7 +70,19 @@ def finishing_beat(heartbeat):
     backstop. Swallows ``Exception`` (including a ``TypeError`` from a
     zero-argument test double) but never ``BaseException``, so SIGTERM's
     ``KeyboardInterrupt`` propagates.
+
+    When ``deadline`` is set, skip the beat unless at least ``post_timeout``
+    seconds (default: HUB_POST_TIMEOUT_SECONDS) remain before it, so a hung
+    opener cannot eat the completion reserve. The loop's heartbeat closure
+    applies the same guard when it can see the execute deadline.
     """
+    if deadline is not None:
+        if clock is None:
+            clock = time.monotonic
+        if post_timeout is None:
+            post_timeout = HUB_POST_TIMEOUT_SECONDS
+        if not (clock() + post_timeout < deadline):
+            return
     try:
         heartbeat(phase='finishing')
     except Exception:

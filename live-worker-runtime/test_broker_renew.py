@@ -203,6 +203,20 @@ class BrokerRenewTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             broker_renew.finishing_beat(stop)
 
+    def test_finishing_beat_skips_when_margin_before_deadline_is_short(self):
+        calls = []
+        clock = Clock(100)
+
+        def heartbeat(*, phase=None):
+            calls.append(phase)
+            return True
+
+        margin = broker_renew.HUB_POST_TIMEOUT_SECONDS
+        broker_renew.finishing_beat(heartbeat, deadline=clock() + margin, clock=clock)
+        self.assertEqual(calls, [])
+        broker_renew.finishing_beat(heartbeat, deadline=clock() + margin + 1, clock=clock)
+        self.assertEqual(calls, ['finishing'])
+
     def test_lease_seconds_matches_policy_default(self):
         default = dynamic_broker.Policy.__dataclass_fields__['lease_seconds'].default
         self.assertEqual(broker_renew.LEASE_SECONDS, default)

@@ -502,11 +502,14 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         result = handle.native.request('session/prompt', {'sessionId': handle.sid,
             'prompt': [{'type': 'text', 'text': prompt}], '_meta': {'verbatim': True, 'promptId': nonce}})
         text, usage = _answer(handle.native, result, handle.sid, nonce)
-        broker_renew.finishing_beat(handle.heartbeat)
-        version = close(handle)
+        # Capture and check acks before the finishing beat so a shape failure
+        # never tells the hub the model answered. close() re-reads the same map.
+        handle.internal_acks = dict(getattr(handle.native, 'internal_ack_counts', {}))
         need(set(handle.internal_acks) <= {'skills-reload', 'workflows-reload'}
              and all(type(value) is int and 1 <= value <= 8 for value in handle.internal_acks.values())
              and sum(handle.internal_acks.values()) <= 8, 'grok_acknowledgement_count_shape')
+        broker_renew.finishing_beat(handle.heartbeat)
+        version = close(handle)
         return {'text': text, 'provider': 'grok', 'model': MODEL, 'effort': EFFORT, 'usage': usage,
                 'preflight': handle.preflight, 'same_process_account_model_quota': handle.preflight['same_process_account_model_quota'],
                 'review_sha256': hashlib.sha256(text.encode()).hexdigest(),

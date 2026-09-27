@@ -4576,5 +4576,163 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(worker.run()['outcome'], 'completed')
         self.assertEqual(finishing_after_close['n'], 0)
 
+    def test_finishing_beats_skip_when_margin_would_eat_completion_reserve(self):
+        """Tight reserve + hung opener: neither finishing beat posts; /complete keeps reserve."""
+        import broker_renew
+
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        beat = {}
+        complete_at = {}
+        original = client.post
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            # Leave less than one opener timeout before the execute deadline so
+            # a hung finishing POST would spend completion_reserve.
+            clock.now = deadline - live_loop.HUB_POST_TIMEOUT_SECONDS
+            broker_renew.finishing_beat(beat['fn'])
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        def post(path, value):
+            if path.endswith('/heartbeat') and isinstance(value, dict) and value.get('phase') == 'finishing':
+                # Simulate HubClient.post opener hang consuming the reserve.
+                clock.now += live_loop.HUB_POST_TIMEOUT_SECONDS
+                client.calls.append((path, copy.deepcopy(value)))
+                return {'active': True, 'deadline': client.task['deadline'], 'server_time': 700}
+            if path.endswith('/complete'):
+                complete_at['clock'] = clock.now
+            return original(path, value)
+
+        adapter.prepare, adapter.execute = prepare, execute
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60, completion_reserve=15),
+                        client, adapter, object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        finishing = [value for path, value in client.calls
+                     if path.endswith('/heartbeat') and value.get('phase') == 'finishing']
+        self.assertEqual(finishing, [])
+        self.assertEqual(len(client.completions), 1)
+        # No opener hang ran: clock at /complete equals clock after execute's
+        # tight assignment (close is instantaneous in this fake).
+        self.assertEqual(complete_at['clock'],
+                         worker._execute_deadline - live_loop.HUB_POST_TIMEOUT_SECONDS)
+
+    def test_finishing_beats_both_sent_with_ample_margin(self):
+        import broker_renew
+
+        clock = Clock()
+        client = Client(clock)
+        adapter = Adapter()
+        beat = {}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare')
+            beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            broker_renew.finishing_beat(beat['fn'])
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        def close(handle):
+            adapter.calls.append('close')
+            # Real close (native stop) can outlast FINISHING_BEAT_AFTER_SECONDS so
+            # the loop's finishing beat still fires after the adapter's.
+            clock.now += live_loop.FINISHING_BEAT_AFTER_SECONDS + 1
+
+        adapter.prepare, adapter.execute, adapter.close = prepare, execute, close
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'completed')
+        finishing = [i for i, (path, value) in enumerate(client.calls)
+                     if path.endswith('/heartbeat') and value.get('phase') == 'finishing']
+        complete = [i for i, (path, _) in enumerate(client.calls) if path.endswith('/complete')]
+        self.assertEqual(len(finishing), 2)
+        self.assertTrue(complete)
+        self.assertLess(finishing[0], finishing[1])
+        self.assertLess(finishing[1], complete[0])
+
+    def test_adapter_finishing_transport_failure_skips_loop_finishing_beat(self):
+        import broker_renew
+        from agent_hub.worker import LeaseLost
+
+        def run_case(effect, *, expect_loop_beat, expect_revoked, expect_completions):
+            clock = Clock()
+            client = Client(clock)
+            adapter = Adapter()
+            beat = {}
+            original = client.post
+            finishing_after_close = {'n': 0}
+
+            def prepare(session, heartbeat, deadline):
+                adapter.calls.append('prepare')
+                beat['fn'] = heartbeat
+                return SimpleNamespace(state='ready')
+
+            def execute(handle, prompt, deadline, *, task_kind):
+                adapter.calls.append('execute')
+                clock.now += live_loop.FINISHING_BEAT_AFTER_SECONDS + 1
+                broker_renew.finishing_beat(beat['fn'])
+                return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+            def post(path, value):
+                if (path.endswith('/heartbeat') and isinstance(value, dict)
+                        and value.get('phase') == 'finishing'):
+                    client.calls.append((path, copy.deepcopy(value)))
+                    if 'close' in adapter.calls:
+                        finishing_after_close['n'] += 1
+                        return original(path, value)
+                    return effect()
+                return original(path, value)
+
+            adapter.prepare, adapter.execute = prepare, execute
+            client.post = post
+            worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                            object(), clock=clock, sleep=clock.sleep)
+            result = worker.run()
+            return result, worker, client, finishing_after_close
+
+        # Transport: adapter beat fails; loop beat must not spend a second timeout.
+        result, worker, client, after = run_case(
+            lambda: (_ for _ in ()).throw(self._hub_shaped_error('timeout')),
+            expect_loop_beat=False, expect_revoked=False, expect_completions=1)
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertIs(worker.lease_revoked, False)
+        self.assertEqual(after['n'], 0)
+        self.assertEqual(len(client.completions), 1)
+        self.assertTrue(worker._finishing_beat_transport_failed)
+
+        # LeaseLost lease_inactive: not transport; loop beat still attempted;
+        # lease_revoked stays today's getattr behaviour; success /complete runs.
+        result, worker, client, after = run_case(
+            lambda: (_ for _ in ()).throw(
+                LeaseLost('gone', reason='lease_inactive')),
+            expect_loop_beat=True, expect_revoked=True, expect_completions=1)
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertIs(worker.lease_revoked, True)
+        self.assertEqual(after['n'], 1)
+        self.assertEqual(len(client.completions), 1)
+        self.assertFalse(worker._finishing_beat_transport_failed)
+
+        # Completable reason: complete still delivered; lease_revoked clear.
+        result, worker, client, after = run_case(
+            lambda: (_ for _ in ()).throw(
+                LeaseLost('gone', reason='lease_expired_completable')),
+            expect_loop_beat=True, expect_revoked=False, expect_completions=1)
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertIs(worker.lease_revoked, False)
+        self.assertEqual(after['n'], 1)
+        self.assertEqual(len(client.completions), 1)
+
 
 if __name__ == '__main__': unittest.main()

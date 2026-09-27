@@ -637,6 +637,10 @@ class Worker:
         self.task_heartbeat_retries = 0
         # Local execute deadline in self.clock() units, or None before execute.
         self._execute_deadline = None
+        # Set when a finishing-phase task heartbeat failed on transport (not
+        # LeaseLost). The loop then skips its own finishing beat so a second
+        # opener timeout cannot eat the completion reserve.
+        self._finishing_beat_transport_failed = False
         self.completion_payload = None
         self.cleaned = False
         self.spans = []
@@ -751,12 +755,21 @@ class Worker:
 
         Never sets lease_revoked and never skips the success /complete: a retained
         expired lease still accepts completion, and a 409 on /complete stays final.
+        Skipped when a hung opener would eat into completion_reserve (need
+        HUB_POST_TIMEOUT_SECONDS of margin before the execute deadline, which
+        already withholds that reserve), or when the adapter's finishing beat
+        just failed on transport.
         """
         if self.stopping:
             return
         if self._task_ack_at is not None and self.clock() - self._task_ack_at < FINISHING_BEAT_AFTER_SECONDS:
             return
-        if self.clock() >= deadline:
+        if self._finishing_beat_transport_failed:
+            return
+        # checked_deadline already withheld completion_reserve from ``deadline``.
+        # Require a full opener timeout of margin so /complete still gets the
+        # reserve even if this POST hangs until HubClient.post's timeout.
+        if not (self.clock() + HUB_POST_TIMEOUT_SECONDS < deadline):
             return
         try:
             with self._critical():
@@ -845,6 +858,7 @@ class Worker:
         # value is a known HEARTBEAT_PHASES member, and it is strictly later
         # than the current phase. Backward, unknown, or pre-claim values are
         # ignored silently.
+        finishing = phase == 'finishing'
         if (phase is not None and self.task
                 and phase in HEARTBEAT_PHASES
                 and self.phase in HEARTBEAT_PHASES
@@ -852,20 +866,28 @@ class Worker:
             self.phase = phase
         if self.stopping:
             return False
+        # Adapter finishing beat: same margin as _finishing_beat so a hung
+        # opener cannot spend completion_reserve. Return True so the adapter
+        # does not treat the skip as a lease loss.
+        if (finishing and self._execute_deadline is not None
+                and not (self.clock() + HUB_POST_TIMEOUT_SECONDS < self._execute_deadline)):
+            return True
         try:
             if self.task:
-                return self._task_heartbeat()
+                return self._task_heartbeat(finishing=finishing)
             self.report()
             return True
         except Exception:
             return False
 
-    def _task_heartbeat(self):
+    def _task_heartbeat(self, *, finishing=False):
         """One or two task /heartbeat POSTs. Retry is bounded by lease window and deadline.
 
         A single transport blip must not abort a paid model call while the hub
         lease (45 s) and local execute deadline still have room for sleep + one
         more POST. LeaseLost, 4xx, and malformed receipts are never retried.
+        Finishing-phase beats never retry: a transport failure there means the
+        loop skips its own finishing beat rather than spending a second timeout.
         """
         delay = TASK_HEARTBEAT_RETRY_DELAY_SECONDS
         window = TASK_HEARTBEAT_RETRY_WINDOW_SECONDS
@@ -877,11 +899,17 @@ class Worker:
             # Stop the call in every case. A retained expired lease can
             # still accept the existing failure completion; preserve
             # the actual phase and model_call_attempted for that path.
+            # Finishing beats: still record lease_revoked via getattr (T110);
+            # the success /complete path is not skipped by this flag alone.
             self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
             return False
         except Exception as error:
+            if finishing and is_task_heartbeat_transport_error(error):
+                self._finishing_beat_transport_failed = True
+                return False
             if not (
-                is_task_heartbeat_transport_error(error)
+                not finishing
+                and is_task_heartbeat_transport_error(error)
                 and not self.stopping
                 and self._task_ack_at is not None
                 and self.clock() + delay - self._task_ack_at < window
