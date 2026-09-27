@@ -10,6 +10,12 @@ HOME/TMP scratch stays outside the receipt workspace. XDG_CACHE_HOME,
 XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR, APPDATA and
 LOCALAPPDATA are pinned beneath provider-home for providers and test-home for
 tests, overriding task_env values case-insensitively.
+
+Claim challenge: when a claim envelope carries receipt_challenge (32 lowercase
+hex), copy it into the run spec and echo it as runner_receipt.challenge. Do not
+send challenge otherwise. Hub rooms with require_runner_receipt or
+require_tests_green depend on this exact copy; see
+runcrew/docs/MYHERO_RUNNER_RECEIPTS.md ("Claim challenge").
 """
 from __future__ import annotations
 
@@ -17,6 +23,7 @@ import hashlib
 import json
 import math
 import importlib
+import re
 import threading
 import os
 from pathlib import Path, PurePosixPath
@@ -27,6 +34,8 @@ import sys
 import tarfile
 import time
 import uuid
+
+_RECEIPT_CHALLENGE = re.compile(r"^[0-9a-f]{32}$")
 
 ENABLED = False
 DEFAULT_LIMITS = {
@@ -484,11 +493,49 @@ def _discard(path, root):
     return proof
 
 
+def runner_spec_from_task(task, base_snapshot, test_command):
+    """Map a claimed hub task into a run_coding_task spec.
+
+    Copies task['envelope']['receipt_challenge'] into the spec only when the
+    envelope carries a str there. Absent or non-str values are omitted so the
+    receipt stays challenge-free (required for legacy leases). Hub rooms with
+    require_runner_receipt or require_tests_green depend on this copy.
+    """
+    spec = {
+        "base_snapshot": base_snapshot,
+        "task_text": task["prompt"],
+        "test_command": test_command,
+    }
+    envelope = task.get("envelope") if type(task) is dict else None
+    if type(envelope) is dict:
+        challenge = envelope.get("receipt_challenge")
+        if type(challenge) is str:
+            spec["receipt_challenge"] = challenge
+    return spec
+
+
+def _spec_receipt_challenge(spec):
+    """Return the challenge to echo, or None. Raises before allocation on bad values."""
+    if "receipt_challenge" not in spec:
+        return None
+    value = spec["receipt_challenge"]
+    if value is None:
+        return None
+    _need(type(value) is str and _RECEIPT_CHALLENGE.fullmatch(value) is not None,
+          "invalid_receipt_challenge")
+    return value
+
+
 def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, task_env=None):
     """Run one offline experiment, even though live enablement stays False.
 
     spec: {base_snapshot: directory/tar path, task_text: str,
-           test_command: nonempty argv list, limits: optional tightening dict}.
+           test_command: nonempty argv list, limits: optional tightening dict,
+           receipt_challenge: optional 32 lowercase hex from the claim envelope}.
+    When receipt_challenge is absent or None the receipt has no challenge key
+    (byte-for-byte as before). When present it must match ^[0-9a-f]{32}$ exactly
+    (no case normalisation) or raise RunnerError('invalid_receipt_challenge')
+    before allocation; a valid value is copied into runner_receipt.challenge.
     credential_dirs must be disjoint from root; links below root are refused.
     task_env explicitly passes non-secret variables to provider and tests only.
     limits use DEFAULT_LIMITS keys; neither caller nor spec can raise hard caps.
@@ -500,6 +547,7 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
     status/error_code/model_call_attempted/runner_receipt/diff/discard_proof.
     """
     _need(type(spec) is dict, "invalid_spec")
+    challenge = _spec_receipt_challenge(spec)
     bound = _limits(spec, limits)
     text, argv = spec.get("task_text"), spec.get("test_command")
     _need(type(text) is str and len(text.encode("utf-8")) <= bound["bytes"], "invalid_task")
@@ -603,6 +651,8 @@ def run_coding_task(spec, provider_fn, *, root, limits, credential_dirs=None, ta
             "tests": {"command": command, "ran": 1, "passed": int(code == 0),
                       "failed": int(code != 0), "errors": 0}, "workspace_id": run.name,
         }
+        if challenge is not None:
+            result["runner_receipt"]["challenge"] = challenge
         # Tripwire: tests must not touch the receipt workspace or control/git refs.
         post_test = _snapshot(workspace, bound)
         _need(post_test == pre_test, "test_mutated_workspace")

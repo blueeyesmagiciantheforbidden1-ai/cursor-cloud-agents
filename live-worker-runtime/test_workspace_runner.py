@@ -160,7 +160,7 @@ def write_receipt_path(workspace, task_text, deadline):
     (workspace / "receipt_workspace").write_text(str(workspace), encoding="utf-8")
 
 
-def hub_validator():
+def hub_core():
     # Load runcrew under a private package name: do not accidentally validate
     # against cca/agent-hub when that is already imported by another suite.
     # RUNCREW_AGENT_HUB is runcrew's source/agent-hub (the folder holding
@@ -180,7 +180,11 @@ def hub_validator():
         core = importlib.util.module_from_spec(core_spec)
         sys.modules[name + ".core"] = core
         core_spec.loader.exec_module(core)
-    return sys.modules[name + ".core"]._runner_receipt
+    return sys.modules[name + ".core"]
+
+
+def hub_validator():
+    return hub_core()._runner_receipt
 
 
 class WorkspaceRunnerTests(unittest.TestCase):
@@ -723,6 +727,101 @@ class WorkspaceRunnerTests(unittest.TestCase):
             self.assertIsNotNone(validator(mutated)[1])
         mutated = copy.deepcopy(receipt); mutated["tests"]["passed"] = 2
         self.assertEqual(validator(mutated)[1], "invalid_tests_totals")
+
+    def test_receipt_challenge_present_in_receipt(self):
+        challenge = "0123456789abcdef0123456789abcdef"
+        self.spec["receipt_challenge"] = challenge
+        result = self.run_task()
+        self.assertEqual(result["status"], "succeeded", result)
+        receipt = result["runner_receipt"]
+        self.assertEqual(receipt["challenge"], challenge)
+        accepted, reason = hub_validator()(receipt)
+        self.assertIsNone(reason)
+        self.assertEqual(accepted["challenge"], challenge)
+
+    def test_receipt_challenge_absent_or_none_omits_key(self):
+        without = self.run_task()["runner_receipt"]
+        self.assertNotIn("challenge", without)
+        legacy_keys = set(without)
+        self.spec["receipt_challenge"] = None
+        with_none = self.run_task()["runner_receipt"]
+        self.assertNotIn("challenge", with_none)
+        self.assertEqual(set(with_none), legacy_keys)
+        # Same shape as today aside from per-run identity fields.
+        for receipt in (without, with_none):
+            self.assertEqual(set(receipt), {
+                "base_commit", "result_commit", "diff_sha256",
+                "files_changed", "tests", "workspace_id"})
+        # With a valid challenge, only the challenge key is added.
+        self.spec["receipt_challenge"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        challenged = self.run_task()["runner_receipt"]
+        self.assertEqual(set(challenged) - legacy_keys, {"challenge"})
+        self.assertEqual(legacy_keys - set(challenged), set())
+
+    def test_invalid_receipt_challenge_before_allocation(self):
+        used_before = set(runner._USED_IDS)
+        bad_values = (
+            "ABCDEF0123456789ABCDEF0123456789",  # uppercase
+            "a" * 31,
+            "a" * 33,
+            "g" * 32,  # non-hex
+            123,
+            b"a" * 32,
+        )
+        for bad in bad_values:
+            with self.subTest(bad=bad):
+                self.spec["receipt_challenge"] = bad
+                with self.assertRaisesRegex(runner.RunnerError, r"^invalid_receipt_challenge$"):
+                    runner.run_coding_task(self.spec, edit, root=self.root, limits={})
+                self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(runner._USED_IDS, used_before)
+
+    def test_runner_spec_from_task_copies_challenge_only_when_str(self):
+        base, argv = str(self.base), [sys.executable, "-c", "pass"]
+        bare = {"prompt": "do the thing", "envelope": {}}
+        self.assertEqual(
+            runner.runner_spec_from_task(bare, base, argv),
+            {"base_snapshot": base, "task_text": "do the thing", "test_command": argv})
+        challenge = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        claimed = {"prompt": "do the thing",
+                   "envelope": {"receipt_challenge": challenge, "step": 0}}
+        self.assertEqual(
+            runner.runner_spec_from_task(claimed, base, argv),
+            {"base_snapshot": base, "task_text": "do the thing",
+             "test_command": argv, "receipt_challenge": challenge})
+        # Non-str envelope values must not be copied (caller must not invent a key).
+        for bad in (None, 1, b"c" * 32, ["x"]):
+            task = {"prompt": "x", "envelope": {"receipt_challenge": bad}}
+            self.assertNotIn("receipt_challenge",
+                             runner.runner_spec_from_task(task, base, argv))
+        self.assertNotIn(
+            "receipt_challenge",
+            runner.runner_spec_from_task({"prompt": "x"}, base, argv))
+
+    def test_hub_bind_receipt_challenge_matrix(self):
+        core = hub_core()
+        challenge = "cccccccccccccccccccccccccccccccc"
+        self.spec["receipt_challenge"] = challenge
+        challenged = self.run_task()["runner_receipt"]
+        accepted, err = core._runner_receipt(challenged)
+        self.assertIsNone(err)
+        bound, bind_err = core._bind_receipt_challenge(
+            accepted, err, {"receipt_challenge": challenge})
+        self.assertIsNone(bind_err)
+        self.assertEqual(bound["challenge"], challenge)
+
+        del self.spec["receipt_challenge"]
+        legacy = self.run_task()["runner_receipt"]
+        self.assertNotIn("challenge", legacy)
+        accepted_legacy, err_legacy = core._runner_receipt(legacy)
+        self.assertIsNone(err_legacy)
+        bound_legacy, bind_legacy = core._bind_receipt_challenge(
+            accepted_legacy, err_legacy, {})
+        self.assertIsNone(bind_legacy)
+
+        # Challenge on a legacy lease is why the runner only copies when present.
+        _, mismatch = core._bind_receipt_challenge(accepted, err, {})
+        self.assertEqual(mismatch, "challenge_mismatch")
 
 
 if __name__ == "__main__":
