@@ -101,6 +101,26 @@ STARTUP_AUTH_CODES = frozenset({
 # Not an assert: the check must hold under python -O too.
 if not all(provider_errors.SAFE_CODE.fullmatch(code) for code in STARTUP_AUTH_CODES):
     raise RuntimeError('STARTUP_AUTH_CODES must all match SAFE_CODE')
+# Each code is raised only by task_prompt or Worker.checked_deadline, after a
+# claim and before the model call. Deliberately left out: task_identity_invalid
+# (run() cannot complete without a 32-hex room_id), task_lease_invalid,
+# task_lease_lost, task_deadline_changed, task_deadline_insufficient,
+# task_setup_unavailable, worker_stopping, and every provider code.
+ROOM_REFUSAL_CODES = frozenset({
+    'purpose_missing',
+    'project_work_only',
+    'room_step_changed',
+    'workspace_not_enabled',
+    'claimed_context_changed',
+    'prompt_invalid',
+    'history_invalid',
+    'full_context_exceeds_worker_limit',
+    'room_identity_changed',
+    'task_timeout_invalid',
+})
+# Not an assert: the check must hold under python -O too.
+if not all(provider_errors.SAFE_CODE.fullmatch(code) for code in ROOM_REFUSAL_CODES):
+    raise RuntimeError('ROOM_REFUSAL_CODES must all match SAFE_CODE')
 
 
 # Consecutive idle maintain() retries before the execution fails with the code.
@@ -169,13 +189,21 @@ def finish_exit(agent, result, last_exit, stream):
     """Process exit code for a finished run; one stderr line only on failure.
 
     0 for completed or idle_drained (nothing printed); QUOTA_EXIT_CODE when
-    the run recorded it, else 1. A failing stderr never changes the code:
-    a lost 75 would hide a quota park from the controller.
+    the run recorded it; ROOM_REFUSED_EXIT_CODE when the run recorded a
+    confirmed room refusal; else 1. A failing stderr never changes the code:
+    a lost 75 would hide a quota park from the controller, and a lost 76
+    would count a room refusal as a strike.
     """
     outcome = result.get('outcome') if isinstance(result, dict) else None
     if outcome in ('completed', 'idle_drained'):
         return 0
-    code = provider_errors.QUOTA_EXIT_CODE if last_exit == provider_errors.QUOTA_EXIT_CODE else 1
+    if (last_exit == provider_errors.ROOM_REFUSED_EXIT_CODE
+            and isinstance(result, dict)
+            and result.get('room_refused') is True
+            and result.get('error_code') in ROOM_REFUSAL_CODES):
+        code = provider_errors.ROOM_REFUSED_EXIT_CODE
+    else:
+        code = provider_errors.QUOTA_EXIT_CODE if last_exit == provider_errors.QUOTA_EXIT_CODE else 1
     try:
         print(exit_line(agent, code, result), file=stream, flush=True)
     except (OSError, ValueError):
@@ -1299,6 +1327,15 @@ class Worker:
                     self._complete_for_span(text, 1, error_code=code)
                 except Exception:
                     outcome['completion_delivery'] = 'refused' if self.completion_refused else 'unconfirmed'
+                else:
+                    # Confirmed failure completion only: never set 76 before
+                    # delivery succeeds (report(force=True) in finally sends
+                    # last_exit_code, and it must stay 1 when delivery failed).
+                    if (code in ROOM_REFUSAL_CODES and not quota
+                            and self.model_call_attempted is False
+                            and self.cleaned and not self.completion_refused):
+                        self.last_exit = provider_errors.ROOM_REFUSED_EXIT_CODE
+                        outcome['room_refused'] = True
             return outcome
         finally:
             self.ready = False

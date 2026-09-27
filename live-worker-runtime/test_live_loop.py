@@ -835,6 +835,233 @@ class LoopTests(unittest.TestCase):
                                      provider_errors.QUOTA_EXIT_CODE, Broken()), provider_errors.QUOTA_EXIT_CODE)
         self.assertEqual(finish_exit('grok', None, None, io.StringIO()), 1)
 
+    def test_allowlisted_room_refusal_exits_76(self):
+        import io
+        from live_loop import finish_exit
+
+        def contribs(n, text='ok'):
+            return [{'agent': 'codex', 'text': text, 'exit_code': 0} for _ in range(n)]
+
+        cases = (
+            ('purpose_missing', lambda c: c.room.pop('purpose')),
+            ('project_work_only', lambda c: c.room.__setitem__('purpose', 'improvement')),
+            ('room_step_changed', lambda c: c.room.__setitem__('status', 'cancelled')),
+            ('workspace_not_enabled', lambda c: c.room.__setitem__('workspace', 'private-server')),
+            ('claimed_context_changed', lambda c: c.room.__setitem__('prompt', 'Other.')),
+            ('prompt_invalid', lambda c: (
+                c.task.__setitem__('prompt', 'x' * 8001),
+                c.room.__setitem__('prompt', 'x' * 8001))),
+            ('history_invalid', lambda c: (
+                c.task.__setitem__('messages', contribs(25)),
+                c.room.__setitem__('messages', contribs(25)))),
+            ('full_context_exceeds_worker_limit', lambda c: (
+                c.task.__setitem__('messages', contribs(24, 'x' * 8400)),
+                c.room.__setitem__('messages', contribs(24, 'x' * 8400)))),
+            ('room_identity_changed', lambda c: c.room.__setitem__('id', 'b' * 32)),
+            ('task_timeout_invalid', lambda c: c.task.__setitem__('timeout_seconds', 901)),
+        )
+        for code, mutate in cases:
+            with self.subTest(code=code):
+                worker, client, adapter, _ = self.setup_worker()
+                mutate(client)
+                result = worker.run()
+                self.assertEqual(result['error_code'], code)
+                self.assertNotIn('execute', adapter.calls)
+                self.assertEqual(adapter.calls.count('close'), 1)
+                self.assertEqual(len(client.completions), 1)
+                completion = client.completions[0]
+                self.assertEqual(completion['exit_code'], 1)
+                self.assertEqual(completion['error_code'], code)
+                self.assertIs(completion['model_call_attempted'], False)
+                self.assertEqual(set(completion), {'lease_token', 'output', 'exit_code', 'error_code',
+                                                   'model_call_attempted', 'step'})
+                self.assertEqual(worker.last_exit, provider_errors.ROOM_REFUSED_EXIT_CODE)
+                self.assertIs(result['room_refused'], True)
+                reports = [v for p, v in client.calls if p.endswith('/report')]
+                self.assertEqual(reports[-1]['last_exit_code'], 76)
+                stream = io.StringIO()
+                self.assertEqual(
+                    finish_exit(worker.settings.agent, result, worker.last_exit, stream), 76)
+                self.assertEqual(stream.getvalue().splitlines(),
+                                 ['grok worker exit 76: %s' % code])
+
+    def test_non_room_refusal_cases_keep_exit_1(self):
+        import io
+        from live_loop import finish_exit
+        from agent_hub.worker import LeaseLost
+
+        # purpose missing, delivery unconfirmed
+        worker, client, adapter, _ = self.setup_worker()
+        del client.room['purpose']
+        client.fail_completions = 3
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'purpose_missing')
+        self.assertEqual(result.get('completion_delivery'), 'unconfirmed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('room_refused', result)
+
+        # purpose missing, delivery refused via LeaseLost on /complete
+        worker, client, adapter, _ = self.setup_worker()
+        del client.room['purpose']
+        original = client.post
+
+        def post_lease_lost(path, value):
+            if path.endswith('/complete'):
+                raise LeaseLost('The hub revoked or expired this task lease')
+            return original(path, value)
+
+        client.post = post_lease_lost
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'purpose_missing')
+        self.assertEqual(result.get('completion_delivery'), 'refused')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('room_refused', result)
+
+        # task_lease_lost: no completion
+        worker, client, adapter, _ = self.setup_worker()
+        client.active = False
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'task_lease_lost')
+        self.assertEqual(client.completions, [])
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('room_refused', result)
+
+        # credential_cleanup_failed
+        worker, client, adapter, _ = self.setup_worker()
+        del client.room['purpose']
+
+        def close_raises(handle):
+            adapter.calls.append('close')
+            raise ValueError('cleanup failed')
+
+        adapter.close = close_raises
+        result = worker.run()
+        self.assertEqual(result['outcome'], 'credential_cleanup_failed')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('room_refused', result)
+
+        # worker_stopping set inside get_room
+        worker, client, adapter, _ = self.setup_worker()
+
+        def get_room(room):
+            worker.stopping = True
+            return copy.deepcopy(client.room)
+
+        client.get_room = get_room
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'worker_stopping')
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('room_refused', result)
+
+        # allowlisted code after the model call started
+        worker, client, adapter, _ = self.setup_worker()
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            raise CodeError('prompt_invalid')
+
+        adapter.execute = execute
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'prompt_invalid')
+        self.assertIs(result['model_call_attempted'], True)
+        self.assertEqual(worker.last_exit, 1)
+        self.assertNotIn('room_refused', result)
+
+        # quota still yields 75
+        worker, client, adapter, _ = self.setup_worker()
+
+        def execute_quota(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            raise CodeError('claude_quota_exhausted')
+
+        adapter.execute = execute_quota
+        result = worker.run()
+        self.assertEqual(worker.last_exit, provider_errors.QUOTA_EXIT_CODE)
+        self.assertNotIn('room_refused', result)
+        self.assertEqual(
+            finish_exit(worker.settings.agent, result, worker.last_exit, io.StringIO()),
+            provider_errors.QUOTA_EXIT_CODE)
+
+    def test_room_refusal_codes_are_exact(self):
+        import inspect
+        expected = frozenset({
+            'purpose_missing', 'project_work_only', 'room_step_changed',
+            'workspace_not_enabled', 'claimed_context_changed', 'prompt_invalid',
+            'history_invalid', 'full_context_exceeds_worker_limit',
+            'room_identity_changed', 'task_timeout_invalid',
+        })
+        self.assertEqual(live_loop.ROOM_REFUSAL_CODES, expected)
+        prompt_src = inspect.getsource(live_loop.task_prompt)
+        deadline_src = inspect.getsource(live_loop.Worker.checked_deadline)
+        for code in live_loop.ROOM_REFUSAL_CODES:
+            self.assertTrue(
+                ("'%s'" % code) in prompt_src or ("'%s'" % code) in deadline_src,
+                code)
+            self.assertNotIn(code, live_loop.STARTUP_AUTH_CODES)
+            self.assertFalse(provider_errors.is_quota(code))
+
+    def test_finish_exit_returns_76_only_for_confirmed_room_refusal(self):
+        import io
+        from live_loop import finish_exit
+
+        stream = io.StringIO()
+        self.assertEqual(
+            finish_exit('grok',
+                        {'outcome': 'failed', 'error_code': 'project_work_only', 'room_refused': True},
+                        76, stream),
+            76)
+        self.assertEqual(stream.getvalue().splitlines(),
+                         ['grok worker exit 76: project_work_only'])
+
+        self.assertEqual(
+            finish_exit('grok',
+                        {'outcome': 'failed', 'error_code': 'native_or_connection_failure',
+                         'room_refused': True},
+                        76, io.StringIO()),
+            1)
+        self.assertEqual(
+            finish_exit('grok',
+                        {'outcome': 'failed', 'error_code': 'project_work_only'},
+                        76, io.StringIO()),
+            1)
+
+        class Broken:
+            def write(self, _):
+                raise OSError('stderr closed')
+
+            def flush(self):
+                raise OSError('stderr closed')
+
+        self.assertEqual(
+            finish_exit('grok',
+                        {'outcome': 'failed', 'error_code': 'project_work_only', 'room_refused': True},
+                        76, Broken()),
+            76)
+
+        # Existing 0/1/75 cases unchanged.
+        for outcome in ('completed', 'idle_drained'):
+            stream = io.StringIO()
+            self.assertEqual(finish_exit('codex', {'outcome': outcome}, 0, stream), 0)
+            self.assertEqual(stream.getvalue(), '')
+        stream = io.StringIO()
+        self.assertEqual(finish_exit('codex', {'outcome': 'failed', 'error_code': 'claim_response_uncertain'}, 1,
+                                     stream), 1)
+        self.assertEqual(stream.getvalue().splitlines(), ['codex worker exit 1: claim_response_uncertain'])
+        stream = io.StringIO()
+        self.assertEqual(finish_exit('claude', {'outcome': 'failed', 'error_code': 'claude_quota_exhausted'},
+                                     provider_errors.QUOTA_EXIT_CODE, stream), provider_errors.QUOTA_EXIT_CODE)
+        self.assertEqual(stream.getvalue().splitlines(), ['claude worker exit 75: claude_quota_exhausted'])
+
+    def test_room_refused_exit_code_pinned_across_modules(self):
+        self.assertEqual(provider_errors.ROOM_REFUSED_EXIT_CODE, 76)
+        fleet_path = Path(__file__).resolve().parent / 'fleet_controller.py'
+        if not fleet_path.is_file():
+            self.skipTest('fleet_controller.py is not present in this image')
+        self.assertEqual(
+            module_constant(ast.parse(fleet_path.read_text(encoding='utf-8')),
+                            'ROOM_REFUSED_EXIT_CODE'),
+            provider_errors.ROOM_REFUSED_EXIT_CODE)
+
     def test_quota_codes_are_recognised_by_suffix_only(self):
         for code in ('claude_quota_exhausted', 'included_quota_exhausted', 'grok_provider_quota_exhausted'):
             self.assertTrue(provider_errors.is_quota(code))

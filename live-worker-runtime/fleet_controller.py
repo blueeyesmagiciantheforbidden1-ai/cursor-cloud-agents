@@ -2,9 +2,11 @@
 
 Clean terminal executions with released credential ownership are replaced; a
 failed one that released cleanly is replaced after a backoff, and the third
-consecutive failure stops the slot. Unknown launches, unreleased or quarantined
-credentials stop the slot at once instead of spending money in a restart loop.
-This module contains no provider calls.
+consecutive failure stops the slot. A room-content refusal (exit 76) is not a
+strike: the slot relaunches after a short delay, and a cap on consecutive
+refusals still stops a worker-side regression loop. Unknown launches,
+unreleased or quarantined credentials stop the slot at once instead of
+spending money in a restart loop. This module contains no provider calls.
 """
 from __future__ import annotations
 
@@ -39,6 +41,13 @@ FAILURE_BACKOFF_SECONDS = (120, 600)
 QUOTA_EXIT_CODE = 75
 QUOTA_PARK_BASE_SECONDS = 3600
 QUOTA_PARK_CAP_SECONDS = 14400
+# Same value as provider_errors.ROOM_REFUSED_EXIT_CODE. Not imported: the
+# controller image does not ship provider_errors.py.
+ROOM_REFUSED_EXIT_CODE = 76
+ROOM_REFUSAL_DELAY_SECONDS = 60
+# The hub retries a pre-model failure once, so 6 is three poison rooms, and
+# the cap keeps a worker-side refusal regression visible.
+MAX_ROOM_REFUSALS = 6
 
 
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
@@ -314,8 +323,9 @@ class Controller:
 
         Cloud Run v2 lists tasks at ``<execution>/tasks``. Permission, transport,
         shape, a count other than one, or a missing exit code all fail closed
-        so the strike path is unchanged. An exit code other than 75 is returned
-        and is not treated as quota.
+        so the strike path is unchanged. Exit 75 is quota; exit 76 is a room
+        refusal. Any other proved exit code is returned and is not treated as
+        quota or a room refusal.
         """
         try:
             listed = self.cloud.get(execution + '/tasks')
@@ -458,6 +468,19 @@ class Controller:
                             last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                         return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
                                 'quota_parks': state['quota_parks'], 'generation': state['generation']}
+                    if exit_code == ROOM_REFUSED_EXIT_CODE and released:
+                        refusals = state.get('room_refusals', 0)
+                        refusals = (refusals if type(refusals) is int and refusals >= 0 else 0) + 1
+                        if refusals >= MAX_ROOM_REFUSALS:
+                            state, version = self.save(state, version, phase='blocked',
+                                room_refusals=refusals, error='room_refusal_loop')
+                            return {'status': 'blocked', 'generation': state['generation']}
+                        self.store.archive(state, execution)
+                        state, version = self.save(state, version, phase='idle', room_refusals=refusals,
+                            next_launch_at=int(self.clock()) + ROOM_REFUSAL_DELAY_SECONDS,
+                            last_execution=state['execution'], last_execution_uid=state['execution_uid'])
+                        return {'status': 'replacement_after_room_refusal', 'room_refusals': refusals,
+                                'next_launch_at': state['next_launch_at'], 'generation': state['generation']}
                     failures = state.get('consecutive_failures', 0) + 1
                     if not released or failures >= MAX_CONSECUTIVE_FAILURES:
                         state, version = self.save(state, version, phase='blocked', consecutive_failures=failures,
@@ -477,6 +500,7 @@ class Controller:
                 self.store.archive(state, execution)
                 cleared = {key: value for key, value in state.items() if key != 'error'}
                 state, version = self.save(cleared, version, phase='idle', consecutive_failures=0, quota_parks=0,
+                    room_refusals=0,
                     last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                 continue
             raise ControllerError('unknown_controller_state')
@@ -514,6 +538,6 @@ class Controller:
         drop = {'error', 'next_launch_at'} if parked else {'error'}
         cleared = {key: value for key, value in state.items() if key not in drop}
         state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'],
-                                    consecutive_failures=0, quota_parks=0)
+                                    consecutive_failures=0, quota_parks=0, room_refusals=0)
         cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
         return {'status': 'idle', 'cleared': cleared_code, 'from_phase': phase, 'generation': state['generation']}

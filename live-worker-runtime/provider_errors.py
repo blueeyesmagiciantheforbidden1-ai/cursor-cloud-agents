@@ -17,6 +17,10 @@ SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
 # the controller can park the slot instead of spending retries on it.
 QUOTA_SUFFIX = '_quota_exhausted'
 QUOTA_EXIT_CODE = 75
+# A claimed room was refused before any model call for a reason that depends
+# only on the room; the failure completion was confirmed and the credential
+# released, so the controller relaunches without a strike.
+ROOM_REFUSED_EXIT_CODE = 76
 
 
 class ProviderCodeError(Exception):

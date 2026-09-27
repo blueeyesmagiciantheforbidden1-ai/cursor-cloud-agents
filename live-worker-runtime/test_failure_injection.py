@@ -442,7 +442,8 @@ class FailureInjectionTests(unittest.TestCase):
         self.assertFalse(result2.get('model_call_attempted'))
         self.assertGreaterEqual(adapter2.calls.count('close'), 1)
         self.assertEqual(result2.get('error_code'), 'room_step_changed')
-        self.assertEqual(worker2.last_exit, 1)
+        self.assertEqual(worker2.last_exit, provider_errors.ROOM_REFUSED_EXIT_CODE)
+        self.assertIs(result2.get('room_refused'), True)
         self.assert_no_secret_leak(result1, result2, out1, err1, out2, err2,
                                    self.log_records, logs2, self._logging_records)
 

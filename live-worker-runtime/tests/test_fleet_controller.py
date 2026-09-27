@@ -745,6 +745,7 @@ class FleetReviewTests(unittest.TestCase):
                 {'lastAttemptResult': {'exitCode': 75}}, {'lastAttemptResult': {'exitCode': 75}}]}},
             'missing exitCode': {'tasks': {'tasks': [{'lastAttemptResult': {}}]}},
             'exit 1': {'tasks': {'tasks': [{'lastAttemptResult': {'exitCode': 1}}]}},
+            'exit 77': {'tasks': {'tasks': [{'lastAttemptResult': {'exitCode': 77}}]}},
         }
         for name, setup in cases.items():
             with self.subTest(case=name):
@@ -761,6 +762,67 @@ class FleetReviewTests(unittest.TestCase):
                 self.assertNotIn('quota_parks', store.state)
                 self.assertNotIn('error', store.state)
                 self.assertEqual(cloud.run_count, 1)
+
+    def test_room_refusal_is_not_a_strike(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['consecutive_failures'] = 2
+        archives_before = len(store.archives)
+        self.park_quota(cloud, broker, code=76)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'replacement_after_room_refusal')
+        self.assertEqual(result['room_refusals'], 1)
+        self.assertEqual(result['next_launch_at'], 1060)
+        self.assertEqual(store.state['consecutive_failures'], 2)
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertNotIn('error', store.state)
+        self.assertEqual(len(store.archives), archives_before + 1)
+        self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
+        controller.clock = lambda: 1060
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.assertEqual(cloud.run_count, 2)
+
+    def test_room_refusal_cap_blocks(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['room_refusals'] = 5
+        self.park_quota(cloud, broker, code=76)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'room_refusal_loop')
+        self.assertEqual(store.state['room_refusals'], 6)
+        self.assertEqual(cloud.run_count, 1)
+        cleared = controller.reset()
+        self.assertEqual(cleared['status'], 'idle')
+        self.assertEqual(cleared['cleared'], 'room_refusal_loop')
+        self.assertEqual(store.state['room_refusals'], 0)
+
+    def test_clean_success_clears_room_refusals(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['room_refusals'] = 4
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, succeededCount=1, failedCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.tick()
+        self.assertEqual(store.state['room_refusals'], 0)
+
+    def test_room_refusal_exit_with_unreleased_credential_blocks(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        self.park_quota(cloud, broker, code=76)
+        broker.state.update(phase='leased')
+        result = controller.tick()
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'worker_failed_credential_unreleased')
+        self.assertEqual(store.state['consecutive_failures'], 1)
+        self.assertEqual(store.state.get('room_refusals', 0), 0)
+
+    def test_quota_exit_leaves_room_refusals_untouched(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['room_refusals'] = 3
+        store.state['consecutive_failures'] = 2
+        self.park_quota(cloud, broker)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'provider_quota_parked')
+        self.assertEqual(store.state['room_refusals'], 3)
+        self.assertEqual(store.state['consecutive_failures'], 2)
 
     def test_reset_on_a_parked_slot_clears_the_park(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
