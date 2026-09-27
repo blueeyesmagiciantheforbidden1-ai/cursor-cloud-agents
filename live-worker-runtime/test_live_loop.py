@@ -4451,6 +4451,51 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(len(client.completions), 1)
         self.assertIs(client.completions[0]['model_call_attempted'], False)
 
+    def test_adapter_execute_floor_refusal_skips_execute_pre_model(self):
+        """65 s left under EXECUTE_WARM_FLOOR=75 → no execute, model_call_attempted false."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        adapter.EXECUTE_WARM_FLOOR = 75
+        # remaining after reserve = 90 - 25 = 65; floor 75 refuses before execute.
+        client.task['deadline'] = 700 + 90
+        client.task['timeout_seconds'] = 90
+        # warm_seconds=3600: with 60 the claim-time warm gate (budget 105) drains.
+        worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertNotIn('execute', adapter.calls)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'], 'task_deadline_insufficient')
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertIn('close', adapter.calls)
+
+    def test_adapter_execute_floor_boundary_allows_execute(self):
+        """Exactly 75 s left with EXECUTE_WARM_FLOOR=75 → execute once, completed."""
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        adapter.EXECUTE_WARM_FLOOR = 75
+        client.task['deadline'] = 700 + 100
+        client.task['timeout_seconds'] = 100
+        worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
+                        object(), clock=clock, sleep=clock.sleep)
+        result = worker.run()
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(result['outcome'], 'completed')
+
+    def test_invalid_adapter_execute_floor_values_fall_back_to_five(self):
+        """Non-int / negative / None floors behave as 0; 65 s left clears the 5 s gate."""
+        for floor in (True, -1, 75.0, '75', None):
+            with self.subTest(floor=floor):
+                clock = Clock(); client = Client(clock); adapter = Adapter()
+                adapter.EXECUTE_WARM_FLOOR = floor
+                client.task['deadline'] = 700 + 90
+                client.task['timeout_seconds'] = 90
+                worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
+                                object(), clock=clock, sleep=clock.sleep)
+                result = worker.run()
+                self.assertEqual(adapter.calls.count('execute'), 1)
+                self.assertEqual(result['outcome'], 'completed')
+
     def test_worker_stopping_before_phase_flip_stays_setup(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         beat = {}

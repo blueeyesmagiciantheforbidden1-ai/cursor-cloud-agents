@@ -631,6 +631,109 @@ class CodexLive(unittest.TestCase):
         self.session.broker.quarantine.assert_called()
         self.session.finish.assert_not_called()
 
+    def test_worker_refuses_task_deadline_below_execute_warm_floor(self):
+        """Real codex: loop deadline under EXECUTE_WARM_FLOOR never enters execute."""
+        execute_calls = []
+
+        def execute(handle, prompt, deadline, *, task_kind='project'):
+            execute_calls.append((handle, prompt, deadline, task_kind))
+            return c.execute(handle, prompt, deadline, task_kind=task_kind)
+
+        adapter = SimpleNamespace(
+            prepare=c.prepare, execute=execute, close=c.close, maintain=c.maintain,
+            EXECUTE_WARM_FLOOR=c.EXECUTE_WARM_FLOOR,
+            CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+            CLI_NAME=getattr(c, 'CLI_NAME', None),
+        )
+        hub_deadline = time.time() + 90
+
+        class HubClient:
+            def __init__(self):
+                self.completions = []
+
+            def post(self, path, value):
+                if path.endswith('/claim'):
+                    return {'task': {
+                        'room_id': 'b' * 32, 'lease_token': 'lease', 'workspace': 'default',
+                        'prompt': 'Project task.', 'messages': [], 'timeout_seconds': 90,
+                        'deadline': hub_deadline, 'step': 0, 'learning_context': {},
+                    }}
+                if path.endswith('/heartbeat'):
+                    return {'active': True, 'deadline': hub_deadline, 'server_time': time.time()}
+                if path.endswith('/complete'):
+                    self.completions.append(copy.deepcopy(value))
+                    return {'room_id': 'b' * 32, 'status': 'needs_reconciliation'}
+                return {'accepted': True}
+
+            def get_room(self, room):
+                return {'id': room, 'workspace': 'default', 'prompt': 'Project task.',
+                        'messages': [], 'status': 'running', 'step': 0, 'purpose': 'project'}
+
+        client = HubClient()
+        worker = live_loop.Worker(
+            live_loop.Settings('codex', 'codex-live', warm_seconds=3600),
+            client, adapter, self.session,
+            clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+        result = worker.run()
+        self.assertEqual(execute_calls, [])
+        self.assertEqual(self.prompt_count(), 0)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['error_code'], 'task_deadline_insufficient')
+        self.assertIs(client.completions[0]['model_call_attempted'], False)
+        self.assertEqual(result['error_code'], 'task_deadline_insufficient')
+        self.session.finish.assert_called_once()
+        self.session.broker.quarantine.assert_not_called()
+
+    def test_worker_executes_at_hub_codex_minimum_timeout(self):
+        """Real codex at hub minimum (120 s): execute once and turn/start once."""
+        execute_calls = []
+
+        def execute(handle, prompt, deadline, *, task_kind='project'):
+            execute_calls.append((handle, prompt, deadline, task_kind))
+            return c.execute(handle, prompt, deadline, task_kind=task_kind)
+
+        adapter = SimpleNamespace(
+            prepare=c.prepare, execute=execute, close=c.close, maintain=c.maintain,
+            EXECUTE_WARM_FLOOR=c.EXECUTE_WARM_FLOOR,
+            CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+            CLI_NAME=getattr(c, 'CLI_NAME', None),
+        )
+        hub_deadline = time.time() + 120
+
+        class HubClient:
+            def __init__(self):
+                self.completions = []
+
+            def post(self, path, value):
+                if path.endswith('/claim'):
+                    return {'task': {
+                        'room_id': 'b' * 32, 'lease_token': 'lease', 'workspace': 'default',
+                        'prompt': 'Project task.', 'messages': [], 'timeout_seconds': 120,
+                        'deadline': hub_deadline, 'step': 0, 'learning_context': {},
+                    }}
+                if path.endswith('/heartbeat'):
+                    return {'active': True, 'deadline': hub_deadline, 'server_time': time.time()}
+                if path.endswith('/complete'):
+                    self.completions.append(copy.deepcopy(value))
+                    return {'room_id': 'b' * 32, 'status': 'completed'}
+                return {'accepted': True}
+
+            def get_room(self, room):
+                return {'id': room, 'workspace': 'default', 'prompt': 'Project task.',
+                        'messages': [], 'status': 'running', 'step': 0, 'purpose': 'project'}
+
+        client = HubClient()
+        worker = live_loop.Worker(
+            live_loop.Settings('codex', 'codex-live', warm_seconds=3600),
+            client, adapter, self.session,
+            clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+        result = worker.run()
+        self.assertEqual(len(execute_calls), 1)
+        self.assertEqual(self.prompt_count(), 1)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['exit_code'], 0)
+        self.assertEqual(result.get('outcome'), 'completed')
+
     def _worker_for_included_permission(self, prepare):
         adapter = SimpleNamespace(
             prepare=prepare, execute=c.execute, close=c.close, maintain=c.maintain,

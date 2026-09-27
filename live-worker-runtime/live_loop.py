@@ -1106,16 +1106,19 @@ class Worker:
                     raise LiveError('completion_delivery_uncertain') from None
                 self.sleep(attempt + 1)
 
+    def _adapter_execute_floor(self):
+        """The adapter's EXECUTE_WARM_FLOOR when it is a non-negative int, else 0."""
+        floor = getattr(self.adapter, 'EXECUTE_WARM_FLOOR', 0)
+        return floor if type(floor) is int and floor >= 0 else 0
+
     def _task_budget(self):
         """Warm seconds a claim must still have, or the task dies before the model call.
 
-        checked_deadline withholds completion_reserve and still requires 5s.
-        Providers may add EXECUTE_WARM_FLOOR (codex: the execute() minimum).
+        checked_deadline withholds completion_reserve. The pre-execute floor is
+        max(5, adapter EXECUTE_WARM_FLOOR); providers may raise that floor
+        (codex: the execute() minimum).
         """
-        floor = getattr(self.adapter, 'EXECUTE_WARM_FLOOR', 0)
-        if type(floor) is not int or floor < 0:
-            floor = 0
-        return self.settings.completion_reserve + 5 + floor
+        return self.settings.completion_reserve + 5 + self._adapter_execute_floor()
 
     def _warm_remaining(self, idle_deadline):
         remaining = idle_deadline - self.clock()
@@ -1275,7 +1278,7 @@ class Worker:
                 # LeaseLost/409, active:false, and malformed answers do not.
                 # phase stays 'model_call' across the retry and never goes back
                 # to setup. model_call_attempted flips only after active:true
-                # and a remaining execute floor of 5 s.
+                # and a remaining execute floor of max(5, adapter EXECUTE_WARM_FLOOR).
                 receipt = None
                 ack_at = None
                 for beat_attempt in range(2):
@@ -1328,8 +1331,10 @@ class Worker:
                 require(isinstance(receipt, dict) and receipt.get('active') is True, 'task_lease_lost')
                 self._task_ack_at = ack_at
                 # Ack arrived but too little execute budget remains: fail before
-                # flipping the flag or entering execute.
-                require(deadline - self.clock() >= 5, 'task_deadline_insufficient')
+                # flipping the flag or entering execute. Floor is
+                # max(5, adapter EXECUTE_WARM_FLOOR).
+                require(deadline - self.clock() >= max(5, self._adapter_execute_floor()),
+                        'task_deadline_insufficient')
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:
