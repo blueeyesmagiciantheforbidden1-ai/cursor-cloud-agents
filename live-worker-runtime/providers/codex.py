@@ -463,6 +463,8 @@ def _fail(handle, error):
     else:
         code = str(error) if isinstance(error, (LiveCodexError, transport.TransportError,
             metadata.MetadataError, protocol_gate.GateError)) else ''
+        if code in _CODEX_INCLUDED_USAGE_UNAVAILABLE_CODES:
+            code = 'codex_quota_exhausted'
         code = code if SAFE_CODE.fullmatch(code) else 'codex_live_operation_failed'
     failure = LiveCodexError(code)
     # prompt_attempted flips right before turn/start, so False here provably
@@ -518,6 +520,11 @@ def prepare(session, heartbeat, deadline):
 _CODEX_REFRESH_SEND_CODES = frozenset({
     'native_input_failed', 'native_write_deadline',
     'native_short_write_invalid', 'native_request_limit',
+})
+# Pre-prompt included-usage refusals park the slot just like idle refresh.
+_CODEX_INCLUDED_USAGE_UNAVAILABLE_CODES = frozenset({
+    'included_usage_unavailable_credit_integration_required',
+    'included_usage_unavailable',
 })
 
 

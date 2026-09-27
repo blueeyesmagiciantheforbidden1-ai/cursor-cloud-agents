@@ -357,14 +357,75 @@ class CodexLive(unittest.TestCase):
         self.assertEqual(handle.state, 'closed')
 
     def test_native_included_permission_is_required_and_no_credits_are_consumed(self):
-        handle = self.prepare()
-        self.native.rates['ordinaryUsageAllowed'] = False
-        with self.assertRaises(c.LiveCodexError):
-            c.execute(handle, 'Project task.', time.monotonic() + 180)
-        self.assertEqual(self.prompt_count(), 0)
-        self.assertEqual(self.session.finish.call_count, 1)
-        self.assertTrue(all(r['method'] not in ('account/rateLimitResetCredit/consume', 'account/login/start')
-                            for r in self.native.requests))
+        for permission in (False, None, 'missing'):
+            with self.subTest(permission=permission):
+                self._fresh_session()
+                handle = self.prepare()
+                if permission == 'missing':
+                    self.native.rates.pop('ordinaryUsageAllowed')
+                else:
+                    self.native.rates['ordinaryUsageAllowed'] = permission
+                with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_exhausted$') as caught:
+                    c.execute(handle, 'Project task.', time.monotonic() + 180)
+                self.assertIs(caught.exception.model_call_attempted, False)
+                self.assertTrue(c.provider_errors.is_quota(str(caught.exception)))
+                self.assertEqual(self.prompt_count(), 0)
+                self.assertEqual(self.session.finish.call_count, 1)
+                self.assertTrue(all(r['method'] not in (
+                    'account/rateLimitResetCredit/consume', 'account/login/start')
+                    for r in self.native.requests))
+
+    def test_prepare_without_included_permission_raises_quota_before_thread_start(self):
+        self.mutate = lambda native: native.rates.__setitem__('ordinaryUsageAllowed', False)
+        with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_exhausted$') as caught:
+            self.prepare()
+        self.assertIs(caught.exception.model_call_attempted, False)
+        self.assertTrue(c.provider_errors.is_quota(str(caught.exception)))
+        self.assertFalse(any(r['method'] in ('thread/start', 'turn/start')
+                             for r in self.native.requests))
+        self.session.finish.assert_called_once()
+        self.session.broker.quarantine.assert_not_called()
+
+    def test_fail_maps_both_vetted_included_usage_codes_to_quota(self):
+        errors = (
+            c.LiveCodexError('included_usage_unavailable'),
+            c.protocol_gate.GateError('included_usage_unavailable_credit_integration_required'),
+        )
+        for error in errors:
+            with self.subTest(code=str(error)):
+                self._fresh_session()
+                handle = self.prepare()
+                with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_exhausted$') as caught:
+                    c._fail(handle, error)
+                self.assertIs(caught.exception.model_call_attempted, False)
+                self.assertEqual(caught.exception.credential_writeback, 'committed')
+                self.assertTrue(c.provider_errors.is_quota(str(caught.exception)))
+                self.assertEqual(self.prompt_count(), 0)
+                self.session.finish.assert_called_once()
+                self.session.broker.quarantine.assert_not_called()
+
+    def test_fail_preserves_unmapped_codes_and_rejects_unvetted_quota_strings(self):
+        cases = (
+            (RuntimeError('included_usage_unavailable'), 'codex_live_operation_failed'),
+            (RuntimeError('included_usage_unavailable_credit_integration_required'),
+             'codex_live_operation_failed'),
+            (c.LiveCodexError('included_quota_exhausted'), 'included_quota_exhausted'),
+            (c.protocol_gate.GateError('included_usage_unavailable_credit_integration_required_extra'),
+             'included_usage_unavailable_credit_integration_required_extra'),
+        )
+        for error, expected in cases:
+            with self.subTest(error_type=type(error).__name__, code=str(error)):
+                self._fresh_session()
+                handle = self.prepare()
+                with self.assertRaisesRegex(c.LiveCodexError, '^' + expected + '$') as caught:
+                    c._fail(handle, error)
+                self.assertEqual(c.provider_errors.is_quota(str(caught.exception)),
+                                 expected == 'included_quota_exhausted')
+                self.assertIs(caught.exception.model_call_attempted, False)
+                self.assertEqual(caught.exception.credential_writeback, 'committed')
+                self.assertEqual(self.prompt_count(), 0)
+                self.session.finish.assert_called_once()
+                self.session.broker.quarantine.assert_not_called()
 
     def test_owner_change_during_idle_quarantines_without_committing_changed_credentials(self):
         handle = self.prepare()
@@ -449,15 +510,21 @@ class CodexLive(unittest.TestCase):
     def test_catalog_drift_blocks_prompt_without_lower_model_fallback(self):
         handle = self.prepare()
         self.native.catalog[0]['supportedReasoningEfforts'] = [{'reasoningEffort': 'high'}]
-        with self.assertRaises(c.LiveCodexError):
+        with self.assertRaisesRegex(c.LiveCodexError, '^highest_supported_effort_required$') as caught:
             c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertNotEqual(str(caught.exception), 'codex_quota_exhausted')
+        self.assertFalse(c.provider_errors.is_quota(str(caught.exception)))
+        self.assertIs(caught.exception.model_call_attempted, False)
         self.assertEqual(self.prompt_count(), 0)
 
     def test_effective_config_change_blocks_prompt(self):
         handle = self.prepare()
         self.native.config['forced_login_method'] = 'api'
-        with self.assertRaises(c.LiveCodexError):
+        with self.assertRaisesRegex(c.LiveCodexError, '^effective_config_mismatch$') as caught:
             c.execute(handle, 'Project task.', time.monotonic() + 180)
+        self.assertNotEqual(str(caught.exception), 'codex_quota_exhausted')
+        self.assertFalse(c.provider_errors.is_quota(str(caught.exception)))
+        self.assertIs(caught.exception.model_call_attempted, False)
         self.assertEqual(self.prompt_count(), 0)
 
     def test_signed_out_account_before_prompt_preserves_identity_auth_code(self):
@@ -546,6 +613,82 @@ class CodexLive(unittest.TestCase):
         self.assertEqual(result['credential_cleanup'], 'failed')
         self.session.broker.quarantine.assert_called()
         self.session.finish.assert_not_called()
+
+    def _worker_for_included_permission(self, prepare):
+        adapter = SimpleNamespace(
+            prepare=prepare, execute=c.execute, close=c.close, maintain=c.maintain,
+            CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+            CLI_NAME=getattr(c, 'CLI_NAME', None),
+        )
+        hub_deadline = time.time() + 600
+
+        class HubClient:
+            def __init__(self):
+                self.claims = []
+                self.completions = []
+
+            def post(self, path, value):
+                if path.endswith('/claim'):
+                    self.claims.append(copy.deepcopy(value))
+                    return {'task': {
+                        'room_id': 'b' * 32, 'lease_token': 'lease', 'workspace': 'default',
+                        'prompt': 'Project task.', 'messages': [], 'timeout_seconds': 300,
+                        'deadline': hub_deadline, 'step': 0, 'learning_context': {},
+                    }}
+                if path.endswith('/heartbeat'):
+                    return {'active': True, 'deadline': hub_deadline, 'server_time': time.time()}
+                if path.endswith('/complete'):
+                    self.completions.append(copy.deepcopy(value))
+                    return {'room_id': 'b' * 32, 'status': 'blocked_on_provider'}
+                return {'accepted': True}
+
+            def get_room(self, room):
+                return {'id': room, 'workspace': 'default', 'prompt': 'Project task.',
+                        'messages': [], 'status': 'running', 'step': 0, 'purpose': 'project'}
+
+        client = HubClient()
+        worker = live_loop.Worker(
+            live_loop.Settings('codex', 'codex-live', warm_seconds=60),
+            client, adapter, self.session,
+            clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+        return worker, client
+
+    def test_worker_prepare_without_included_permission_parks_without_claim(self):
+        self.mutate = lambda native: native.rates.__setitem__('ordinaryUsageAllowed', False)
+        worker, client = self._worker_for_included_permission(c.prepare)
+        result = worker.run()
+        self.assertEqual(result['error_code'], 'codex_quota_exhausted')
+        self.assertIs(result['provider_quota_exhausted'], True)
+        self.assertEqual(worker.last_exit, c.provider_errors.QUOTA_EXIT_CODE)
+        self.assertEqual(live_loop.finish_exit('codex', result, worker.last_exit, io.StringIO()), 75)
+        self.assertEqual(client.claims, [])
+        self.assertEqual(client.completions, [])
+        self.assertEqual(self.prompt_count(), 0)
+        self.session.finish.assert_called_once()
+        self.session.broker.quarantine.assert_not_called()
+
+    def test_worker_execute_without_included_permission_completes_as_quota_and_parks(self):
+        real_prepare = c.prepare
+
+        def prepare(session, heartbeat, deadline):
+            handle = real_prepare(session, heartbeat, deadline)
+            self.native.rates['ordinaryUsageAllowed'] = False
+            return handle
+
+        worker, client = self._worker_for_included_permission(prepare)
+        result = worker.run()
+        self.assertEqual(len(client.completions), 1)
+        completion = client.completions[0]
+        self.assertEqual(completion['error_code'], 'codex_quota_exhausted')
+        self.assertEqual(completion['exit_code'], 1)
+        self.assertIn('usage limit is exhausted (codex_quota_exhausted)', completion['output'])
+        # The loop keeps its conservative flag; the hub ranks the quota suffix first.
+        self.assertIs(completion['model_call_attempted'], True)
+        self.assertEqual(self.prompt_count(), 0)
+        self.assertEqual(worker.last_exit, 75)
+        self.assertIs(result['provider_quota_exhausted'], True)
+        self.session.finish.assert_called_once()
+        self.session.broker.quarantine.assert_not_called()
 
     def test_unknown_turn_response_remains_uncertain_and_is_never_replayed(self):
         handle = self.prepare(); self.native.fail_prompt = True
@@ -1092,6 +1235,23 @@ class CodexLive(unittest.TestCase):
             handle.native.next_renew = clock() + 10000
             handle.next_quota_refresh = clock()
             self.native.rates = rates(100)
+            with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_exhausted$') as caught:
+                c.maintain(handle)
+            self.assertTrue(c.provider_errors.is_quota(str(caught.exception)))
+            self.assertEqual(live_loop.maintain_fault(caught.exception), 'fail')
+            self.assertNotEqual(handle.state, 'ready')
+            self.assertEqual(handle.credential_writeback, 'committed')
+
+    def test_quota_refresh_without_included_permission_raises_quota_park(self):
+        clock = StepClock()
+        with patch('time.monotonic', clock):
+            handle = self.prepare()
+            bind_lease_clock(handle, clock)
+            handle.next_renew = clock() + 10000
+            handle.native.next_renew = clock() + 10000
+            handle.next_quota_refresh = clock()
+            self.native.rates = rates(12)
+            self.native.rates['ordinaryUsageAllowed'] = False
             with self.assertRaisesRegex(c.LiveCodexError, '^codex_quota_exhausted$') as caught:
                 c.maintain(handle)
             self.assertTrue(c.provider_errors.is_quota(str(caught.exception)))
