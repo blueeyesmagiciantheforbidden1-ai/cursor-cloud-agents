@@ -867,7 +867,12 @@ class Worker:
         Entrypoint hands the active lease to Worker at construction; entrypoint's
         finally only finishes when worker is None. An interrupt during the first
         report(force=True) (before prepare) must still release the lease here.
-        prepare()'s own cleanup leaves session non-active, so this is a no-op then.
+
+        prepare() cleanup is not always a no-op here: an adapter may already have
+        quarantined the lease (for example prepare sign-out where ``_close`` fails
+        its owner check) while ``session.state`` still reads ``active``. finish is
+        then refused; the quarantine fallback with ``provider_refresh_uncertain``
+        is harmless because the broker keeps the first quarantine reason.
 
         Returns None when there was nothing to release, else 'released',
         'quarantined' or 'failed' (the same value on a repeat call). Only a

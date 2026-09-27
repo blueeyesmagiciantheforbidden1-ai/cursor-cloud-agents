@@ -689,6 +689,118 @@ class CodexLive(unittest.TestCase):
                 self.assertFalse(any(r['method'] == 'thread/start' for r in self.native.requests))
                 self.session.broker.quarantine.assert_called()
 
+    def test_worker_prepare_sign_out_double_quarantine_keeps_adapter_reason(self):
+        """Signed-out prepare: adapter quarantines while session stays active; first reason wins.
+
+        Real Worker + codex adapter prepare. Sign-out leaves owner_verified false so
+        close fails the owner check and quarantines; session.state remains 'active'.
+        Fake broker mirrors cloud_credential_broker (keeps first reason, refuses
+        finish after quarantine). Production _close also uses
+        provider_refresh_uncertain; this pin uses a distinct adapter reason so the
+        unprepared-release fallback cannot hide a overwrite.
+        """
+        self._fresh_session()
+        self.mutate = lambda native: setattr(
+            native, 'account', {'requiresOpenaiAuth': True, 'account': None})
+
+        adapter_reason = 'writeback_uncertain'
+        quarantine_calls = []
+        writes = []
+        phase = {'value': 'leased', 'reason': ''}
+
+        def quarantine(lease, reason):
+            quarantine_calls.append(reason)
+            if phase['value'] == 'quarantined':
+                return
+            phase['value'] = 'quarantined'
+            phase['reason'] = reason
+            writes.append(reason)
+
+        def finish(*, native_stopped):
+            self.assertIs(native_stopped, True)
+            if phase['value'] == 'quarantined':
+                raise BrokerError('credential_lease_not_active')
+            raise AssertionError('finish expected a quarantined broker')
+
+        def close_failing_owner_check(handle):
+            """Same owner-check failure path as codex._close; distinct quarantine reason."""
+            if handle.state == 'closed':
+                return
+            if handle.state == 'quarantined':
+                raise c.LiveCodexError('credential_reconciliation_required')
+            handle.state = 'closing'
+            try:
+                if handle.native is not None:
+                    handle.native.stop_group()
+                    handle.native_stopped = True
+                if not (handle.native_stopped and handle.owner_verified):
+                    raise c.LiveCodexError('verified_native_owner_and_stop_required')
+                version = handle.session.finish(native_stopped=True)
+                handle.credential_version_ref = c.hashlib.sha256(version.encode()).hexdigest()
+                handle.credential_writeback = 'committed'
+                handle.state = 'closed'
+            except Exception:
+                handle.state = 'quarantined'
+                handle.credential_writeback = 'uncertain'
+                try:
+                    handle.session.broker.quarantine(handle.session.lease, adapter_reason)
+                except Exception:
+                    pass
+                raise c.LiveCodexError('credential_reconciliation_required') from None
+
+        lease = self.session.lease
+        self.session.broker = SimpleNamespace(
+            execution=lease.execution, execution_uid=lease.execution_uid,
+            assert_current=Mock(), renew=Mock(), quarantine=quarantine)
+        self.session.finish = finish
+        self.session.state = 'active'
+
+        adapter = SimpleNamespace(
+            prepare=c.prepare, execute=c.execute, close=c.close, maintain=c.maintain,
+            CLI_EXECUTABLE=getattr(c, 'CLI_EXECUTABLE', None),
+            CLI_NAME=getattr(c, 'CLI_NAME', None),
+        )
+
+        class HubClient:
+            def __init__(self):
+                self.posts = []
+
+            def post(self, path, value):
+                self.posts.append((path, copy.deepcopy(value)))
+                if path.endswith('/claim') or path.endswith('/complete'):
+                    raise AssertionError('unexpected hub path: ' + path)
+                return {'accepted': True}
+
+            def get_room(self, room):
+                raise AssertionError('unexpected get_room')
+
+        client = HubClient()
+        with patch.object(c, '_close', close_failing_owner_check):
+            worker = live_loop.Worker(
+                live_loop.Settings('codex', 'codex-live', warm_seconds=60),
+                client, adapter, self.session,
+                clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
+            result = worker.run()
+
+        self.assertEqual(writes, [adapter_reason])
+        self.assertEqual(phase['reason'], adapter_reason)
+        self.assertNotEqual(phase['reason'], 'provider_refresh_uncertain')
+        self.assertGreaterEqual(len(quarantine_calls), 2)
+        self.assertEqual(quarantine_calls[0], adapter_reason)
+        self.assertEqual(quarantine_calls[-1], 'provider_refresh_uncertain')
+        self.assertEqual(result.get('credential_cleanup'), 'failed')
+        self.assertEqual(
+            live_loop.finish_exit('codex', result, worker.last_exit, io.StringIO()), 1)
+        self.assertEqual(result['error_code'], 'native_subscription_identity_required')
+        self.assertIs(result['auth_failed'], True)
+        self.assertFalse(any(p.endswith('/claim') or p.endswith('/complete')
+                             for p, _ in client.posts))
+        reports = [v for p, v in client.posts if p.endswith('/report')]
+        self.assertTrue(reports)
+        self.assertEqual(reports[-1]['auth_status'], 'failed')
+        self.assertEqual(self.session.state, 'active')
+        self.assertIsNone(worker.handle)
+
     def test_worker_malformed_account_status_at_prepare_is_not_failed_auth(self):
         self._fresh_session()
         self.mutate = lambda native: setattr(native, 'account', 'not-a-dict')

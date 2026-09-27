@@ -905,6 +905,25 @@ class BrokerTests(unittest.TestCase):
         self.assertBlocked(lambda: self.acquire())
         self.assertEqual(self.wire.state['phase'], 'quarantined')
 
+    def test_second_quarantine_keeps_first_reason_and_refuses_release(self):
+        """Idempotent quarantine: first reason wins; release after quarantine is refused."""
+        lease = self.acquire()
+        self.broker.quarantine(lease, 'writeback_uncertain')
+        self.assertEqual(self.wire.state['phase'], 'quarantined')
+        self.assertEqual(self.wire.state['quarantine_reason'], 'writeback_uncertain')
+        revision = self.wire.revision
+        writes_before = sum(1 for method, host, _ in self.wire.calls
+                            if method == 'POST' and host == 'firestore.googleapis.com')
+        self.broker.quarantine(lease, 'provider_refresh_uncertain')
+        self.assertEqual(self.wire.state['phase'], 'quarantined')
+        self.assertEqual(self.wire.state['quarantine_reason'], 'writeback_uncertain')
+        self.assertEqual(self.wire.revision, revision)
+        writes_after = sum(1 for method, host, _ in self.wire.calls
+                           if method == 'POST' and host == 'firestore.googleapis.com')
+        self.assertEqual(writes_after, writes_before)
+        with self.assertRaisesRegex(cb.BrokerError, '^durable_commit_required_before_release$'):
+            self.broker.release(lease, lease.version)
+
     def test_backend_identity_mismatch_prevents_secret_access(self):
         self.wire.state['canonical_account_ref'] = 'd' * 64
         self.assertBlocked(lambda: self.acquire())
