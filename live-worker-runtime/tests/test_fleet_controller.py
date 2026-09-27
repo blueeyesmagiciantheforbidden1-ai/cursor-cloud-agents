@@ -795,6 +795,9 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
         self.assertEqual(store.state['room_refusals'][-1], 1000)
         self.assertEqual(cloud.run_count, 1)
+        # The self-clearing block keeps the generation's receipt (Light on T142).
+        self.assertEqual(len(store.archives), 1)
+        self.assertEqual(store.archives[0][0]['execution'], store.state['execution'])
         cleared = controller.reset()
         self.assertEqual(cleared['status'], 'idle')
         self.assertEqual(cleared['cleared'], 'room_refusal_loop')

@@ -511,8 +511,11 @@ class Controller:
                         refusals = prune_room_refusals(state.get('room_refusals'), now)
                         refusals = prune_room_refusals(refusals + [now], now)
                         if len(refusals) >= MAX_ROOM_REFUSALS:
-                            # Same as the strike block path: leave the execution
-                            # in place; do not archive.
+                            # Archive now: this block clears itself by ageing,
+                            # so no operator may read the live state before the
+                            # next launch replaces it (the strike block waits
+                            # for an operator and keeps today's behaviour).
+                            self.store.archive(state, execution)
                             state, version = self.save(state, version, phase='blocked',
                                 room_refusals=refusals, error='room_refusal_loop')
                             return {'status': 'blocked', 'generation': state['generation']}
