@@ -531,8 +531,8 @@ class Worker:
         self.interrupted = False
         self.next_report = 0.0
         self.last_exit = None
-        # Set only when the hub itself answered that this task lease is no
-        # longer active; the hub refuses a completion for it.
+        # Skip completion when the hub reports an inactive lease, or an old
+        # hub's 409 does not say whether the expired lease is still completable.
         self.lease_revoked = False
         # A completion HTTP 409 is a final refusal, not uncertain delivery.
         self.completion_refused = False
@@ -717,9 +717,11 @@ class Worker:
                 try:
                     receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
                                                self._heartbeat_body(self.task))
-                except LeaseLost:
-                    # Match the pre-execute model_call heartbeat's lease-loss rule.
-                    self.lease_revoked = True
+                except LeaseLost as error:
+                    # Stop the call in every case. A retained expired lease can
+                    # still accept the existing failure completion; preserve
+                    # the actual phase and model_call_attempted for that path.
+                    self.lease_revoked = error.reason != 'lease_expired_completable'
                     return False
                 if not isinstance(receipt, dict) or receipt.get('active') is not True:
                     self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
@@ -981,7 +983,9 @@ class Worker:
                         # endpoint 409. Do not infer lease loss from HTTP 409
                         # in an arbitrary cause (e.g. metadata identity refresh).
                         if isinstance(error, LeaseLost):
-                            self.lease_revoked = True
+                            # A retained lease gets one failure completion with
+                            # model_call_attempted=False: execute never started.
+                            self.lease_revoked = error.reason != 'lease_expired_completable'
                             raise LiveError('task_lease_lost') from error
                         if beat_attempt == 0 and is_task_heartbeat_transport_error(error):
                             delay = 1
@@ -1005,9 +1009,9 @@ class Worker:
                     break
                 if isinstance(receipt, dict) and receipt.get('active') is False:
                     self.lease_revoked = True
-                # Same path as checked_deadline: task_lease_lost; lease_revoked
+                # Same path as checked_deadline: task_lease_lost; active:false
                 # skips completion. model_call_attempted is False here — the hub
-                # never confirmed model_call (or revoked the lease) and execute
+                # never confirmed model_call and execute
                 # was never entered. Transport errors from post raise before the
                 # flag flips for the same reason.
                 # If this fails, phase stays 'model_call' on purpose: the beat
@@ -1098,8 +1102,9 @@ class Worker:
             if self.completion_payload is not None:
                 outcome['completion_delivery'] = 'refused' if self.completion_refused else 'unconfirmed'
             elif self.lease_revoked:
-                # The hub revoked this lease; a completion for it would be
-                # refused with 409. Its own expiry path records it.
+                # Inactive leases are refused; old hubs send no reason, so keep
+                # their conservative skip. Only an explicit completable reason
+                # takes the failure-completion path below.
                 outcome['completion_delivery'] = 'skipped_lease_revoked'
             elif self.cleaned and self.task and isinstance(self.task, dict) and re.fullmatch(r'[a-f0-9]{32}', self.task.get('room_id', '')):
                 if quota:

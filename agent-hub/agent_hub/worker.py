@@ -45,7 +45,9 @@ class WorkerError(RuntimeError):
 
 
 class LeaseLost(WorkerError):
-    pass
+    def __init__(self, message: str, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -291,7 +293,24 @@ class HubClient:
                 break
             except HTTPError as exc:
                 if exc.code == 409:
-                    raise LeaseLost("The hub revoked or expired this task lease") from exc
+                    reason = None
+                    try:
+                        encoded_error = exc.read(4097)
+                        if len(encoded_error) <= 4096:
+                            error = json.loads(encoded_error)
+                            if (isinstance(error, dict)
+                                    and error.get('reason') in (
+                                        'lease_expired_completable', 'lease_inactive')):
+                                reason = error['reason']
+                    except Exception:
+                        # Advisory metadata must never mask the lease refusal.
+                        pass
+                    finally:
+                        try:
+                            exc.close()
+                        except Exception:
+                            pass
+                    raise LeaseLost("The hub revoked or expired this task lease", reason=reason) from exc
                 if google_auth and exc.code in (401, 403):
                     self.identity_expires = 0
                     self.identity_token = None

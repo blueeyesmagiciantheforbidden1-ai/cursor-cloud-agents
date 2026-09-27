@@ -6,6 +6,7 @@ agent_hub import so the vendored pre-F4 hub on PYTHONPATH cannot win.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -410,13 +411,9 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertFalse(raw.get('rejected_outputs'))
         self.assertFalse(raw.get('completion_rejections'))
 
-    def test_7_expired_lease_mid_call_skips_a_completable_failure(self):
-        """Worker-side asserts flip once the heartbeat 409 carries a machine code."""
-        import provider_errors
-
+    def recording_client(self, *, without_reason=False):
+        from agent_hub.worker import LeaseLost
         case = self
-        room = self.create_room(recovery='manual')
-        beats = []
 
         class RecordingClient(HubClient):
             def __init__(self):
@@ -424,6 +421,7 @@ class F4HubE2ETests(unittest.TestCase):
                                         'F4_E2E_TOKEN', {}))
                 self.opener = build_opener(ProxyHandler({}))
                 self.paths = []
+                self.lease_reasons = []
                 self.reader = LoopbackClient(case.base, case.tokens[case.agent], case.agent)
 
             def get_room(self, room_id):
@@ -431,7 +429,38 @@ class F4HubE2ETests(unittest.TestCase):
 
             def post(self, path, value):
                 self.paths.append((path, dict(value)))
-                return super().post(path, value)
+                try:
+                    return super().post(path, value)
+                except LeaseLost as error:
+                    self.lease_reasons.append(error.reason)
+                    raise
+
+        client = RecordingClient()
+        if without_reason:
+            opener = client.opener
+
+            class OldHubOpener:
+                def open(self, request, **kwargs):
+                    try:
+                        return opener.open(request, **kwargs)
+                    except HTTPError as error:
+                        if error.code != 409:
+                            raise
+                        # Simulate the old hub's wire response. The real new
+                        # HubClient must parse this absent reason as None.
+                        with error:
+                            body = json.loads(error.read().decode('utf-8'))
+                        body.pop('reason', None)
+                        raise HTTPError(error.url, error.code, error.msg, error.headers,
+                                        io.BytesIO(json.dumps(body).encode('utf-8'))) from error
+
+            client.opener = OldHubOpener()
+        return client
+
+    def run_expired_mid_call(self, room, *, client=None):
+        import provider_errors
+        case = self
+        beats = []
 
         class TickError(provider_errors.ProviderCodeError, RuntimeError):
             pass
@@ -452,50 +481,44 @@ class F4HubE2ETests(unittest.TestCase):
                     raise TickError('grok_hub_heartbeat_lost')
                 raise AssertionError('lease expiry did not stop the call')
 
-        client = RecordingClient()
+        client = client or self.recording_client()
         result, adapter = self.run_worker(client=client, adapter=ExpiryAdapter())
         self.assertEqual(beats, [True, False])
         self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
         self.assertIs(result['model_call_attempted'], True)
-        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
-        self.assertFalse(any(path.endswith('/complete') for path, _ in client.paths))
+        self.assertEqual(adapter.calls.count('execute'), 1)
         self.assertEqual(adapter.calls.count('close'), 1)
+        return result, client
 
+    def test_7_expired_lease_mid_call_completes_one_failure(self):
+        room = self.create_room(recovery='manual')
+        result, client = self.run_expired_mid_call(room)
+        self.assertNotIn('completion_delivery', result)
+        self.assertTrue(client.lease_reasons)
+        self.assertEqual(set(client.lease_reasons), {'lease_expired_completable'})
+        completions = [value for path, value in client.paths if path.endswith('/complete')]
+        self.assertEqual(len(completions), 1)
+        completion = completions[0]
+        self.assertEqual(completion['exit_code'], 1)
+        self.assertEqual(completion['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertIs(completion['model_call_attempted'], True)
         raw = self.raw(room['id'])
         self.assertEqual(raw['status'], 'needs_reconciliation')
-        self.assertEqual(raw['failure_reason'], 'lease')
-        self.assertIsNotNone(raw['lease'])
+        self.assertEqual(raw['failure_reason'], 'post_model')
+        self.assertIsNone(raw['lease'])
         heartbeat_bodies = [value for path, value in client.paths
                             if path.endswith('/heartbeat')]
         self.assertTrue(heartbeat_bodies)
         token = heartbeat_bodies[0]['lease_token']
         self.assertTrue(all(value['lease_token'] == token for value in heartbeat_bodies))
-        self.assertEqual(raw['lease']['token'], token)
-        record = raw['attempt_records'][-1]
-        self.assertEqual(record['outcome'], 'lease_expired')
-        self.assertEqual(record['failure_class'], 'lease_expired')
-        self.assertEqual(record['last_phase'], 'model_call')
-        for key in ('exit_code', 'error_code', 'model_call_attempted'):
-            self.assertNotIn(key, record)
-        self.assertFalse(raw.get('rejected_outputs'))
-
+        self.assertEqual(completion['lease_token'], token)
         output = ('The cloud worker stopped before it could deliver a verified answer '
                   '(grok_hub_heartbeat_lost). It did not automatically repeat the model request.')
-        receipt = client.post('/v1/tasks/' + room['id'] + '/complete', {
-            'lease_token': token,
-            'output': output,
-            'exit_code': 1,
-            'step': 0,
-            'error_code': 'grok_hub_heartbeat_lost',
-            'model_call_attempted': True,
-        })
-        self.assertEqual(receipt, {'room_id': room['id'], 'status': 'needs_reconciliation'})
-        raw = self.raw(room['id'])
-        self.assertIsNone(raw['lease'])
-        self.assertEqual(raw['failure_reason'], 'post_model')
+        self.assertEqual(completion['output'], output)
         record = raw['attempt_records'][-1]
         self.assertEqual(record['outcome'], 'failed')
         self.assertEqual(record['failure_class'], 'post_model')
+        self.assertEqual(record['last_phase'], 'model_call')
         self.assertEqual(record['exit_code'], 1)
         self.assertEqual(record['error_code'], 'grok_hub_heartbeat_lost')
         self.assertIs(record['model_call_attempted'], True)
@@ -504,6 +527,100 @@ class F4HubE2ETests(unittest.TestCase):
         self.assertEqual(raw['rejected_outputs'][0]['exit_code'], 1)
         self.assertEqual(raw['rejected_outputs'][0]['step'], 0)
         self.assertEqual(raw['rejected_outputs'][0]['full_text'], output)
+        self.assertEqual(raw['messages'], [])
+
+        manager = LoopbackClient(self.base, self.tokens['manager'], 'manager')
+        with self.assertRaises(OSError) as refused:
+            manager.post('/v1/rooms/' + room['id'] + '/retry', {})
+        self.assertEqual(refused.exception.__cause__.code, 409)
+        self.assertIn('post_model output cannot be retried unless force is true', str(refused.exception))
+        manager.post('/v1/rooms/' + room['id'] + '/retry', {'force': True})
+        self.assertTrue(self.raw(room['id'])['retry_audit'][-1]['force'])
+
+    def test_7b_old_hub_409_without_reason_keeps_the_skip(self):
+        room = self.create_room(recovery='manual')
+        client = self.recording_client(without_reason=True)
+        result, client = self.run_expired_mid_call(room, client=client)
+        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+        self.assertTrue(client.lease_reasons)
+        self.assertEqual(set(client.lease_reasons), {None})
+        self.assertFalse(any(path.endswith('/complete') for path, _ in client.paths))
+        raw = self.raw(room['id'])
+        self.assertEqual(raw['status'], 'needs_reconciliation')
+        self.assertEqual(raw['failure_reason'], 'lease')
+        self.assertIsNotNone(raw['lease'])
+        record = raw['attempt_records'][-1]
+        self.assertEqual(record['outcome'], 'lease_expired')
+        self.assertEqual(record['failure_class'], 'lease_expired')
+        self.assertEqual(record['last_phase'], 'model_call')
+        for key in ('exit_code', 'error_code', 'model_call_attempted'):
+            self.assertNotIn(key, record)
+        self.assertFalse(raw.get('rejected_outputs'))
+
+    def test_7c_expired_pre_execute_lease_completes_one_pre_model_failure(self):
+        room = self.create_room(recovery='manual')
+        client = self.recording_client()
+        original = client.post
+        expired = False
+
+        def post(path, value):
+            nonlocal expired
+            if not expired and path.endswith('/heartbeat') and value.get('phase') == 'model_call':
+                expired = True
+                self.now += LEASE_SECONDS + 1
+            return original(path, value)
+
+        client.post = post
+        result, adapter = self.run_worker(client=client)
+        self.assertNotIn('execute', adapter.calls)
+        self.assertEqual(adapter.calls.count('close'), 1)
+        self.assertEqual(result['error_code'], 'task_lease_lost')
+        self.assertIs(result['model_call_attempted'], False)
+        self.assertNotIn('completion_delivery', result)
+        self.assertTrue(client.lease_reasons)
+        self.assertEqual(set(client.lease_reasons), {'lease_expired_completable'})
+        completions = [value for path, value in client.paths if path.endswith('/complete')]
+        self.assertEqual(len(completions), 1)
+        self.assertEqual(completions[0]['exit_code'], 1)
+        self.assertEqual(completions[0]['error_code'], 'task_lease_lost')
+        self.assertIs(completions[0]['model_call_attempted'], False)
+        raw = self.raw(room['id'])
+        self.assertEqual(raw['status'], 'retry_scheduled')
+        self.assertIsNone(raw['lease'])
+        self.assertEqual(len(raw['attempt_records']), 1)
+        record = raw['attempt_records'][-1]
+        self.assertEqual(record['failure_class'], 'pre_model')
+        self.assertEqual(record['last_phase'], 'setup')
+        self.assertEqual(record['exit_code'], 1)
+        self.assertEqual(record['error_code'], 'task_lease_lost')
+        self.assertIs(record['model_call_attempted'], False)
+        self.assertIn('expired_first', record)
+
+    def test_7d_completion_409_after_completable_heartbeat_is_final(self):
+        room = self.create_room(recovery='manual')
+        client = self.recording_client()
+        original = client.post
+
+        def post(path, value):
+            if path.endswith('/complete'):
+                self.hub.cancel('manager', room['id'])
+            return original(path, value)
+
+        client.post = post
+        result, client = self.run_expired_mid_call(room, client=client)
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertIn('lease_expired_completable', client.lease_reasons)
+        self.assertEqual(client.lease_reasons[-1], 'lease_inactive')
+        completions = [value for path, value in client.paths if path.endswith('/complete')]
+        self.assertEqual(len(completions), 1)
+        self.assertEqual(completions[0]['exit_code'], 1)
+        self.assertEqual(completions[0]['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertIs(completions[0]['model_call_attempted'], True)
+        raw = self.raw(room['id'])
+        self.assertEqual(raw['status'], 'cancelled')
+        self.assertIsNone(raw['lease'])
+        self.assertFalse(raw.get('completed_leases'))
+        self.assertFalse(raw.get('rejected_outputs'))
         self.assertEqual(raw['messages'], [])
 
     def test_7_lost_complete_reply_next_agent_claimed_counts_as_delivered(self):

@@ -2516,7 +2516,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(phases, sorted(phases, key=HUB_PHASES.index))
         return result, phases, client
 
-    def _run_mid_call_hub_error(self, kind):
+    def _run_mid_call_hub_error(self, kind, *, reason=None, refuse_completion=False):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         beat = {}
         cancelled = False
@@ -2536,7 +2536,11 @@ class HeartbeatPhaseTests(unittest.TestCase):
         def post(path, value):
             if cancelled and path.endswith('/heartbeat'):
                 client.calls.append((path, copy.deepcopy(value)))
-                raise self._hub_shaped_error(kind)
+                raise self._hub_shaped_error(kind, reason=reason)
+            if refuse_completion and path.endswith('/complete'):
+                client.calls.append((path, copy.deepcopy(value)))
+                client.completions.append(copy.deepcopy(value))
+                raise self._hub_shaped_error(409, reason=reason)
             return original(path, value)
 
         adapter.prepare, adapter.execute = prepare, execute
@@ -2545,16 +2549,49 @@ class HeartbeatPhaseTests(unittest.TestCase):
                         object(), clock=clock, sleep=clock.sleep)
         return worker.run(), worker, client, adapter
 
-    def test_lease_lost_mid_call_skips_the_completion(self):
-        result, worker, client, adapter = self._run_mid_call_hub_error(409)
-        self.assertIs(worker.lease_revoked, True)
+    def test_inactive_or_old_hub_lease_lost_mid_call_skips_the_completion(self):
+        for reason in (None, 'lease_inactive'):
+            with self.subTest(reason=reason):
+                result, worker, client, adapter = self._run_mid_call_hub_error(409, reason=reason)
+                self.assertIs(worker.lease_revoked, True)
+                self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+                self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+                self.assertFalse(any(path.endswith('/complete') for path, _ in client.calls))
+                self.assertEqual(client.completions, [])
+                self.assertEqual(adapter.calls.count('execute'), 1)
+                self.assertEqual(adapter.calls.count('close'), 1)
+                self.assertIs(result['model_call_attempted'], True)
+                self.assertEqual(worker.last_exit, 1)
+
+    def test_completable_lease_lost_mid_call_completes_one_failure(self):
+        result, worker, client, adapter = self._run_mid_call_hub_error(
+            409, reason='lease_expired_completable')
+        self.assertIs(worker.lease_revoked, False)
+        self.assertEqual(worker.phase, 'model_call')
         self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
-        self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
-        self.assertFalse(any(path.endswith('/complete') for path, _ in client.calls))
-        self.assertEqual(client.completions, [])
-        self.assertEqual(adapter.calls.count('close'), 1)
         self.assertIs(result['model_call_attempted'], True)
+        self.assertNotIn('completion_delivery', result)
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertEqual(client.completions[0]['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+        self.assertEqual(worker.completion_payload, client.completions[0])
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(adapter.calls.count('close'), 1)
         self.assertEqual(worker.last_exit, 1)
+
+    def test_completion_409_after_completable_heartbeat_is_final(self):
+        result, worker, client, adapter = self._run_mid_call_hub_error(
+            409, reason='lease_expired_completable', refuse_completion=True)
+        self.assertIs(worker.lease_revoked, False)
+        self.assertIs(worker.completion_refused, True)
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertEqual(result['completion_delivery'], 'refused')
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(worker.completion_payload, client.completions[0])
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+        self.assertEqual(adapter.calls.count('execute'), 1)
+        self.assertEqual(adapter.calls.count('close'), 1)
 
     def test_other_hub_error_mid_call_still_completes(self):
         result, worker, client, adapter = self._run_mid_call_hub_error(403)
@@ -2709,6 +2746,46 @@ class HeartbeatPhaseTests(unittest.TestCase):
         # active:false is a definite answer — do not retry the beat.
         self.assertEqual(model_call_beats['n'], 1)
 
+    def test_pre_execute_lease_lost_completes_only_with_explicit_completable_reason(self):
+        for reason in (None, 'lease_inactive', 'lease_expired_completable'):
+            with self.subTest(reason=reason):
+                clock = Clock(); client = Client(clock); adapter = Adapter()
+                original = client.post
+                sleeps = []
+
+                def post(path, value):
+                    if path.endswith('/heartbeat') and value.get('phase') == 'model_call':
+                        client.calls.append((path, copy.deepcopy(value)))
+                        raise self._hub_shaped_error(409, reason=reason)
+                    return original(path, value)
+
+                client.post = post
+                worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                                object(), clock=clock, sleep=sleeps.append)
+                result = worker.run()
+                self.assertNotIn('execute', adapter.calls)
+                self.assertEqual(adapter.calls.count('close'), 1)
+                self.assertEqual(sleeps, [])
+                self.assertIs(result['model_call_attempted'], False)
+                self.assertEqual(result['error_code'], 'task_lease_lost')
+                self.assertEqual(worker.phase, 'model_call')
+                model_beats = [value for path, value in client.calls
+                               if path.endswith('/heartbeat') and value.get('phase') == 'model_call']
+                self.assertEqual(len(model_beats), 1)
+                if reason == 'lease_expired_completable':
+                    self.assertIs(worker.lease_revoked, False)
+                    self.assertNotIn('completion_delivery', result)
+                    self.assertEqual(len(client.completions), 1)
+                    completion = client.completions[0]
+                    self.assertEqual(completion['exit_code'], 1)
+                    self.assertEqual(completion['error_code'], 'task_lease_lost')
+                    self.assertIs(completion['model_call_attempted'], False)
+                    self.assertEqual(worker.completion_payload, completion)
+                else:
+                    self.assertIs(worker.lease_revoked, True)
+                    self.assertEqual(result['completion_delivery'], 'skipped_lease_revoked')
+                    self.assertEqual(client.completions, [])
+
     def test_model_call_heartbeat_transport_error_then_success_runs_execute(self):
         clock = Clock(); client = Client(clock); adapter = Adapter()
         original = client.post
@@ -2812,7 +2889,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
         # Malformed answer is not a transport error — do not retry.
         self.assertEqual(model_call_beats['n'], 1)
 
-    def _hub_shaped_error(self, kind):
+    def _hub_shaped_error(self, kind, *, reason=None):
         """Exceptions shaped like HubClient.post — type/status only, no message parsing."""
         from urllib.error import HTTPError, URLError
         from agent_hub.worker import LeaseLost, WorkerError
@@ -2839,7 +2916,7 @@ class HeartbeatPhaseTests(unittest.TestCase):
         except WorkerError as exc:
             if kind == 409:
                 try:
-                    raise LeaseLost('The hub revoked or expired this task lease') from exc.__cause__
+                    raise LeaseLost('The hub revoked or expired this task lease', reason=reason) from exc.__cause__
                 except LeaseLost as lost:
                     return lost
             return exc
