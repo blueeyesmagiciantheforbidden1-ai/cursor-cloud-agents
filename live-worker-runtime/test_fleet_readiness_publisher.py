@@ -258,6 +258,25 @@ class PhaseMappingTests(unittest.TestCase):
         failed = {'uid': NEXT_UID, 'failedCount': 1, 'runningCount': 0}
         self.assertNotEqual(map_readiness_phase('active', failed), 'ready')
 
+    def test_room_refusal_loop_reason_code_is_visible(self):
+        state = {
+            'phase': 'blocked',
+            'updated_at': 1000,
+            'error': 'room_refusal_loop',
+            'room_refusals': 6,
+        }
+        entry = agent_readiness_entry(state, clock=lambda: 1000)
+        self.assertEqual(entry['phase'], 'blocked')
+        self.assertEqual(entry['reason_code'], 'room_refusal_loop')
+        self.assertTrue(REASON_CODE.fullmatch(entry['reason_code']))
+        doc = document_from_slots({'codex': state}, published_at=1000, ttl_seconds=180, clock=lambda: 1000)
+        self.assertEqual(doc['agents']['codex']['reason_code'], 'room_refusal_loop')
+        self.assertEqual(doc['agents']['codex']['phase'], 'blocked')
+        # Hub agent entries are exact keys only; room_refusals has no field.
+        self.assertEqual(set(doc['agents']['codex']), AGENT_ENTRY_KEYS)
+        if hub_validate_document is not None:
+            hub_validate_document(doc, 1000)
+
     def test_execution_started_helper(self):
         self.assertFalse(execution_started(None))
         self.assertFalse(execution_started({'runningCount': 0}))

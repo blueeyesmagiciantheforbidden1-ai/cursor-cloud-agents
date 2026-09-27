@@ -9,7 +9,10 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path('C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e7f-992bfc4740b3/agent-hub')
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(SOURCE))
 
-from fleet_controller import Controller, ControllerError, digest
+from fleet_controller import (
+    Controller, ControllerError, digest, prune_room_refusals,
+    MAX_ROOM_REFUSALS, ROOM_REFUSAL_WINDOW_SECONDS, ROOM_REFUSAL_DELAY_SECONDS,
+)
 from agent_hub.credential_broker_service import BoundaryError
 from test_dynamic_broker import POLICY
 
@@ -775,6 +778,7 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(store.state['consecutive_failures'], 2)
         self.assertEqual(store.state['phase'], 'idle')
         self.assertNotIn('error', store.state)
+        self.assertEqual(store.state['room_refusals'], [1000])
         self.assertEqual(len(store.archives), archives_before + 1)
         self.assertEqual(controller.tick()['status'], 'replacement_cooldown')
         controller.clock = lambda: 1060
@@ -783,26 +787,27 @@ class FleetReviewTests(unittest.TestCase):
 
     def test_room_refusal_cap_blocks(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
-        store.state['room_refusals'] = 5
+        store.state['room_refusals'] = [1000 - 50 * i for i in range(5, 0, -1)]
         self.park_quota(cloud, broker, code=76)
         result = controller.tick()
         self.assertEqual(result['status'], 'blocked')
         self.assertEqual(store.state['error'], 'room_refusal_loop')
-        self.assertEqual(store.state['room_refusals'], 6)
+        self.assertEqual(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
+        self.assertEqual(store.state['room_refusals'][-1], 1000)
         self.assertEqual(cloud.run_count, 1)
         cleared = controller.reset()
         self.assertEqual(cleared['status'], 'idle')
         self.assertEqual(cleared['cleared'], 'room_refusal_loop')
-        self.assertEqual(store.state['room_refusals'], 0)
+        self.assertEqual(store.state['room_refusals'], [])
 
-    def test_clean_success_clears_room_refusals(self):
+    def test_clean_success_preserves_room_refusals(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
-        store.state['room_refusals'] = 4
+        store.state['room_refusals'] = [700, 800, 900, 950]
         cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
             reconciling=False, runningCount=0, succeededCount=1, failedCount=0)
         broker.state.update(execution_uid=NEXT_UID)
         controller.tick()
-        self.assertEqual(store.state['room_refusals'], 0)
+        self.assertEqual(store.state['room_refusals'], [700, 800, 900, 950])
 
     def test_room_refusal_exit_with_unreleased_credential_blocks(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()
@@ -823,6 +828,143 @@ class FleetReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'provider_quota_parked')
         self.assertEqual(store.state['room_refusals'], 3)
         self.assertEqual(store.state['consecutive_failures'], 2)
+
+    def test_legacy_int_room_refusals_fails_open_once(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['room_refusals'] = 3
+        self.park_quota(cloud, broker, code=76)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'replacement_after_room_refusal')
+        self.assertEqual(result['room_refusals'], 1)
+        self.assertEqual(store.state['room_refusals'], [1000])
+
+    def test_interleaved_clean_success_does_not_reset_room_refusals(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        # Refusals at t and t+60.
+        self.park_quota(cloud, broker, code=76)
+        self.assertEqual(controller.tick()['room_refusals'], 1)
+        controller.clock = lambda: 1060
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        self.park_quota(cloud, broker, code=76)
+        self.assertEqual(controller.tick()['room_refusals'], 2)
+        # Relaunch, then a clean exit 0 must not clear the window.
+        controller.clock = lambda: 1120
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        cloud.executions_by_name[NEXT].update(completionTime='2026-09-22T00:01:00Z',
+            reconciling=False, runningCount=0, succeededCount=1, failedCount=0)
+        broker.state.update(execution_uid=NEXT_UID)
+        controller.tick()
+        self.assertEqual(store.state['room_refusals'], [1000, 1060])
+        # Four more refusals at t+180.. reach 6 and block.
+        for index, when in enumerate([1180, 1240, 1300, 1360]):
+            controller.clock = lambda now=when: now
+            self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+            self.park_quota(cloud, broker, code=76)
+            result = controller.tick()
+            if index < 3:
+                self.assertEqual(result['status'], 'replacement_after_room_refusal')
+                self.assertEqual(result['room_refusals'], 3 + index)
+            else:
+                self.assertEqual(result['status'], 'blocked')
+                self.assertEqual(store.state['error'], 'room_refusal_loop')
+                self.assertEqual(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
+
+    def test_refusals_outside_window_do_not_block(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        # Six refusals spaced just over a window apart never hold 6 after prune.
+        when = 1000
+        for _ in range(6):
+            controller.clock = lambda now=when: now
+            self.park_quota(cloud, broker, code=76)
+            result = controller.tick()
+            self.assertEqual(result['status'], 'replacement_after_room_refusal')
+            self.assertEqual(len(store.state['room_refusals']), 1)
+            controller.clock = lambda now=when + ROOM_REFUSAL_DELAY_SECONDS: now
+            self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+            when += ROOM_REFUSAL_WINDOW_SECONDS + 1
+        self.assertNotEqual(store.state.get('phase'), 'blocked')
+
+    def test_room_refusal_loop_clears_by_ageing(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        t0 = 1000
+        store.state['room_refusals'] = [t0 + 60 * i for i in range(5)]
+        block_at = t0 + 60 * 5
+        controller.clock = lambda: block_at
+        self.park_quota(cloud, broker, code=76)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'room_refusal_loop')
+        self.assertEqual(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
+        controller.clock = lambda: block_at + 10
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(store.state['error'], 'room_refusal_loop')
+        # Oldest (t0) ages out at t0 + WINDOW + 1.
+        clear_at = t0 + ROOM_REFUSAL_WINDOW_SECONDS + 1
+        controller.clock = lambda: clear_at
+        result = controller.tick()
+        self.assertEqual(store.state['phase'], 'idle')
+        self.assertNotIn('error', store.state)
+        self.assertLess(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
+        self.assertEqual(store.state['next_launch_at'], clear_at + ROOM_REFUSAL_DELAY_SECONDS)
+        self.assertEqual(result['status'], 'replacement_cooldown')
+        controller.clock = lambda: clear_at + ROOM_REFUSAL_DELAY_SECONDS
+        self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+        # A different blocked error is not released by the same ageing tick.
+        controller2, store2, _, _, _, _ = self.make(); controller2.tick()
+        store2.state['phase'] = 'blocked'
+        store2.state['error'] = 'worker_failed_no_restart_loop'
+        store2.state['room_refusals'] = [t0]
+        store2.state['consecutive_failures'] = 3
+        controller2.clock = lambda: clear_at
+        self.assertEqual(controller2.tick()['status'], 'blocked')
+        self.assertEqual(store2.state['error'], 'worker_failed_no_restart_loop')
+
+    def test_room_refusals_coexist_with_consecutive_failures(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['room_refusals'] = [900, 950]
+        store.state['consecutive_failures'] = 2
+        self.park_quota(cloud, broker, code=76)
+        result = controller.tick()
+        self.assertEqual(result['status'], 'replacement_after_room_refusal')
+        self.assertEqual(result['room_refusals'], 3)
+        self.assertEqual(store.state['room_refusals'], [900, 950, 1000])
+        self.assertEqual(store.state['consecutive_failures'], 2)
+
+    def test_reset_clears_room_refusals_to_empty_list(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        store.state['room_refusals'] = [1000 - 10 * i for i in range(5, 0, -1)]
+        self.park_quota(cloud, broker, code=76)
+        self.assertEqual(controller.tick()['status'], 'blocked')
+        self.assertEqual(controller.reset()['status'], 'idle')
+        self.assertEqual(store.state['room_refusals'], [])
+
+    def test_room_refusals_list_stays_bounded(self):
+        controller, store, cloud, broker, _, _ = self.make(); controller.tick()
+        when = 1000
+        for _ in range(20):
+            controller.clock = lambda now=when: now
+            self.park_quota(cloud, broker, code=76)
+            result = controller.tick()
+            # Spread far enough that prune never reaches the block cap.
+            self.assertEqual(result['status'], 'replacement_after_room_refusal')
+            self.assertLessEqual(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
+            controller.clock = lambda now=when + ROOM_REFUSAL_DELAY_SECONDS: now
+            self.assertEqual(controller.tick()['status'], 'job_running_readiness_separate')
+            when += ROOM_REFUSAL_WINDOW_SECONDS // 2
+        self.assertLessEqual(len(store.state['room_refusals']), MAX_ROOM_REFUSALS)
+
+    def test_prune_room_refusals_helper(self):
+        now = 10_000
+        self.assertEqual(prune_room_refusals(3, now), [])
+        self.assertEqual(prune_room_refusals(None, now), [])
+        self.assertEqual(prune_room_refusals('x', now), [])
+        self.assertEqual(prune_room_refusals([now - 10, True, 1.5, now + 1, 'x'], now), [now - 10])
+        old = now - ROOM_REFUSAL_WINDOW_SECONDS - 1
+        edge = now - ROOM_REFUSAL_WINDOW_SECONDS
+        self.assertEqual(prune_room_refusals([old, edge, now], now), [edge, now])
+        many = list(range(now - 20, now + 1))
+        pruned = prune_room_refusals(many, now)
+        self.assertEqual(len(pruned), MAX_ROOM_REFUSALS)
+        self.assertEqual(pruned, many[-MAX_ROOM_REFUSALS:])
 
     def test_reset_on_a_parked_slot_clears_the_park(self):
         controller, store, cloud, broker, _, _ = self.make(); controller.tick()

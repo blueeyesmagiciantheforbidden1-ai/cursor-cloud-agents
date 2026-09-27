@@ -3,10 +3,16 @@
 Clean terminal executions with released credential ownership are replaced; a
 failed one that released cleanly is replaced after a backoff, and the third
 consecutive failure stops the slot. A room-content refusal (exit 76) is not a
-strike: the slot relaunches after a short delay, and a cap on consecutive
-refusals still stops a worker-side regression loop. Unknown launches,
-unreleased or quarantined credentials stop the slot at once instead of
-spending money in a restart loop. This module contains no provider calls.
+strike: the slot relaunches after a short delay. room_refusals is a sliding
+window of at most MAX_ROOM_REFUSALS controller timestamps over
+ROOM_REFUSAL_WINDOW_SECONDS; clean success, idle drain, and completed tasks
+do not clear it — only ageing out of the window does (or an operator reset).
+When the window holds MAX_ROOM_REFUSALS entries the slot blocks with
+error room_refusal_loop (visible on readiness/hub_status); _tick releases
+that block on its own once pruning leaves fewer than MAX_ROOM_REFUSALS.
+Unknown launches, unreleased or quarantined credentials stop the slot at
+once instead of spending money in a restart loop. This module contains no
+provider calls.
 """
 from __future__ import annotations
 
@@ -48,6 +54,25 @@ ROOM_REFUSAL_DELAY_SECONDS = 60
 # The hub retries a pre-model failure once, so 6 is three poison rooms, and
 # the cap keeps a worker-side refusal regression visible.
 MAX_ROOM_REFUSALS = 6
+ROOM_REFUSAL_WINDOW_SECONDS = 3600
+
+
+def prune_room_refusals(value, now):
+    """Return room_refusals pruned to the current sliding window.
+
+    A non-list value (legacy int, None, junk) yields [] so it fails open once.
+    Non-int, bool, and future entries are dropped; entries older than
+    now - ROOM_REFUSAL_WINDOW_SECONDS are dropped; only the newest
+    MAX_ROOM_REFUSALS remain.
+    """
+    if not isinstance(value, list):
+        return []
+    cutoff = now - ROOM_REFUSAL_WINDOW_SECONDS
+    kept = [entry for entry in value
+            if type(entry) is int and entry <= now and entry >= cutoff]
+    if len(kept) > MAX_ROOM_REFUSALS:
+        kept = sorted(kept)[-MAX_ROOM_REFUSALS:]
+    return kept
 
 
 SAFE_CODE = re.compile(r'[a-z][a-z0-9_]{0,99}')
@@ -374,6 +399,19 @@ class Controller:
             else:
                 state, version = self._adopt_config(state, version)
             phase = state['phase']
+            # room_refusal_loop is the only blocked error that clears itself:
+            # when the one-hour window no longer holds MAX_ROOM_REFUSALS entries,
+            # return to idle with the usual refusal relaunch delay. Every other
+            # blocked error stays operator-reset only.
+            if (phase == 'blocked' and state.get('error') == 'room_refusal_loop'):
+                now = int(self.clock())
+                refusals = prune_room_refusals(state.get('room_refusals'), now)
+                if len(refusals) < MAX_ROOM_REFUSALS:
+                    cleared = {key: value for key, value in state.items() if key != 'error'}
+                    state, version = self.save(cleared, version, phase='idle',
+                        room_refusals=refusals,
+                        next_launch_at=now + ROOM_REFUSAL_DELAY_SECONDS)
+                    continue
             if phase in ('blocked', 'launch_intent', 'binding_intent', 'grant_intent'):
                 # Another delivery may own this mutation, or its reply was lost.
                 # Read-only reconciliation occurs separately; never repeat it.
@@ -469,17 +507,21 @@ class Controller:
                         return {'status': 'provider_quota_parked', 'next_launch_at': state['next_launch_at'],
                                 'quota_parks': state['quota_parks'], 'generation': state['generation']}
                     if exit_code == ROOM_REFUSED_EXIT_CODE and released:
-                        refusals = state.get('room_refusals', 0)
-                        refusals = (refusals if type(refusals) is int and refusals >= 0 else 0) + 1
-                        if refusals >= MAX_ROOM_REFUSALS:
+                        now = int(self.clock())
+                        refusals = prune_room_refusals(state.get('room_refusals'), now)
+                        refusals = prune_room_refusals(refusals + [now], now)
+                        if len(refusals) >= MAX_ROOM_REFUSALS:
+                            # Same as the strike block path: leave the execution
+                            # in place; do not archive.
                             state, version = self.save(state, version, phase='blocked',
                                 room_refusals=refusals, error='room_refusal_loop')
                             return {'status': 'blocked', 'generation': state['generation']}
                         self.store.archive(state, execution)
                         state, version = self.save(state, version, phase='idle', room_refusals=refusals,
-                            next_launch_at=int(self.clock()) + ROOM_REFUSAL_DELAY_SECONDS,
+                            next_launch_at=now + ROOM_REFUSAL_DELAY_SECONDS,
                             last_execution=state['execution'], last_execution_uid=state['execution_uid'])
-                        return {'status': 'replacement_after_room_refusal', 'room_refusals': refusals,
+                        return {'status': 'replacement_after_room_refusal',
+                                'room_refusals': len(refusals),
                                 'next_launch_at': state['next_launch_at'], 'generation': state['generation']}
                     failures = state.get('consecutive_failures', 0) + 1
                     if not released or failures >= MAX_CONSECUTIVE_FAILURES:
@@ -499,8 +541,11 @@ class Controller:
                 # A clean run clears a provider-quota park as well as the strikes.
                 self.store.archive(state, execution)
                 cleared = {key: value for key, value in state.items() if key != 'error'}
+                # room_refusals is a sliding window: clean success does not reset
+                # it. Prune on write so aged entries leave the stored list.
+                now = int(self.clock())
+                cleared['room_refusals'] = prune_room_refusals(cleared.get('room_refusals'), now)
                 state, version = self.save(cleared, version, phase='idle', consecutive_failures=0, quota_parks=0,
-                    room_refusals=0,
                     last_execution=state['execution'], last_execution_uid=state['execution_uid'])
                 continue
             raise ControllerError('unknown_controller_state')
@@ -538,6 +583,6 @@ class Controller:
         drop = {'error', 'next_launch_at'} if parked else {'error'}
         cleared = {key: value for key, value in state.items() if key not in drop}
         state, version = self.save(cleared, version, phase='idle', previous_uid=previous['uid'],
-                                    consecutive_failures=0, quota_parks=0, room_refusals=0)
+                                    consecutive_failures=0, quota_parks=0, room_refusals=[])
         cleared_code = state_error if isinstance(state_error, str) and SAFE_CODE.fullmatch(state_error) else 'unrecorded'
         return {'status': 'idle', 'cleared': cleared_code, 'from_phase': phase, 'generation': state['generation']}
