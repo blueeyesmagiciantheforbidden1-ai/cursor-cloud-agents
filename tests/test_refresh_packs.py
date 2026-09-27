@@ -6,6 +6,7 @@ Firestore, Cloud Run, or the hub.
 import ast
 from pathlib import Path
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -375,6 +376,22 @@ class BaseDriftTest(unittest.TestCase):
     live image came from the 22f pack, whose pre-prompt PASSIVE_EVENTS were
     never committed; every startup failed.
     """
+
+    @classmethod
+    def setUpClass(cls):
+        # base_drift asks git whether each pack file is a committed blob, so
+        # outside a git checkout every test here would report misleading drift.
+        # Fail once, loudly, instead (Light: four false drift failures train
+        # people to ignore this canary).
+        try:
+            probe = subprocess.run(['git', '-C', str(refresh_packs.ROOT), 'rev-parse', '--is-inside-work-tree'],
+                                   capture_output=True, text=True)
+            inside = probe.returncode == 0 and probe.stdout.strip() == 'true'
+        except OSError:
+            inside = False
+        if not inside:
+            raise AssertionError('test_refresh_packs requires a git checkout: %s is not a git repository '
+                                 '(base drift compares pack files with committed git blobs)' % refresh_packs.ROOT)
 
     def make_base(self, root, files):
         base = Path(root) / 'live-image-copilot-live-20260922f-source'
