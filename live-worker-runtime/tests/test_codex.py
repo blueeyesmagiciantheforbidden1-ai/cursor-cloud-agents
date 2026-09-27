@@ -505,6 +505,11 @@ class CodexLive(unittest.TestCase):
             CLI_NAME=getattr(c, 'CLI_NAME', None),
         )
 
+        # One fixed hub deadline: recomputing time.time() + 600 per response
+        # made heartbeats report a changed deadline (task_deadline_changed)
+        # whenever the clock ticked between the claim and a beat.
+        hub_deadline = time.time() + 600
+
         class HubClient:
             def __init__(self):
                 self.completions = []
@@ -514,11 +519,10 @@ class CodexLive(unittest.TestCase):
                     return {'task': {
                         'room_id': 'b' * 32, 'lease_token': 'lease', 'workspace': 'default',
                         'prompt': 'Project task.', 'messages': [], 'timeout_seconds': 300,
-                        'deadline': time.time() + 600, 'step': 0, 'learning_context': {},
+                        'deadline': hub_deadline, 'step': 0, 'learning_context': {},
                     }}
                 if path.endswith('/heartbeat'):
-                    now = time.time()
-                    return {'active': True, 'deadline': now + 600, 'server_time': now}
+                    return {'active': True, 'deadline': hub_deadline, 'server_time': time.time()}
                 if path.endswith('/complete'):
                     self.completions.append(copy.deepcopy(value))
                     return {'room_id': 'b' * 32, 'status': 'needs_reconciliation'}
