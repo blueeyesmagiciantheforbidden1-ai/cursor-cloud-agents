@@ -119,6 +119,7 @@ class Runtime:
     def __init__(self, config):
         base.require(set(config) == {'schema_version', 'audience', 'policies', 'slots'}, 'controller_config_invalid')
         _, policies = parse_config({k: config[k] for k in ('schema_version', 'audience', 'policies')})
+        base.require(len({p.profile.provider for p in policies}) == len(policies), 'controller_slots_invalid')
         base.require(isinstance(config['slots'], dict) and set(config['slots']) == {p.profile.provider for p in policies},
                      'controller_slots_invalid')
         self.controllers = []

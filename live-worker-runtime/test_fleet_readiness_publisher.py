@@ -4,12 +4,15 @@ from __future__ import annotations
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+import ast
+from dataclasses import asdict
 import json
 import os
 import sys
 import threading
 import time
 import unittest
+from unittest.mock import Mock
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -18,6 +21,7 @@ SOURCE = Path('C:/Users/9/.codex/visualizations/2026/09/20/01a0bfe3-8100-7811-8e
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SOURCE))
 
+import fleet_readiness_publisher as frp  # noqa: E402
 from fleet_controller import Controller, digest, map_readiness_phase, execution_started  # noqa: E402
 from fleet_readiness_publisher import (  # noqa: E402
     AGENT_ENTRY_KEYS, DOCUMENT_KEYS, FORBIDDEN_PAYLOAD_KEYS, EXECUTION_ID, MAX_REASON_CODE,
@@ -31,10 +35,12 @@ from test_dynamic_broker import POLICY  # noqa: E402
 # first breaks worker imports (UpstreamUnavailable etc.). Import by loading the
 # runcrew module file under an isolated package name.
 HUB_VALIDATE_SOURCE = ''
+HUB_VALIDATE_ROOT = None
+HUB_STUB_AGENTS = None
 
 
 def _load_hub_validate_document():
-    global HUB_VALIDATE_SOURCE
+    global HUB_VALIDATE_SOURCE, HUB_VALIDATE_ROOT, HUB_STUB_AGENTS
     import importlib.util
     import types
     # Same convention as test_workspace_runner: RUNCREW_AGENT_HUB is runcrew's
@@ -62,6 +68,8 @@ def _load_hub_validate_document():
         core.HubError = HubError
         core.AGENTS = ('codex', 'claude', 'cursor', 'copilot', 'grok')
         sys.modules[core_name] = core
+    HUB_VALIDATE_ROOT = runcrew_ah
+    HUB_STUB_AGENTS = sys.modules[core_name].AGENTS
     fr_path = runcrew_ah / 'fleet_readiness.py'
     fr_name = pkg_name + '.fleet_readiness'
     spec = importlib.util.spec_from_file_location(fr_name, fr_path)
@@ -258,6 +266,17 @@ class PhaseMappingTests(unittest.TestCase):
 
 
 class PayloadContractTests(unittest.TestCase):
+    def test_rejects_keys_outside_hub_contract(self):
+        entry = agent_readiness_entry({'phase': 'idle', 'updated_at': 1})
+        for key in ('codex_ryan', 'gemini'):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, '^agent_key_invalid$'):
+                    build_readiness_document({key: entry}, published_at=1, ttl_seconds=30)
+
+    def test_hub_agents_cover_policy_providers(self):
+        from agent_hub.cloud_credential_broker import _PROVIDERS
+        self.assertEqual(set(frp.HUB_AGENTS), _PROVIDERS)
+
     def test_document_exact_keys_and_bounds(self):
         doc = build_readiness_document(
             {
@@ -373,6 +392,79 @@ class PayloadContractTests(unittest.TestCase):
 
 
 class PublisherBehaviourTests(unittest.TestCase):
+    def test_slot_agent_key_is_provider(self):
+        self.assertEqual(frp.slot_agent_key(
+            _FakeController('codex', {'phase': 'idle'}, profile='blueeyes')), 'codex')
+
+    def test_collision_skips_stores_and_post(self):
+        hub, logs = FakeHubClient(), []
+        publisher = FleetReadinessPublisher(
+            enabled=True, hub_url='http://127.0.0.1:9', token='tok',
+            post=hub, log=logs.append, clock=lambda: 1000,
+        )
+        controllers = [_FakeController('codex', {'phase': 'idle'}, profile=profile)
+                       for profile in ('ryan', 'blueeyes')]
+        for controller in controllers:
+            controller.store.read = Mock(return_value=({'phase': 'idle'}, 1))
+        result = publish_after_tick(controllers, publisher)
+        self.assertIsNone(result)
+        self.assertEqual(hub.calls, [])
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(json.loads(logs[0])['reason'], 'agent_key_collision')
+        self.assertEqual(publisher.failures['count'], 1)
+        for controller in controllers:
+            controller.store.read.assert_not_called()
+
+    def test_runtime_refuses_duplicate_providers(self):
+        from agent_hub.credential_broker_service import BrokerError
+        from agent_hub.cloud_credential_broker import ProfileConfig
+        from cloud_runtime import Runtime
+        from test_dynamic_broker import ENDPOINT
+        profiles = [
+            ProfileConfig('codex', 'ryan', '1'*64, '2'*64,
+                          'runcrew-credential-codex-ryan', 'runcrew-worker-codex-ryan'),
+            ProfileConfig('codex', 'blueeyes', '3'*64, '4'*64,
+                          'runcrew-credential-codex-blueeyes', 'runcrew-worker-codex-blueeyes'),
+        ]
+        config = {
+            'schema_version': 1, 'audience': ENDPOINT,
+            'policies': [
+                {'profile': asdict(profile), 'caller_subject': subject,
+                 'caller_service_account': 'runcrew-worker-codex@project-0c6d31fa-509e-4116-a2c.iam.gserviceaccount.com',
+                 'lease_seconds': 240}
+                for profile, subject in zip(profiles, ('123456789', '987654321'))
+            ],
+            'slots': {'codex': {'job_uid': JOB_UID, 'template_sha256': '0'*64, 'enabled': True}},
+        }
+        with self.assertRaises(BrokerError) as raised:
+            Runtime(config)
+        self.assertEqual(str(raised.exception), 'controller_slots_invalid')
+
+    def test_http_status_codes_are_fixed_and_sanitized(self):
+        url, token = 'http://127.0.0.1:9/v1/fleet/readiness', 'secret-token'
+        for code, expected in (
+            (400, 'hub_http_400'), (401, 'hub_http_401'), (403, 'hub_http_403'),
+            (404, 'hub_http_404'), (409, 'hub_http_409'), (413, 'hub_http_413'),
+            (500, 'hub_http_5xx'), (503, 'hub_http_5xx'), (599, 'hub_http_5xx'),
+            (418, 'hub_http_other'), (600, 'hub_http_other'),
+            ('400', 'hub_http_other'), (None, 'hub_http_other'), (400.0, 'hub_http_other'),
+        ):
+            with self.subTest(code=code):
+                hub, logs = FakeHubClient(), []
+                hub.fail_with = HTTPError(url, code, 'x', hdrs=None, fp=None)
+                publisher = FleetReadinessPublisher(
+                    enabled=True, hub_url='http://127.0.0.1:9', token=token,
+                    post=hub, log=logs.append, clock=lambda: 1,
+                )
+                self.assertIsNone(publisher.publish_slots({'codex': {'phase': 'idle'}}))
+                self.assertEqual(publisher.failures['count'], 1)
+                self.assertEqual(len(logs), 1)
+                self.assertEqual(json.loads(logs[0])['reason'], expected)
+                self.assertTrue(frp.SAFE_CODE.fullmatch(expected))
+                for line in logs:
+                    self.assertNotIn(token, line)
+                    self.assertNotIn(url, line)
+
     def test_flag_off_sends_nothing(self):
         hub = FakeHubClient()
         publisher = FleetReadinessPublisher(
@@ -495,11 +587,11 @@ class PublisherBehaviourTests(unittest.TestCase):
         )
         self.assertEqual(len(hub.calls), 1)
         self.assertEqual(hub.calls[0]['document']['ttl_seconds'], 120)
-        self.assertEqual(set(doc['agents']), {'codex_ryan', 'claude_ryan'})
-        self.assertEqual(doc['agents']['codex_ryan']['phase'], 'idle')
-        self.assertEqual(doc['agents']['claude_ryan']['phase'], 'blocked')
+        self.assertEqual(set(doc['agents']), {'codex', 'claude'})
+        self.assertEqual(doc['agents']['codex']['phase'], 'idle')
+        self.assertEqual(doc['agents']['claude']['phase'], 'blocked')
 
-    def test_runtime_tick_one_post_three_slots_keyed_with_profile(self):
+    def test_runtime_tick_one_post_three_slots_keyed_by_provider(self):
         hub = FakeHubClient()
         publisher = FleetReadinessPublisher(
             enabled=True, hub_url='http://127.0.0.1:9', token='tok',
@@ -519,10 +611,8 @@ class PublisherBehaviourTests(unittest.TestCase):
         result = runtime.tick()
         self.assertEqual(len(hub.calls), 1)
         doc = hub.calls[0]['document']
-        expected = {'codex_ryan', 'claude_blueeyes', 'grok_ryan'}
+        expected = {'codex', 'claude', 'grok'}
         self.assertEqual(set(doc['agents']), expected)
-        for key in expected:
-            self.assertIn('_', key)
         self.assertEqual(result['codex']['status'], 'ok')
         self.assertEqual(result['claude']['status'], 'ok')
         self.assertEqual(result['grok']['status'], 'ok')
@@ -535,12 +625,18 @@ class RealHttpPublishTests(unittest.TestCase):
 
     def setUp(self):
         self.hits = []
+        self.statuses = []
+        self.force_status = None
         self.redirect_targets = []
         parent = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 return
+
+            def send_response(self, code, message=None):
+                parent.statuses.append(code)
+                super().send_response(code, message)
 
             def do_POST(self):
                 length = int(self.headers.get('Content-Length', '0'))
@@ -552,6 +648,10 @@ class RealHttpPublishTests(unittest.TestCase):
                     'token': self.headers.get('X-Hub-Token'),
                     'body': body,
                 })
+                if parent.force_status is not None:
+                    self.send_response(parent.force_status)
+                    self.end_headers()
+                    return
                 if self.path == '/redirect-source':
                     self.send_response(302)
                     self.send_header('Location', 'http://127.0.0.1:%d/v1/fleet/readiness' % parent.server.server_port)
@@ -597,25 +697,57 @@ class RealHttpPublishTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def test_real_publish_succeeds_end_to_end(self):
-        self.assertTrue(HUB_VALIDATE_SOURCE.startswith('import'))
+    def test_hub_agents_mirror_core(self):
+        tree = ast.parse((HUB_VALIDATE_ROOT / 'core.py').read_text(encoding='utf-8'))
+        fleet = next(ast.literal_eval(node.value) for node in tree.body
+                     if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'FLEET'
+                             for target in node.targets))
+        self.assertEqual(fleet, frp.HUB_AGENTS)
+        self.assertEqual(fleet, HUB_STUB_AGENTS)
+
+    def _tick_runtime(self, logs):
+        from cloud_runtime import Runtime
         publisher = FleetReadinessPublisher(
             enabled=True, hub_url=self.base, token='fleet-token-for-local-test',
-            tick_seconds=60, clock=lambda: int(time.time()),
+            tick_seconds=60, clock=lambda: int(time.time()), log=logs.append,
         )
-        # Hub AGENTS are provider names; e2e uses those so validate_document accepts.
-        doc = publisher.publish_slots({
-            'codex': {'phase': 'idle', 'updated_at': int(time.time())},
-            'claude': {'phase': 'blocked', 'updated_at': int(time.time()),
-                       'error': 'launch_without_execution'},
-        })
-        self.assertIsNotNone(doc)
+        runtime = Runtime.__new__(Runtime)
+        runtime.lock = threading.Lock()
+        runtime.controllers = [
+            _FakeController(provider, {'phase': 'idle', 'updated_at': int(time.time())},
+                            profile=profile)
+            for provider, profile in (('codex', 'ryan'), ('claude', 'blueeyes'), ('grok', 'ryan'))
+        ]
+        runtime.readiness_publisher = publisher
+        runtime.tick()
+        return publisher
+
+    def test_real_publish_succeeds_end_to_end(self):
+        self.assertTrue(HUB_VALIDATE_SOURCE.startswith('import'))
+        logs = []
+        publisher = self._tick_runtime(logs)
         self.assertEqual(len(self.hits), 1)
         self.assertEqual(self.hits[0]['agent'], 'fleet')
         self.assertEqual(self.hits[0]['path'], '/v1/fleet/readiness')
+        self.assertEqual(self.statuses, [200])
+        self.assertEqual(publisher.failures['count'], 0)
+        self.assertEqual(logs, [])
         body = json.loads(self.hits[0]['body'].decode())
-        self.assertEqual(body['agents']['codex']['reason_code'], 'ok')
-        self.assertEqual(body['agents']['claude']['reason_code'], 'launch_without_execution')
+        self.assertEqual(set(body['agents']), {'codex', 'claude', 'grok'})
+
+    def test_real_http_conflict_is_logged(self):
+        self.force_status = 409
+        logs = []
+        publisher = self._tick_runtime(logs)
+        self.assertEqual(len(self.hits), 1)
+        self.assertEqual(self.hits[0]['path'], '/v1/fleet/readiness')
+        self.assertEqual(self.statuses, [409])
+        self.assertEqual(publisher.failures['count'], 1)
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(json.loads(logs[0])['reason'], 'hub_http_409')
+        self.assertNotIn('fleet-token-for-local-test', logs[0])
+        self.assertNotIn(self.base, logs[0])
 
     def test_redirect_not_followed(self):
         # POST to a path that 302s; NoRedirect must not follow to /v1/fleet/readiness.

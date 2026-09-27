@@ -22,6 +22,9 @@ from fleet_controller import SAFE_CODE, map_readiness_phase
 
 READINESS_PATH = '/v1/fleet/readiness'
 SCHEMA = 1
+# Mirrored from runcrew/agent_hub/core.py (FLEET/AGENTS), enforced by
+# runcrew/agent_hub/fleet_readiness.py (validate_document).
+HUB_AGENTS = ('codex', 'claude', 'cursor', 'copilot', 'grok')
 # Short timeout so a hung hub cannot stall the controller tick.
 POST_TIMEOUT_SECONDS = 2.5
 # Bound store.read / cloud.get under the Runtime lock so a hung backend cannot
@@ -77,9 +80,8 @@ def ttl_for_tick_interval(tick_seconds):
 
 
 def slot_agent_key(controller):
-    """Hub agents[] key: provider_profile so multi-profile fleets do not collide."""
-    profile = controller.policy.profile
-    return '%s_%s' % (profile.provider, profile.profile)
+    """Hub agents[] key: the provider name accepted by the hub contract."""
+    return controller.policy.profile.provider
 
 
 def _opaque_execution_id(state, execution=None):
@@ -137,7 +139,8 @@ def build_readiness_document(agents, *, published_at, ttl_seconds):
         raise ValueError('agents_invalid')
     clean = {}
     for name, entry in agents.items():
-        if not isinstance(name, str) or not AGENT_KEY.fullmatch(name) or len(name) > MAX_AGENT_KEY:
+        if (not isinstance(name, str) or name not in HUB_AGENTS
+                or not AGENT_KEY.fullmatch(name) or len(name) > MAX_AGENT_KEY):
             raise ValueError('agent_key_invalid')
         if not isinstance(entry, dict) or set(entry) != AGENT_ENTRY_KEYS:
             raise ValueError('agent_entry_invalid')
@@ -274,8 +277,16 @@ class FleetReadinessPublisher:
             code = str(error)
             _log_failure(self.log, code if SAFE_CODE.fullmatch(code) else 'payload_invalid', self.failures)
             return None
-        except HTTPError:
-            _log_failure(self.log, 'hub_http_error', self.failures)
+        except HTTPError as error:
+            code = 'hub_http_other'
+            if type(error.code) is int:
+                code = {
+                    400: 'hub_http_400', 401: 'hub_http_401', 403: 'hub_http_403',
+                    404: 'hub_http_404', 409: 'hub_http_409', 413: 'hub_http_413',
+                }.get(error.code, 'hub_http_other')
+                if 500 <= error.code <= 599:
+                    code = 'hub_http_5xx'
+            _log_failure(self.log, code, self.failures)
             return None
         except (URLError, OSError, TimeoutError):
             _log_failure(self.log, 'hub_unreachable', self.failures)
@@ -313,10 +324,13 @@ def publish_after_tick(controllers, publisher, *, snapshot_timeout=SNAPSHOT_TIME
     """
     if publisher is None or not publisher.active():
         return None
+    keyed_controllers = [(slot_agent_key(controller), controller) for controller in controllers]
+    if len({name for name, _ in keyed_controllers}) != len(keyed_controllers):
+        _log_failure(publisher.log, 'agent_key_collision', publisher.failures)
+        return None
     slot_states = {}
     executions = {}
-    for controller in controllers:
-        name = slot_agent_key(controller)
+    for name, controller in keyed_controllers:
         try:
             state_pair, timed_out = _call_with_timeout(controller.store.read, snapshot_timeout)
             if timed_out:
