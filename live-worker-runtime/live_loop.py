@@ -240,6 +240,10 @@ MAX_REPAIR_ERRORS, MAX_REPAIR_ERROR_TEXT = 8, 160
 HEARTBEAT_PHASES = ('setup', 'model_call', 'finishing')
 # The hub lease is 45 s, and complete() can take three 10 s POSTs plus 3 s of sleeps.
 FINISHING_BEAT_AFTER_SECONDS = 10
+TASK_HEARTBEAT_RETRY_DELAY_SECONDS = 1
+# The hub lease is 45 s, so a retry that starts less than 30 s after the last
+# acknowledged beat reaches the hub within 30 + HUB_POST_TIMEOUT_SECONDS = 40 s.
+TASK_HEARTBEAT_RETRY_WINDOW_SECONDS = 30
 
 
 def _repair_errors(task):
@@ -562,6 +566,10 @@ class Worker:
         self.phase = None
         # Clock value taken just before the last task heartbeat that returned active.
         self._task_ack_at = None
+        # Mid-call task-heartbeat transport retries sent by heartbeat().
+        self.task_heartbeat_retries = 0
+        # Local execute deadline in self.clock() units, or None before execute.
+        self._execute_deadline = None
         self.completion_payload = None
         self.cleaned = False
         self.spans = []
@@ -779,30 +787,68 @@ class Worker:
             return False
         try:
             if self.task:
-                try:
-                    ack_at = self.clock()
-                    receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
-                                               self._heartbeat_body(self.task))
-                except LeaseLost as error:
-                    # Stop the call in every case. A retained expired lease can
-                    # still accept the existing failure completion; preserve
-                    # the actual phase and model_call_attempted for that path.
-                    self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
-                    return False
-                if not isinstance(receipt, dict) or receipt.get('active') is not True:
-                    self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
-                    return False
-                self._task_ack_at = ack_at
-                try:
-                    self.report()
-                except Exception:
-                    # Telemetry only: the task lease was renewed just above.
-                    self.report_failures += 1
-                return True
+                return self._task_heartbeat()
             self.report()
             return True
         except Exception:
             return False
+
+    def _task_heartbeat(self):
+        """One or two task /heartbeat POSTs. Retry is bounded by lease window and deadline.
+
+        A single transport blip must not abort a paid model call while the hub
+        lease (45 s) and local execute deadline still have room for sleep + one
+        more POST. LeaseLost, 4xx, and malformed receipts are never retried.
+        """
+        delay = TASK_HEARTBEAT_RETRY_DELAY_SECONDS
+        window = TASK_HEARTBEAT_RETRY_WINDOW_SECONDS
+        try:
+            ack_at = self.clock()
+            receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                                       self._heartbeat_body(self.task))
+        except LeaseLost as error:
+            # Stop the call in every case. A retained expired lease can
+            # still accept the existing failure completion; preserve
+            # the actual phase and model_call_attempted for that path.
+            self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
+            return False
+        except Exception as error:
+            if not (
+                is_task_heartbeat_transport_error(error)
+                and not self.stopping
+                and self._task_ack_at is not None
+                and self.clock() + delay - self._task_ack_at < window
+                and self._execute_deadline is not None
+                and self.clock() + delay + HUB_POST_TIMEOUT_SECONDS < self._execute_deadline
+            ):
+                return False
+            self.sleep(delay)
+            # Re-check after sleep: stopping, lease window, and execute budget
+            # may have moved; never post a third attempt.
+            if (self.stopping
+                    or not (self.clock() - self._task_ack_at < window)
+                    or not (self.clock() + HUB_POST_TIMEOUT_SECONDS < self._execute_deadline)):
+                return False
+            self.task_heartbeat_retries += 1
+            try:
+                ack_at = self.clock()
+                receipt = self.client.post('/v1/tasks/' + self.task['room_id'] + '/heartbeat',
+                                           self._heartbeat_body(self.task))
+            except LeaseLost as error:
+                self.lease_revoked = getattr(error, 'reason', None) != 'lease_expired_completable'
+                return False
+            except Exception:
+                return False
+        if not isinstance(receipt, dict) or receipt.get('active') is not True:
+            self.lease_revoked = isinstance(receipt, dict) and receipt.get('active') is False
+            return False
+        self._task_ack_at = ack_at
+        try:
+            self.report()
+        except Exception:
+            # Telemetry only: the task lease was renewed just above.
+            self.report_failures += 1
+        return True
 
     def checked_deadline(self, task):
         require(isinstance(task, dict) and re.fullmatch(r'[a-f0-9]{32}', task.get('room_id', '')),
@@ -1112,6 +1158,7 @@ class Worker:
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:
+                    self._execute_deadline = deadline
                     reply = self.adapter.execute(self.handle, prompt, deadline, task_kind='project')
                     self.phase = 'finishing'
                     require(isinstance(reply, dict) and isinstance(reply.get('text'), str)
@@ -1235,6 +1282,8 @@ class Worker:
                 outcome['usage_rejected'] = self.usage_rejected
             if self.report_failures > 0:
                 outcome['report_failures'] = self.report_failures
+            if self.task_heartbeat_retries > 0:
+                outcome['task_heartbeat_retries'] = self.task_heartbeat_retries
             if self.capability_dropped:
                 outcome['capability_dropped'] = True
             self.log(outcome)

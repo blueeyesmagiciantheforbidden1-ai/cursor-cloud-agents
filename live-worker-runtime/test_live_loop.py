@@ -2931,6 +2931,255 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertEqual(client.completions[0]['error_code'], 'grok_hub_heartbeat_lost')
         self.assertIs(client.completions[0]['model_call_attempted'], True)
 
+    def _run_mid_call_effects(self, effects, *, advance=20, sleep_extra=0,
+                              on_first_post=None, on_sleep=None, task_overrides=None):
+        """Mid-call heartbeat with ordered hub effects after execute is entered.
+
+        Each effect is a kind for _hub_shaped_error, a (kind, reason) tuple, a
+        receipt dict/list, an Exception instance to raise, or None (pass through
+        to the real Client.post). execute advances the clock by `advance`
+        seconds, then calls the captured heartbeat once.
+        """
+        clock = Clock(); client = Client(clock); adapter = Adapter()
+        if task_overrides:
+            client.task.update(task_overrides)
+        beat = {}
+        in_execute = {'on': False}
+        mid_posts = []
+        sleeps = []
+        original = client.post
+        effect_i = {'n': 0}
+        worker_box = {}
+
+        def prepare(session, heartbeat, deadline):
+            adapter.calls.append('prepare'); beat['fn'] = heartbeat
+            return SimpleNamespace(state='ready')
+
+        def execute(handle, prompt, deadline, *, task_kind):
+            adapter.calls.append('execute')
+            in_execute['on'] = True
+            clock.now += advance
+            ok = beat['fn']()
+            in_execute['on'] = False
+            if ok is not True:
+                raise CodeError('grok_hub_heartbeat_lost')
+            return {'text': adapter.answer, 'model': 'example', 'effort': 'max', 'usage': None}
+
+        def apply_effect(effect, path, value):
+            if effect is None:
+                return original(path, value)
+            if isinstance(effect, BaseException):
+                raise effect
+            if isinstance(effect, (dict, list)):
+                return copy.deepcopy(effect)
+            if isinstance(effect, tuple):
+                raise self._hub_shaped_error(effect[0], reason=effect[1])
+            raise self._hub_shaped_error(effect)
+
+        def post(path, value):
+            if in_execute['on'] and path.endswith('/heartbeat'):
+                client.calls.append((path, copy.deepcopy(value)))
+                mid_posts.append(copy.deepcopy(value))
+                i = effect_i['n']
+                effect_i['n'] += 1
+                if on_first_post is not None and i == 0:
+                    on_first_post(worker_box['worker'])
+                if i < len(effects):
+                    return apply_effect(effects[i], path, value)
+                return original(path, value)
+            return original(path, value)
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if on_sleep is not None:
+                on_sleep(worker_box['worker'], seconds)
+            clock.sleep(seconds + sleep_extra)
+
+        adapter.prepare, adapter.execute = prepare, execute
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, adapter,
+                        object(), clock=clock, sleep=sleep)
+        worker_box['worker'] = worker
+        result = worker.run()
+        return result, worker, client, adapter, mid_posts, sleeps
+
+    def test_mid_call_one_transport_error_then_success(self):
+        kinds = ('connection', 'timeout', 503, 500, OSError('network'))
+        for kind in kinds:
+            with self.subTest(kind=repr(kind)):
+                result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+                    [kind, None], advance=20)
+                self.assertEqual(result['outcome'], 'completed')
+                self.assertEqual(len(client.completions), 1)
+                self.assertEqual(client.completions[0]['exit_code'], 0)
+                self.assertNotIn('error_code', client.completions[0])
+                self.assertEqual(len(mid_posts), 2)
+                self.assertEqual(mid_posts[0], mid_posts[1])
+                self.assertEqual(mid_posts[0].get('phase'), 'model_call')
+                self.assertEqual(sleeps, [1])
+                self.assertEqual(result['task_heartbeat_retries'], 1)
+                self.assertIs(worker.lease_revoked, False)
+                blob = str(result) + str(client.completions)
+                for fragment in ('Hub connection failed', 'HTTP 5', 'timed out'):
+                    self.assertNotIn(fragment, blob)
+
+    def test_mid_call_two_transport_errors_in_a_row(self):
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection', 'connection'], advance=20)
+        self.assertEqual(len(mid_posts), 2)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertEqual(len(client.completions), 1)
+        self.assertEqual(client.completions[0]['exit_code'], 1)
+        self.assertIs(client.completions[0]['model_call_attempted'], True)
+        self.assertIs(worker.lease_revoked, False)
+        self.assertEqual(result['task_heartbeat_retries'], 1)
+
+    def test_mid_call_transport_then_hub_refusal_on_retry(self):
+        cases = (
+            ((409, None), True, 'skipped_lease_revoked', 0),
+            ((409, 'lease_inactive'), True, 'skipped_lease_revoked', 0),
+            ((409, 'lease_expired_completable'), False, None, 1),
+            ({'active': False}, True, 'skipped_lease_revoked', 0),
+        )
+        for second, revoked, delivery, n_complete in cases:
+            with self.subTest(second=second):
+                result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+                    ['connection', second], advance=20)
+                self.assertEqual(len(mid_posts), 2)
+                self.assertEqual(sleeps, [1])
+                self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+                self.assertIs(worker.lease_revoked, revoked)
+                if delivery is not None:
+                    self.assertEqual(result['completion_delivery'], delivery)
+                    self.assertFalse(any(path.endswith('/complete') for path, _ in client.calls))
+                else:
+                    self.assertNotIn('completion_delivery', result)
+                self.assertEqual(len(client.completions), n_complete)
+                if n_complete:
+                    self.assertEqual(client.completions[0]['exit_code'], 1)
+
+    def test_mid_call_errors_that_are_never_retried(self):
+        cases = (
+            403, 400,
+            (409, None), (409, 'lease_inactive'), (409, 'lease_expired_completable'),
+            'invalid_json', 'non_object',
+            {'active': False},
+            ['not', 'a', 'dict'],
+        )
+        for kind in cases:
+            with self.subTest(kind=kind):
+                result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+                    [kind], advance=20)
+                self.assertEqual(len(mid_posts), 1)
+                self.assertEqual(sleeps, [])
+                self.assertNotIn('task_heartbeat_retries', result)
+        # Completed happy path also omits the key.
+        result, phases, client = self.run_worker()
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertNotIn('task_heartbeat_retries', result)
+
+    def test_mid_call_stopping_during_first_post_skips_retry(self):
+        def on_first(worker):
+            worker.on_signal()
+
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection'], advance=20, on_first_post=on_first)
+        self.assertEqual(len(mid_posts), 1)
+        self.assertEqual(sleeps, [])
+        self.assertNotIn('task_heartbeat_retries', result)
+
+    def test_mid_call_stopping_during_sleep_skips_second_post(self):
+        def on_sleep(worker, seconds):
+            worker.on_signal()
+
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection', None], advance=20, on_sleep=on_sleep)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(mid_posts), 1)
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+
+    def test_mid_call_keyboard_interrupt_during_sleep(self):
+        def on_sleep(worker, seconds):
+            raise KeyboardInterrupt
+
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection', None], advance=20, on_sleep=on_sleep)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(mid_posts), 1)
+        self.assertEqual(result['error_code'], 'worker_stopping')
+
+    def test_mid_call_retry_window(self):
+        # 28 s: clock+delay - ack = 129 < 30 → retry.
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection', None], advance=28)
+        self.assertEqual(len(mid_posts), 2)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(result['task_heartbeat_retries'], 1)
+
+        # 29 s: 130 == 30 → no retry.
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection'], advance=29)
+        self.assertEqual(len(mid_posts), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertNotIn('task_heartbeat_retries', result)
+
+        # Oversleep: post-sleep window fails (131 - 100 = 31 >= 30).
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection', None], advance=20, sleep_extra=11)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(mid_posts), 1)
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+
+    def test_mid_call_deadline_guard(self):
+        overrides = {'timeout_seconds': 60, 'deadline': 760}
+        # Advance 20: 120+1+10=131 < 135 → retry.
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection', None], advance=20, task_overrides=overrides)
+        self.assertEqual(len(mid_posts), 2)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(result['outcome'], 'completed')
+        self.assertEqual(result['task_heartbeat_retries'], 1)
+
+        # Advance 25: 125+1+10=136 >= 135 → no retry (window alone would allow).
+        result, worker, client, adapter, mid_posts, sleeps = self._run_mid_call_effects(
+            ['connection'], advance=25, task_overrides=overrides)
+        self.assertEqual(len(mid_posts), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(result['error_code'], 'grok_hub_heartbeat_lost')
+        self.assertNotIn('task_heartbeat_retries', result)
+
+    def test_mid_call_direct_heartbeat_without_deadline_does_not_retry(self):
+        clock = Clock(); client = Client(clock)
+        original = client.post
+        posts = []
+
+        def post(path, value):
+            if path.endswith('/heartbeat'):
+                client.calls.append((path, copy.deepcopy(value)))
+                posts.append(1)
+                raise self._hub_shaped_error('connection')
+            return original(path, value)
+
+        client.post = post
+        worker = Worker(Settings('grok', 'grok-live', warm_seconds=60), client, Adapter(),
+                        object(), clock=clock, sleep=clock.sleep)
+        worker.task = dict(client.task)
+        worker.phase = 'model_call'
+        # _task_ack_at and _execute_deadline stay None.
+        self.assertIs(worker.heartbeat(), False)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(worker.task_heartbeat_retries, 0)
+
+        worker._task_ack_at = 100
+        # Still no _execute_deadline.
+        posts.clear()
+        self.assertIs(worker.heartbeat(), False)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(worker.task_heartbeat_retries, 0)
+
     def test_report_lease_lost_does_not_revoke_the_task(self):
         from agent_hub.worker import LeaseLost
         clock = Clock(); client = Client(clock)
