@@ -884,6 +884,8 @@ def execute(handle, prompt, task_deadline, *, task_kind='project'):
         if (auth == 'copilot_account_not_authenticated'
                 and isinstance(error, CopilotError)
                 and not handle.attempted):
+            # Set False only on a path that provably precedes the prompt
+            # (handle.attempted flips right before the send): the loop trusts it.
             error.model_call_attempted = False
             raise error
         if close_error is not None:

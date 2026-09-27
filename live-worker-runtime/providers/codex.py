@@ -455,6 +455,8 @@ def _fail(handle, error):
             metadata.MetadataError, protocol_gate.GateError)) else ''
         code = code if SAFE_CODE.fullmatch(code) else 'codex_live_operation_failed'
     failure = LiveCodexError(code)
+    # prompt_attempted flips right before turn/start, so False here provably
+    # precedes the prompt; the loop trusts an explicit False over its own flag.
     failure.model_call_attempted = handle.prompt_attempted
     failure.credential_writeback = handle.credential_writeback
     raise failure from None
