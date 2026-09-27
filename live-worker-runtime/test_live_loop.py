@@ -23,8 +23,9 @@ PROVIDERS = Path(__file__).resolve().parent / 'providers'
 SPAN_FIELDS = ('trace_id', 'room_id', 'step', 'attempt_key', 'span', 'duration_ms', 'outcome', 'error_code')
 DIGEST = 'sha256:' + ('ab' * 32)
 TRACE = '01234567-89ab-cdef-0123-456789abcdef'
-# Claude's TOOLS_POLICY still has uppercase A; hub _POLICY refuses it (REVIEW.md).
-HUB_REFUSED_CONSTANTS = {('claude', 'TOOLS_POLICY')}
+# Empty: every assigned CLI_NAME / CLI_VERSION / TOOLS_POLICY constant must pass
+# live_loop.capability_valid when substituted into a filler manifest.
+HUB_REFUSED_CONSTANTS = set()
 
 
 @contextmanager
@@ -1852,6 +1853,7 @@ class LoopTests(unittest.TestCase):
                     live_loop.capability_valid(obj, now=now), hub_accepts(obj), label)
 
     def test_hub_refused_policy_omits_the_manifest(self):
+        # Uppercase A in dontAsk still fails the hub _POLICY rule.
         now = datetime(2026, 9, 26, tzinfo=timezone.utc)
         result = live_loop.capability_manifest(
             SimpleNamespace(
@@ -1861,6 +1863,48 @@ class LoopTests(unittest.TestCase):
             'claude', '2020-01-01T00:00:00Z',
             environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now)
         self.assertIsNone(result)
+
+    def test_claude_tools_policy_manifest_is_sent(self):
+        # After the lowercase label fix, claude's published policy passes the
+        # worker hub-label check and the capability object is attached to report.
+        now = datetime(2026, 9, 26, tzinfo=timezone.utc)
+        policy = 'read_only_tools_dontask_restricted'
+        claude_path = PROVIDERS / 'claude.py'
+        if claude_path.is_file():
+            tree = ast.parse(claude_path.read_text(encoding='utf-8'))
+            assigned = None
+            for node in tree.body:
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                        and node.targets[0].id == 'TOOLS_POLICY'
+                        and isinstance(node.value, ast.Constant)):
+                    assigned = node.value.value
+            self.assertEqual(assigned, policy)
+            literals = [node.value for node in ast.walk(tree)
+                        if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+            self.assertGreaterEqual(literals.count(policy), 2)
+        self.assertTrue(live_loop._hub_label_valid(live_loop._TOOLS_POLICY, policy))
+        result = live_loop.capability_manifest(
+            SimpleNamespace(
+                CLI_NAME='claude', CLI_VERSION='1',
+                TOOLS_POLICY=policy,
+                MODEL='claude-fable-5-1', EFFORT='max'),
+            'claude', '2020-01-01T00:00:00Z',
+            environ={'RUNCREW_IMAGE_DIGEST': DIGEST}, now=now)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['tools_policy'], policy)
+        with capability_env(RUNCREW_IMAGE_DIGEST=DIGEST):
+            worker, client, adapter, _ = self.setup_worker()
+            adapter.CLI_NAME = 'claude'
+            adapter.CLI_VERSION = '1'
+            adapter.TOOLS_POLICY = policy
+            adapter.MODEL = 'claude-fable-5-1'
+            adapter.EFFORT = 'max'
+            worker.ready = True
+            worker.report(force=True)
+            payload = client.calls[-1][1]
+            self.assertIn('capability', payload)
+            self.assertEqual(payload['capability']['tools_policy'], policy)
 
     def test_report_400_with_manifest_retries_once_without_it(self):
         from urllib.error import HTTPError
