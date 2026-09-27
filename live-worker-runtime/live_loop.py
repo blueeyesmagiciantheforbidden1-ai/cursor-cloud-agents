@@ -279,6 +279,11 @@ HEARTBEAT_PHASES = ('setup', 'model_call', 'finishing')
 # The hub lease is 45 s, and complete() can take three 10 s POSTs plus 3 s of sleeps.
 FINISHING_BEAT_AFTER_SECONDS = 10
 TASK_HEARTBEAT_RETRY_DELAY_SECONDS = 1
+# Time passes between the loop's pre-execute deadline check and the adapter's
+# own EXECUTE_WARM_FLOOR check (the model_call beat, renew and collect run
+# first). A declared floor therefore needs this much more at the loop, or a
+# task that passes here at floor + 0.2 s fails inside the adapter as post_model.
+EXECUTE_FLOOR_MARGIN_SECONDS = 5
 # The hub lease is 45 s, so a retry that starts less than 30 s after the last
 # acknowledged beat reaches the hub within 30 + HUB_POST_TIMEOUT_SECONDS = 40 s.
 TASK_HEARTBEAT_RETRY_WINDOW_SECONDS = 30
@@ -1331,10 +1336,11 @@ class Worker:
                 require(isinstance(receipt, dict) and receipt.get('active') is True, 'task_lease_lost')
                 self._task_ack_at = ack_at
                 # Ack arrived but too little execute budget remains: fail before
-                # flipping the flag or entering execute. Floor is
-                # max(5, adapter EXECUTE_WARM_FLOOR).
-                require(deadline - self.clock() >= max(5, self._adapter_execute_floor()),
-                        'task_deadline_insufficient')
+                # flipping the flag or entering execute. A declared adapter floor
+                # gets EXECUTE_FLOOR_MARGIN_SECONDS on top; otherwise 5 s.
+                floor = self._adapter_execute_floor()
+                need = floor + EXECUTE_FLOOR_MARGIN_SECONDS if floor else 0
+                require(deadline - self.clock() >= max(5, need), 'task_deadline_insufficient')
                 self.model_call_attempted = True
                 model_started = self.clock()
                 try:

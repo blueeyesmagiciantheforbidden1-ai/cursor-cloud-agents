@@ -4471,16 +4471,33 @@ class HeartbeatPhaseTests(unittest.TestCase):
         self.assertIn('close', adapter.calls)
 
     def test_adapter_execute_floor_boundary_allows_execute(self):
-        """Exactly 75 s left with EXECUTE_WARM_FLOOR=75 → execute once, completed."""
+        """Floor + margin (80 s) left with EXECUTE_WARM_FLOOR=75 → execute once, completed."""
+        self.assertEqual(live_loop.EXECUTE_FLOOR_MARGIN_SECONDS, 5)
         clock = Clock(); client = Client(clock); adapter = Adapter()
         adapter.EXECUTE_WARM_FLOOR = 75
-        client.task['deadline'] = 700 + 100
-        client.task['timeout_seconds'] = 100
+        client.task['deadline'] = 700 + 105
+        client.task['timeout_seconds'] = 105
         worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
                         object(), clock=clock, sleep=clock.sleep)
         result = worker.run()
         self.assertEqual(adapter.calls.count('execute'), 1)
         self.assertEqual(result['outcome'], 'completed')
+
+    def test_adapter_execute_floor_plus_one_second_refuses_pre_model(self):
+        """76 s left under EXECUTE_WARM_FLOOR=75 is inside the margin: refuse before execute (Light)."""
+        for left in (75, 76, 79):
+            with self.subTest(left=left):
+                clock = Clock(); client = Client(clock); adapter = Adapter()
+                adapter.EXECUTE_WARM_FLOOR = 75
+                client.task['deadline'] = 700 + 25 + left
+                client.task['timeout_seconds'] = 25 + left
+                worker = Worker(Settings('codex', 'codex-live', warm_seconds=3600), client, adapter,
+                                object(), clock=clock, sleep=clock.sleep)
+                result = worker.run()
+                self.assertNotIn('execute', adapter.calls)
+                self.assertEqual(client.completions[0]['error_code'], 'task_deadline_insufficient')
+                self.assertIs(client.completions[0]['model_call_attempted'], False)
+                self.assertIs(result['model_call_attempted'], False)
 
     def test_invalid_adapter_execute_floor_values_fall_back_to_five(self):
         """Non-int / negative / None floors behave as 0; 65 s left clears the 5 s gate."""
