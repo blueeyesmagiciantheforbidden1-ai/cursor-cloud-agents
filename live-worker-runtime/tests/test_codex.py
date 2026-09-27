@@ -692,12 +692,12 @@ class CodexLive(unittest.TestCase):
     def test_worker_prepare_sign_out_double_quarantine_keeps_adapter_reason(self):
         """Signed-out prepare: adapter quarantines while session stays active; first reason wins.
 
-        Real Worker + codex adapter prepare. Sign-out leaves owner_verified false so
-        close fails the owner check and quarantines; session.state remains 'active'.
+        Real Worker + codex prepare (signed out). owner_verified stays false so the
+        close owner check fails and quarantines; session.state remains 'active'.
         Fake broker mirrors cloud_credential_broker (keeps first reason, refuses
-        finish after quarantine). Production _close also uses
+        finish after quarantine). Production _close also quarantines with
         provider_refresh_uncertain; this pin uses a distinct adapter reason so the
-        unprepared-release fallback cannot hide a overwrite.
+        unprepared-release fallback cannot hide an overwrite.
         """
         self._fresh_session()
         self.mutate = lambda native: setattr(
@@ -707,6 +707,7 @@ class CodexLive(unittest.TestCase):
         quarantine_calls = []
         writes = []
         phase = {'value': 'leased', 'reason': ''}
+        owner_check_failed = {'value': False}
 
         def quarantine(lease, reason):
             quarantine_calls.append(reason)
@@ -722,23 +723,21 @@ class CodexLive(unittest.TestCase):
                 raise BrokerError('credential_lease_not_active')
             raise AssertionError('finish expected a quarantined broker')
 
+        real_close = c._close
+
         def close_failing_owner_check(handle):
-            """Same owner-check failure path as codex._close; distinct quarantine reason."""
-            if handle.state == 'closed':
-                return
-            if handle.state == 'quarantined':
-                raise c.LiveCodexError('credential_reconciliation_required')
+            """Real stop + owner check; quarantine with a distinct first reason."""
+            if handle.state in ('closed', 'quarantined'):
+                return real_close(handle)
             handle.state = 'closing'
             try:
                 if handle.native is not None:
                     handle.native.stop_group()
                     handle.native_stopped = True
                 if not (handle.native_stopped and handle.owner_verified):
+                    owner_check_failed['value'] = True
                     raise c.LiveCodexError('verified_native_owner_and_stop_required')
-                version = handle.session.finish(native_stopped=True)
-                handle.credential_version_ref = c.hashlib.sha256(version.encode()).hexdigest()
-                handle.credential_writeback = 'committed'
-                handle.state = 'closed'
+                return real_close(handle)
             except Exception:
                 handle.state = 'quarantined'
                 handle.credential_writeback = 'uncertain'
@@ -782,6 +781,7 @@ class CodexLive(unittest.TestCase):
                 clock=time.monotonic, sleep=lambda s: None, log=lambda record: None)
             result = worker.run()
 
+        self.assertTrue(owner_check_failed['value'])
         self.assertEqual(writes, [adapter_reason])
         self.assertEqual(phase['reason'], adapter_reason)
         self.assertNotEqual(phase['reason'], 'provider_refresh_uncertain')
