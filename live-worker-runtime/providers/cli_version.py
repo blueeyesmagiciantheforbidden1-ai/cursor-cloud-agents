@@ -85,6 +85,10 @@ def probe_cli_version(executable, *, timeout=_PROBE_TIMEOUT_SECONDS, runner=subp
         return None, 'cli_version_probe_failed'
     except Exception:
         return None, 'cli_version_probe_failed'
+    if completed.returncode != 0:
+        # An error message can carry digits ("request failed (401)"); taking a
+        # token from it would publish a version the CLI never reported.
+        return None, 'cli_version_exit_nonzero'
     text = (completed.stdout or '') + ('\n' if completed.stdout and completed.stderr else '') + (completed.stderr or '')
     version = sanitise_version(text)
     if version is None:

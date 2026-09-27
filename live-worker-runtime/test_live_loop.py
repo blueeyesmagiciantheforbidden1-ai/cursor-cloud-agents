@@ -2136,6 +2136,15 @@ class LoopTests(unittest.TestCase):
             self.assertIsNone(timed)
             self.assertEqual(timed_reason, 'cli_version_timeout')
 
+            # A failing --version must not publish a number from its error text.
+            def failed(*args, **kwargs):
+                return sp.CompletedProcess(args[0], 1, stdout='',
+                                           stderr='Error: request failed (401)\n')
+
+            errored, errored_reason = cli_ver.probe_cli_version(str(fake), runner=failed)
+            self.assertIsNone(errored)
+            self.assertEqual(errored_reason, 'cli_version_exit_nonzero')
+
     def test_report_400_with_manifest_retries_once_without_it(self):
         from urllib.error import HTTPError
         from agent_hub.worker import WorkerError
