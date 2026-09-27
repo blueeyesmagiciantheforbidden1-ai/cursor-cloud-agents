@@ -4,6 +4,7 @@ from collections import deque
 from datetime import datetime, timezone
 import io
 import json
+import os
 from pathlib import Path
 import queue
 import sys
@@ -14,17 +15,101 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+
+def locate_transport(environ, root):
+    """Find the complete Codex transport without masking a broken explicit path."""
+    filenames = ('metadata.py', 'protocol_gate.py', 'transport.py', 'credential_state.py')
+    override = environ.get('RUNCREW_CODEX_TRANSPORT')
+    if override:
+        directory = Path(override)
+        missing = [name for name in filenames if not (directory / name).is_file()]
+        if missing:
+            raise ImportError('RUNCREW_CODEX_TRANSPORT is missing: ' + ', '.join(missing))
+        return directory
+
+    root = Path(root)
+    for directory in (root, root.parent / 'codex-cloud-transport',
+                      root.parent.parent / 'runcrew' / 'codex-cloud-transport'):
+        if all((directory / name).is_file() for name in filenames):
+            return directory
+    if environ.get('RUNCREW_LIVE_PROVIDER') == 'codex':
+        raise ImportError('Codex transport modules are required for RUNCREW_LIVE_PROVIDER=codex; '
+                          'set RUNCREW_CODEX_TRANSPORT to runcrew\'s codex-cloud-transport')
+    return None
+
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent / 'agent-hub'))
-sys.path.insert(0, str(ROOT.parent / 'codex-cloud-transport'))
+TRANSPORT = locate_transport(os.environ, ROOT)
+if TRANSPORT is not None and TRANSPORT != ROOT:
+    sys.path.append(str(TRANSPORT))
 sys.path.insert(0, str(ROOT))
 import broker_renew
 import live_loop
 from agent_hub.cloud_credential_broker import BrokerError, Conflict, MutationUncertain
 from agent_hub.credential_broker_service import BoundaryError
-from providers import codex as c
+if TRANSPORT is None:
+    c = None
+    SKIP_REASON = "Set RUNCREW_CODEX_TRANSPORT to runcrew's codex-cloud-transport to run Codex tests"
+else:
+    from providers import codex as c
+    SKIP_REASON = ''
 
 EMAIL = 'cursor-owner@example.invalid'
+
+
+class LocateTransport(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='runcrew-codex-locator-')
+        self.addCleanup(self.temporary.cleanup)
+        self.workspace = Path(self.temporary.name)
+        self.root = self.workspace / 'cca' / 'live-worker-runtime'
+        self.root.mkdir(parents=True)
+
+    def _complete(self, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in ('metadata.py', 'protocol_gate.py', 'transport.py', 'credential_state.py'):
+            (directory / name).touch()
+        return directory
+
+    def test_explicit_directory_wins_over_image_layout(self):
+        directory = self._complete(self.workspace / 'explicit')
+        self._complete(self.root)
+        self.assertEqual(locate_transport({'RUNCREW_CODEX_TRANSPORT': str(directory)}, self.root),
+                         directory)
+
+    def test_incomplete_explicit_directory_does_not_fall_back(self):
+        directory = self._complete(self.workspace / 'explicit')
+        (directory / 'transport.py').unlink()
+        self._complete(self.root)
+        with self.assertRaisesRegex(ImportError, r'RUNCREW_CODEX_TRANSPORT.*transport\.py'):
+            locate_transport({'RUNCREW_CODEX_TRANSPORT': str(directory)}, self.root)
+
+    def test_image_layout_wins_over_external_directories(self):
+        self._complete(self.root)
+        self._complete(self.root.parent / 'codex-cloud-transport')
+        self._complete(self.workspace / 'runcrew' / 'codex-cloud-transport')
+        self.assertEqual(locate_transport({}, self.root), self.root)
+
+    def test_sibling_wins_over_runcrew_checkout(self):
+        sibling = self._complete(self.root.parent / 'codex-cloud-transport')
+        self._complete(self.workspace / 'runcrew' / 'codex-cloud-transport')
+        self.assertEqual(locate_transport({}, self.root), sibling)
+
+    def test_runcrew_checkout_is_found(self):
+        directory = self._complete(self.workspace / 'runcrew' / 'codex-cloud-transport')
+        self.assertEqual(locate_transport({}, self.root), directory)
+
+    def test_missing_transport_in_codex_image_is_an_error(self):
+        with self.assertRaisesRegex(ImportError, 'RUNCREW_LIVE_PROVIDER=codex'):
+            locate_transport({'RUNCREW_LIVE_PROVIDER': 'codex'}, self.root)
+
+    def test_missing_transport_offline_returns_none(self):
+        self.assertIsNone(locate_transport({}, self.root))
+
+    def test_empty_override_uses_image_layout(self):
+        self._complete(self.root)
+        self.assertEqual(locate_transport({'RUNCREW_CODEX_TRANSPORT': ''}, self.root), self.root)
 
 
 class StepClock:
@@ -71,7 +156,7 @@ class FakeProcess:
         return self.exit_code
 
 
-class FixtureRPC(c.WarmRPC):
+class FixtureRPC(c.WarmRPC if c is not None else object):
     """Use production request/parser/gate/result paths; replace only native IO."""
     def __init__(self, home, renew, *, timeout_seconds, execution_mode):
         self.home, self.renew = home, renew
@@ -155,8 +240,13 @@ class FixtureRPC(c.WarmRPC):
         self.process.exit_code = 0
 
 
+@unittest.skipIf(c is None, SKIP_REASON)
 class CodexLive(unittest.TestCase):
     def setUp(self):
+        owner_patch = patch.dict(c.metadata.OWNER_REFS, {
+            'blueeyes': c.hashlib.sha256(EMAIL.strip().casefold().encode('utf-8')).hexdigest()})
+        owner_patch.start()
+        self.addCleanup(owner_patch.stop)
         self.temporary = tempfile.TemporaryDirectory(prefix='runcrew-codex-offline-')  # system temp: the image app dir is read-only
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name) / 'home'
@@ -1042,6 +1132,26 @@ class CodexLive(unittest.TestCase):
 
 
 
+@unittest.skipIf(c is None, SKIP_REASON)
+class TransportWiring(unittest.TestCase):
+    def test_transport_modules_come_from_located_dir(self):
+        directory = Path(TRANSPORT).resolve()
+        for module in (c.metadata, c.protocol_gate, c.transport):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(Path(module.__file__).resolve().parent, directory)
+        if TRANSPORT != ROOT:
+            import agent_hub
+            self.assertFalse(Path(agent_hub.__file__).resolve().is_relative_to(directory))
+
+    def test_owner_binding_is_scoped_to_each_test(self):
+        original = dict(c.metadata.OWNER_REFS)
+        result = unittest.TestResult()
+        CodexLive('test_prepare_is_model_ready_without_any_turn_or_inference').run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(c.metadata.OWNER_REFS, original)
+
+
+@unittest.skipIf(c is None, SKIP_REASON)
 class WireWrites(unittest.TestCase):
     def test_real_sender_completes_only_unwritten_suffix_of_large_prompt(self):
         class ShortWriter(io.BytesIO):

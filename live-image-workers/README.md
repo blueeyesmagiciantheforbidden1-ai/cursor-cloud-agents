@@ -11,7 +11,7 @@ They are built from packs kept outside git (`live-image-<provider>-<version>-sou
     python live-image-workers/refresh_packs.py --packs C:\API_KEYS\cloud-agent-online \
         --base-version live-20260922b --version live-20260923a --owner-email <owner email> [--out <dir>]
 
-Verified 2026-09-23 on Alpha from the `live-20260922b` packs: for all five providers, `test_live_loop.py` and `test_dynamic_broker.py` pass with `python -I` in the merged image layout (`agent_hub/` + `live/`), and `test_copilot_provider.py` passes; the provider-specific tests (`test_claude.py`, `test_codex.py`, `test_cursor.py`, `test_grok.py`) need the base image and run in the build.
+Verified 2026-09-23 on Alpha from the `live-20260922b` packs: for all five providers, `test_live_loop.py` and `test_dynamic_broker.py` pass with `python -I` in the merged image layout (`agent_hub/` + `live/`), and `test_copilot_provider.py` passes; the provider-specific tests (`test_claude.py`, `test_codex.py`, `test_cursor.py`, `test_grok.py`) run in the build with the base image, and `test_codex.py` also runs offline when `RUNCREW_CODEX_TRANSPORT` (or a runcrew checkout beside cca) provides the transport modules.
 
 Build and deploy, one provider at a time, from the pack directory under the deployer identity (the deployer needs the same roles as for the controller; see `live-image-controller/README.md`):
 
